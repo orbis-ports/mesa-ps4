@@ -8,6 +8,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include "util/u_atomic.h"
 #include "radv_queue.h"
 #include "tools/radv_debug_hang.h"
 #include "tools/radv_debug_nir.h"
@@ -15,6 +16,10 @@
 #include "radv_buffer.h"
 #include "radv_cp_reg_shadowing.h"
 #include "radv_cs.h"
+#ifdef HAVE_ORBIS_PLATFORM
+#include "radv_descriptor_pool.h"
+#include "ac_linux_drm.h"
+#endif
 #include "radv_device_memory.h"
 #include "radv_image.h"
 #include "vk_common_entrypoints.h"
@@ -24,6 +29,18 @@
 #include "ac_cmdbuf.h"
 #include "ac_debug.h"
 #include "ac_descriptors.h"
+
+#ifdef HAVE_ORBIS_PLATFORM
+/* The tess ring watermark's state. File-static because the fill happens where the ring is created and the
+ * read happens between submissions, and threading it through either signature would put a diagnostic into
+ * an interface. 0x5a is the arm's own decoy byte - one poison value across this port, so a stray pattern in
+ * a dump is recognisable wherever it turns up. */
+#define ORBIS_TESS_RING_POISON 0x5a
+static uint8_t *orbis_tess_ring_map;
+static uint64_t orbis_tess_ring_size;
+static uint32_t orbis_tess_ring_sized_at; /* what ac_gpu_info computed, for the ratio */
+#endif
+
 
 enum radeon_ctx_priority
 radv_get_queue_global_priority(const VkDeviceQueueGlobalPriorityCreateInfo *pObj)
@@ -351,6 +368,110 @@ radv_fill_shader_rings(struct radv_device *device, uint32_t *desc, struct radeon
    memcpy(desc, device->sample_locations_8x, 64);
 }
 
+/**
+ * ⚠ THIS HARDWARE WRITES PAST THE RING SIZE IT WAS TOLD, so the allocation has to be bigger than the
+ * register. Two runs of the same 349 tests, differing in nothing else:
+ *
+ *   VGT_GSVS_RING_SIZE = S, buffer S     GPU Protection fault, client TC0, access Write,
+ *                                        "Unmapped page access" - the geometry shader off the end
+ *   VGT_GSVS_RING_SIZE = S, buffer 16*S  349 / 349
+ *
+ * The register carries the SAME value in both, so this is the allocation and nothing else. RADV
+ * computes one number and uses it for both, which is right everywhere amdgpu runs; here the declared
+ * size is fine and the buffer behind it is not.
+ *
+ * ⚠ AND THE PADDING IS A MARGIN, NOT A DERIVATION. Four blanket multipliers were spent moving this
+ * boundary before the two were separated - two carried geometry.basic, four carried multiview, and
+ * neither carried this - so the honest reading is that nothing here predicts how far past the end
+ * the hardware goes. ORBIS_GS_RING_PAD is the knob for the next family that outgrows it, and its
+ * existence is the admission that one may.
+ */
+static uint32_t
+radv_orbis_gs_ring_bytes(uint32_t size, bool is_esgs)
+{
+#ifdef HAVE_ORBIS_PLATFORM
+   /* ⚠ AND THE SLACK IS BOUNDED, BECAUSE THE FIRST VERSION OF IT WAS NOT AND COST A RUN.
+    *
+    * A bare multiplier here compounds with the size scale and lands on a value that is already
+    * clamped to the hardware maximum - MIN2(gsvs_ring_size, 63.999 MB * num_se) upstream - so 16x
+    * of that asked for 2147442688 bytes, the arena said "out of device VA", the device was lost and
+    * 328 tests failed behind it. The overrun this absorbs was measured on SMALL rings; nothing says
+    * it grows with the ring, and everything says the arena will not survive assuming it does. */
+   static int pad = -1;
+   static int esgs_pad = -1;
+   static int cap_mb = -1;
+
+   if (pad < 0) {
+      const char *const e = getenv("ORBIS_GS_RING_PAD");
+      const char *const c = getenv("ORBIS_GS_RING_PAD_CAP_MB");
+      pad = (e != NULL && *e != '\0') ? MAX2(atoi(e), 1) : 16;
+      cap_mb = (c != NULL && *c != '\0') ? MAX2(atoi(c), 0) : 512;
+
+      /* ⚠ A SEPARATE PAD FOR THE ES-TO-GS RING, BECAUSE ONE PAD FOR BOTH CANNOT ASK THE QUESTION.
+       *
+       * Run 53 raised ORBIS_GS_RING_PAD to 32 to test the one term the elimination had left - the ESGS
+       * allocation - and never got to test it: the GSVS rings went to 160 MB, 300 MB and 512 MB, the arena
+       * ran out of device VA, BOs were handed addresses that live BOs still held, and the two geometry.basic
+       * tests failed with difference 17883.6 and 21818.5 - the SAME numbers run 51 produced by starving the
+       * declared size. Two very different causes, one indistinguishable picture, which is what an experiment
+       * looks like when it never establishes its own condition.
+       *
+       * The ESGS rings are small - 512 KB to 1.5 MB requested against GSVS's 5 MB to 64 MB - so padding them
+       * hard costs tens of megabytes while padding GSVS hard costs the device. Splitting the knob is what
+       * makes the remaining term reachable at all.
+       *
+       * ORBIS_GS_RING_PAD_ESGS, defaulting to whatever ORBIS_GS_RING_PAD is, so nothing changes unless it
+       * is asked for. */
+      const char *const ee = getenv("ORBIS_GS_RING_PAD_ESGS");
+      esgs_pad = (ee != NULL && *ee != '\0') ? MAX2(atoi(ee), 1) : pad;
+
+      mesa_logi("radv/orbis: GS ring allocations padded %dx (ESGS %dx), TOTAL capped at %d MiB - this CP "
+                "writes past the ring size it is given, and an uncapped pad loses the device instead.",
+                pad, esgs_pad, cap_mb);
+   }
+
+   const int this_pad = is_esgs ? esgs_pad : pad;
+
+   /* ⚠ THE CEILING IS ON THE TOTAL, NOT THE SLACK, because the arena is what breaks and the arena
+    * sees a total. Capping the slack was guessed at three times - 64 MiB starved the binding-model
+    * geometry tests, uncapped asked 2 GB and lost the device - while the log carries what this arena
+    * actually survived:
+    *
+    *   301,989,888 B  allocated, run completed
+    *   671,086,080 B  allocated, device lost shortly after
+    *
+    * So 256 MiB is a number with a measurement under it rather than a fourth guess. A ring larger
+    * than the cap on its own is never shrunk: that would trade a fault for a wrong picture. */
+   const uint64_t slack = (uint64_t)size * (uint32_t)(this_pad - 1);
+   const uint64_t ceiling = MAX2((uint64_t)size, (uint64_t)cap_mb * 1024 * 1024);
+   const uint64_t total = MIN2(MIN2((uint64_t)size + slack, ceiling), (uint64_t)UINT32_MAX);
+
+   /* ⚠ PRINT THE NUMBERS, BECAUSE THREE RUNS WERE SPENT MOVING MULTIPLIERS WITHOUT KNOWING ONE.
+    * Every configuration tried so far fixed one family and broke another - a 64 MiB cap starves the
+    * binding-model geometry tests while an uncapped pad asks for 2 GB and loses the device - and
+    * none of that reasoning had a single real ring size in it. Once per distinct size, so a run
+    * carries the magnitudes instead of the next guess. */
+   {
+      static uint32_t seen[8];
+      static unsigned n;
+      bool known = false;
+      for (unsigned i = 0; i < n; i++)
+         known |= seen[i] == size;
+      if (!known) {
+         if (n < ARRAY_SIZE(seen))
+            seen[n++] = size;
+         mesa_logi("radv/orbis: GS ring %u B requested -> %" PRIu64 " B allocated (slack %" PRIu64
+                   " B%s)",
+                   size, total, slack, total == ceiling && slack ? ", AT THE CAP" : "");
+      }
+   }
+
+   return (uint32_t)total;
+#else
+   return size;
+#endif
+}
+
 static void
 radv_emit_gs_ring_sizes(struct radv_device *device, struct radv_cmd_stream *cs, struct radeon_winsys_bo *esgs_ring_bo,
                         uint32_t esgs_ring_size, struct radeon_winsys_bo *gsvs_ring_bo, uint32_t gsvs_ring_size)
@@ -366,16 +487,122 @@ radv_emit_gs_ring_sizes(struct radv_device *device, struct radv_cmd_stream *cs, 
    if (gsvs_ring_bo)
       radv_cs_add_buffer(device->ws, cs->b, gsvs_ring_bo);
 
+   uint32_t esgs_reg = esgs_ring_size >> 8;
+   uint32_t gsvs_reg = gsvs_ring_size >> 8;
+
+#ifdef HAVE_ORBIS_PLATFORM
+   /* ⚠ DOES THIS REGISTER REACH THE VGT AT ALL? ASK BY ITS EFFECT, BECAUSE READING IT IS IMPOSSIBLE.
+    *
+    * Run 50 settled the reading question and settled it against us: VGT_PRIMITIVE_TYPE, four bytes from
+    * VGT_GSVS_RING_SIZE and written by this driver on every draw, reads back 0x00000000 after two draws have
+    * executed. The COPY_DATA route is BLIND TO THE WHOLE VGT USER-CONFIG BLOCK - which is also, at last, why
+    * the three tessellation registers answer zero. One mechanism, two mysteries; and it means every zero this
+    * port has read from that block is a non-answer rather than a measurement.
+    *
+    * So stop reading and watch what happens instead. This divides ONLY THE REGISTER, leaving the allocation
+    * and every other term alone, which turns reachability into an image comparison:
+    *
+    *   the images get worse    the register reaches the VGT, the ring wraps where we tell it to, and the ring
+    *                           defect is about the VALUE we compute
+    *   nothing changes at all  the register is inert on this part, the VGT wraps on something we do not
+    *                           control, and no multiplier was ever going to fix it
+    *
+    * ⚠ DIVIDE, DO NOT MULTIPLY. A larger declared size than the allocation is how the hardware gets sent past
+    * the end of a buffer, which is the fault that kills the device. Shrinking is the safe direction and it is
+    * the sensitive one: the baseline already passes geometry.basic.output_10 and output_128.
+    *
+    * ORBIS_GS_RING_REG_DIV=8 is the experiment; unset is the shipped behaviour. */
+   {
+      static int div = -1;
+      if (div < 0) {
+         const char *const e = getenv("ORBIS_GS_RING_REG_DIV");
+         div = (e != NULL && *e != '\0') ? MAX2(atoi(e), 1) : 1;
+      }
+      if (div > 1) {
+         const uint32_t esgs_was = esgs_reg, gsvs_was = gsvs_reg;
+         /* Never to zero: a zero-sized ring is a different experiment and probably an immediate hang. */
+         esgs_reg = MAX2(esgs_reg / (uint32_t)div, 1u);
+         gsvs_reg = MAX2(gsvs_reg / (uint32_t)div, 1u);
+         mesa_logi("radv/orbis: ORBIS_GS_RING_REG_DIV=%d - DECLARING ESGS 0x%08x -> 0x%08x, GSVS 0x%08x -> "
+                   "0x%08x while the allocations stay as they are. If the geometry images do not change, this "
+                   "register does not reach the VGT.",
+                   div, esgs_was, esgs_reg, gsvs_was, gsvs_reg);
+      }
+   }
+
+   /* ⚠ THE OTHER DIRECTION, AND IT SEPARATES THE TWO FAULTS FOR THE FIRST TIME.
+    *
+    * Run 51 answered the reachability question: dividing the declared size by eight took
+    * geometry.basic.output_10 and output_128 from Pass to image differences of 17883 and 21818 against a
+    * threshold of 0.0015. The register reaches the VGT and the VGT wraps where we tell it to.
+    *
+    * That makes ORBIS_GS_RING_SCALE the wrong instrument for what remains, because it moves the DECLARED size
+    * and the ALLOCATION together - which is exactly why eight configurations never separated
+    *
+    *     the ring wraps too early    -> it overwrites itself   -> WRONG IMAGES
+    *     the allocation is short     -> something writes past  -> GPU FAULT
+    *
+    * This moves only the first. If multiview's images come right, the declared size was what was short and
+    * the allocation was never the point; if nothing changes, the declaration was already adequate and the
+    * fault lives in the allocation.
+    *
+    * ⚠ AND IT IS CLAMPED TO WHAT WAS ACTUALLY ALLOCATED, which is the whole reason it is safe to raise a
+    * declared ring size at all. radv_orbis_gs_ring_bytes() is deterministic, so the padded allocation can be
+    * recomputed here exactly; declaring more than that is how the hardware gets sent past the end of a buffer
+    * and is refused rather than trusted to the caller. With the shipped 16x padding, MUL=2 still leaves the
+    * declaration eight times inside the buffer.
+    *
+    * ORBIS_GS_RING_REG_MUL=2. */
+   {
+      static int mul = -1;
+      if (mul < 0) {
+         const char *const e = getenv("ORBIS_GS_RING_REG_MUL");
+         mul = (e != NULL && *e != '\0') ? MAX2(atoi(e), 1) : 1;
+      }
+      if (mul > 1) {
+         const uint32_t esgs_cap = (uint32_t)(radv_orbis_gs_ring_bytes(esgs_ring_size, true) >> 8);
+         const uint32_t gsvs_cap = (uint32_t)(radv_orbis_gs_ring_bytes(gsvs_ring_size, false) >> 8);
+         const uint32_t esgs_was = esgs_reg, gsvs_was = gsvs_reg;
+
+         esgs_reg = MIN2(esgs_reg * (uint32_t)mul, esgs_cap);
+         gsvs_reg = MIN2(gsvs_reg * (uint32_t)mul, gsvs_cap);
+
+         mesa_logi("radv/orbis: ORBIS_GS_RING_REG_MUL=%d - DECLARING ESGS 0x%08x -> 0x%08x (allocation allows "
+                   "0x%08x), GSVS 0x%08x -> 0x%08x (allows 0x%08x). The ALLOCATIONS are untouched, so this "
+                   "asks whether the DECLARED size was what multiview was short of.%s",
+                   mul, esgs_was, esgs_reg, esgs_cap, gsvs_was, gsvs_reg, gsvs_cap,
+                   (esgs_reg == esgs_cap || gsvs_reg == gsvs_cap)
+                      ? "  ⚠ ONE OF THEM HIT THE ALLOCATION CEILING - the factor asked for is not the factor "
+                        "applied, and a null result means less than it looks."
+                      : "");
+      }
+   }
+#endif
+
+   /* ⚠ THIS USED TO SIT OUTSIDE THE PLATFORM SEAM, saying "the note is a no-op elsewhere". It is not:
+    * ac_orbis_note_gs_ring_sizes is declared in ac_linux_drm.h, which this file includes only under
+    * HAVE_ORBIS_PLATFORM, and defined only in ac_orbis_drm.c, which only -Dplatforms=orbis builds. So
+    * every other configuration of this tree failed on -Werror=implicit-function-declaration, and would
+    * have failed at the link even with a prototype.
+    *
+    * The instinct behind it was sound - a call site inside an #ifdef has broken the host link twice in
+    * this file's history - but the cure for that is a stub that really exists, and there is none. The
+    * other four ac_orbis_note_* call sites in RADV are all inside the seam already; this one was the
+    * odd one out rather than the pattern. */
+#ifdef HAVE_ORBIS_PLATFORM
+   ac_orbis_note_gs_ring_sizes(esgs_reg, gsvs_reg);
+#endif
+
    radeon_begin(cs);
 
    if (pdev->info.gfx_level >= GFX7) {
       radeon_set_uconfig_reg_seq(R_030900_VGT_ESGS_RING_SIZE, 2);
-      radeon_emit(esgs_ring_size >> 8);
-      radeon_emit(gsvs_ring_size >> 8);
+      radeon_emit(esgs_reg);
+      radeon_emit(gsvs_reg);
    } else {
       radeon_set_config_reg_seq(R_0088C8_VGT_ESGS_RING_SIZE, 2);
-      radeon_emit(esgs_ring_size >> 8);
-      radeon_emit(gsvs_ring_size >> 8);
+      radeon_emit(esgs_reg);
+      radeon_emit(gsvs_reg);
    }
 
    radeon_end();
@@ -394,6 +621,76 @@ radv_emit_tess_factor_ring(struct radv_device *device, struct radv_cmd_stream *c
    va = radv_buffer_get_va(tess_rings_bo);
 
    radv_cs_add_buffer(device->ws, cs->b, tess_rings_bo);
+
+#ifdef HAVE_ORBIS_PLATFORM
+   /* ⚠ THE LINE THAT MAKES THE FIX CHECKABLE, and without it a run that programmed the rings and a run that
+    * inherited Sony's look identical. A log carrying this sentence took the registers from a BO of ours; a
+    * log without it left 0xff0000000 in place. It is also the base the remaining write faults have to be
+    * compared against, so it prints the extent rather than just the address.
+    *
+    * ac_emit_cp_tess_rings puts the FACTOR ring at va + tess_offchip_ring_size and writes va >> 8, so both
+    * numbers below are what the register will actually carry. */
+   {
+      /* p_atomic rather than a plain flag: this runs on whatever thread built the preamble, and the arm
+       * spent a commit today removing eighteen copies of the racy version. */
+      static unsigned said;
+      if (p_atomic_read(&said) < 1 && p_atomic_inc_return(&said) <= 1) {
+         mesa_logi("radv/orbis: tess rings are OURS - 0x%" PRIx64 "..0x%" PRIx64 " (offchip %u B, factor %u B, "
+                   "total %u B); VGT_TF_MEMORY_BASE <- 0x%" PRIx64 ", replacing Sony's 0x0ff00000",
+                   va, va + pdev->info.total_tess_ring_size, pdev->info.tess_offchip_ring_size,
+                   pdev->info.tess_factor_ring_size, pdev->info.total_tess_ring_size,
+                   (va + pdev->info.tess_offchip_ring_size) >> 8);
+
+         /* ⚠ THE NUMBERS THE OVERRUN IS READ AGAINST. A write fault inside this ring is only interpretable
+          * against the buffer count and the stride: the fault at 0x212a50000 meant "offchip buffer 74" only
+          * because 32768 and 72 were known. Printing them turns the next klog address into an index without a
+          * spreadsheet, and states what went into OFFCHIP_BUFFERING so a run cannot be mistaken for one that
+          * carried the other value. */
+         const unsigned stride = pdev->info.hs_offchip_workgroup_dw_size * 4;
+         mesa_logi("radv/orbis: offchip stride %u B, %u buffer(s) allocated, %u shader engine(s); "
+                   "VGT_HS_OFFCHIP_PARAM <- 0x%08x. A write fault at ring+N*%u is offchip buffer N.",
+                   stride, stride ? pdev->info.tess_offchip_ring_size / stride : 0, pdev->info.max_se,
+                   pdev->info.hs_offchip_param, stride);
+      }
+   }
+#endif
+
+#ifdef HAVE_ORBIS_PLATFORM
+   /* ⚠ MOVE OUR OWN RING ON PURPOSE, BECAUSE THE TWO KINDS OF TRAFFIC DISAGREE ABOUT WHERE IT IS.
+    *
+    * Measured, both halves: the WRITES follow our base - correcting the offchip count from 72 to 256 moved
+    * the factor ring from 0x212a40000 to 0x213000000 and the write faults moved with it, keeping their
+    * offsets from the new base. The READS do not - they land at 0xff0000000 plus small offsets no matter
+    * what we program, and sceGnmGetTheTessellationFactorRingBufferBaseAddress() answers 0xff0000000 in this
+    * very process, first-hand rather than quoted.
+    *
+    * Two rings, then. But "the reads ignore our base" is an inference from two fixes that each moved one
+    * thing; nothing has moved the base ON ITS OWN, with every other number held still. ORBIS_TF_BASE_BIAS
+    * does exactly that: it adds a known offset to the address we program, changing nothing else.
+    *
+    *   write faults shift by the bias   -> writes use our base, confirmed by a deliberate move rather than
+    *                                       by a side effect of a sizing change
+    *   read faults stay at 0xff0000000  -> the reads genuinely never see our base, and the question becomes
+    *                                       which register or descriptor still carries Sony's
+    *   read faults shift too            -> they DO use our base, and 0xff0000000 was reached some other way
+    *
+    * ⚠ THE RING STAYS WHERE IT WAS ALLOCATED. Only the ADDRESS PROGRAMMED moves, so the hardware is pointed
+    * at memory we own but did not intend for it - which is the whole point, and why this is a diagnostic
+    * with a knob rather than a default. */
+   uint64_t orbis_tf_va = va + pdev->info.tess_offchip_ring_size;
+   {
+      const char *const bias_s = getenv("ORBIS_TF_BASE_BIAS");
+      const uint64_t bias = bias_s != NULL ? strtoull(bias_s, NULL, 0) : 0;
+      if (bias != 0) {
+         orbis_tf_va += bias;
+         mesa_logw("radv/orbis: ORBIS_TF_BASE_BIAS moves the programmed factor-ring base by 0x%" PRIx64
+                   " to 0x%" PRIx64 " while the allocation stays put. Tessellation output goes somewhere we "
+                   "own but did not mean; the point is only whether the fault addresses follow.",
+                   bias, orbis_tf_va);
+      }
+   }
+   ac_orbis_note_tf_base((uint32_t)(orbis_tf_va >> 8));
+#endif
 
    ac_emit_cp_tess_rings(cs->b, &pdev->info, va);
 }
@@ -888,27 +1185,97 @@ radv_update_preamble_cs(struct radv_queue_state *queue, struct radv_device *devi
    }
 
    if (needs->esgs_ring_size > queue->ring_info.esgs_ring_size) {
-      result = radv_bo_create(device, NULL, needs->esgs_ring_size, 4096, RADEON_DOMAIN_VRAM, ring_bo_flags,
-                              RADV_BO_PRIORITY_SCRATCH, 0, true, &esgs_ring_bo);
+      result = radv_bo_create(device, NULL, radv_orbis_gs_ring_bytes(needs->esgs_ring_size, true), 4096,
+                              RADEON_DOMAIN_VRAM, ring_bo_flags, RADV_BO_PRIORITY_SCRATCH, 0, true, &esgs_ring_bo);
       if (result != VK_SUCCESS)
          goto fail;
       radv_rmv_log_command_buffer_bo_create(device, esgs_ring_bo, 0, 0, needs->esgs_ring_size);
    }
 
    if (needs->gsvs_ring_size > queue->ring_info.gsvs_ring_size) {
-      result = radv_bo_create(device, NULL, needs->gsvs_ring_size, 4096, RADEON_DOMAIN_VRAM, ring_bo_flags,
-                              RADV_BO_PRIORITY_SCRATCH, 0, true, &gsvs_ring_bo);
+      result = radv_bo_create(device, NULL, radv_orbis_gs_ring_bytes(needs->gsvs_ring_size, false), 4096,
+                              RADEON_DOMAIN_VRAM, ring_bo_flags, RADV_BO_PRIORITY_SCRATCH, 0, true, &gsvs_ring_bo);
       if (result != VK_SUCCESS)
          goto fail;
       radv_rmv_log_command_buffer_bo_create(device, gsvs_ring_bo, 0, 0, needs->gsvs_ring_size);
    }
 
    if (!queue->ring_info.tess_rings && needs->tess_rings) {
-      result = radv_bo_create(device, NULL, pdev->info.total_tess_ring_size, 256, RADEON_DOMAIN_VRAM, ring_bo_flags_tmz,
+      uint64_t tess_bo_size = pdev->info.total_tess_ring_size;
+#ifdef HAVE_ORBIS_PLATFORM
+      /* ⚠ A KNOB FOR AN OPEN QUESTION, DEFAULTING TO THE UNMODIFIED SIZE.
+       *
+       * With the rings finally programmed from a BO of ours, the earlier effort measured a GPU WRITE fault on
+       * the page immediately after a ring - an offset into the ring of 74 x 32768 where the allocation was
+       * sized for 72 workgroups. Two explanations fit and it did not separate them:
+       *
+       *   the sizing is short   - every term of it (max_good_cu_per_sa x max_sa_per_se x max_se,
+       *                           ac_gpu_info.c) comes from CU topology this port's own arm marks UNCITED
+       *   the count is wrong    - OFFCHIP_BUFFERING may be read per-SE by this part, where Mesa divides by
+       *                           max_se only from GFX11 up (ac_cmdbuf_cp.c)
+       *
+       * That effort left the multiplier at FOUR by default, which turns an unanswered question into shipped
+       * behaviour. It defaults to 1 here: the ring fix and the ring SIZE are two variables, and the first run
+       * should move one. ORBIS_TESS_RING_SCALE=4 arms the experiment from the env file without a rebuild,
+       * which is the whole point of it being a knob.
+       *
+       * It grows the ALLOCATION only. hs_offchip_param still states the same workgroup count and the ring
+       * descriptors carry the same sizes, so the extra pages sit past the factor ring - where the overrun
+       * lands - and the two candidates separate on the next run with no further instrument:
+       *
+       *   the fault disappears        -> the sizing is short, and the topology guess is what makes it short
+       *   the fault stays at end+page -> the hardware was told the wrong workgroup count
+       */
+      {
+         const char *const scale_env = getenv("ORBIS_TESS_RING_SCALE");
+         unsigned scale = (scale_env != NULL) ? (unsigned)atoi(scale_env) : 1u;
+         if (scale < 1 || scale > 64)
+            scale = 1;
+         if (scale != 1) {
+            tess_bo_size *= scale;
+            mesa_logi("radv/orbis: ORBIS_TESS_RING_SCALE=%u - allocating %" PRIu64 " bytes for a ring "
+                      "ac_gpu_info sized at %u. Every register is left as computed, so this tests the SIZE "
+                      "and nothing else.",
+                      scale, tess_bo_size, pdev->info.total_tess_ring_size);
+         }
+      }
+#endif
+      result = radv_bo_create(device, NULL, tess_bo_size, 256, RADEON_DOMAIN_VRAM, ring_bo_flags_tmz,
                               RADV_BO_PRIORITY_SCRATCH, 0, true, &tess_rings_bo);
       if (result != VK_SUCCESS)
          goto fail;
-      radv_rmv_log_command_buffer_bo_create(device, tess_rings_bo, 0, 0, pdev->info.total_tess_ring_size);
+
+#ifdef HAVE_ORBIS_PLATFORM
+      /* ⚠ HOW BIG DOES THE RING ACTUALLY NEED TO BE? A MULTIPLIER IS NOT AN ANSWER.
+       *
+       * ORBIS_TESS_RING_SCALE=4 stopped the write faults, which established that the ring ac_gpu_info sizes
+       * is SHORTER than the hardware uses - both register readings of those faults had already been tested
+       * and killed. What it did not establish is by how much, and shipping x4 as a default would import that
+       * open question as a fact.
+       *
+       * So the ring is filled with a pattern at creation and the highest byte the GPU disturbed is reported.
+       * That converts "four times is enough" into a number, in one run, with no console bisection - and the
+       * number is what a real fix needs, because the honest form of this is a corrected size term rather
+       * than a multiplier.
+       *
+       * ORBIS_TESS_RING_WATERMARK=<n> reports after every nth submission. Off by default: the scan reads the
+       * whole ring, which is 9 MiB at scale 4. */
+      if (getenv("ORBIS_TESS_RING_WATERMARK") != NULL) {
+         uint8_t *const map = (uint8_t *)radv_buffer_map(device->ws, tess_rings_bo);
+         if (map != NULL) {
+            memset(map, ORBIS_TESS_RING_POISON, tess_bo_size);
+            orbis_tess_ring_map = map;
+            orbis_tess_ring_size = tess_bo_size;
+            orbis_tess_ring_sized_at = pdev->info.total_tess_ring_size;
+            mesa_logi("radv/orbis: tess ring filled with 0x%02x for the watermark - anything not that byte "
+                      "afterwards was written by the GPU",
+                      ORBIS_TESS_RING_POISON);
+         } else {
+            mesa_logw("radv/orbis: tess ring would not map - no watermark this boot");
+         }
+      }
+#endif
+      radv_rmv_log_command_buffer_bo_create(device, tess_rings_bo, 0, 0, tess_bo_size);
    }
 
    if (!queue->ring_info.task_rings && needs->task_rings) {
@@ -1240,6 +1607,46 @@ radv_update_preambles(struct radv_queue_state *queue, struct radv_device *device
       *use_perf_counters |= cmd_buffer->queue_state.uses_perf_counters;
       *has_follower |= !!cmd_buffer->gang.cs;
    }
+
+#ifdef HAVE_ORBIS_PLATFORM
+   /* ⚠ THE TESSELLATION RINGS ARE ALLOCATED WHETHER OR NOT ANYTHING TESSELLATES, because on this console the
+    * alternative is inheriting Sony's.
+    *
+    * VGT_TF_RING_SIZE, VGT_HS_OFFCHIP_PARAM and VGT_TF_MEMORY_BASE are written for GFX7 through
+    * ac_cmdbuf_set_ucfg_reg_seq (ac_cmdbuf_cp.c:358) - USER-CONFIG, not context state, so they are not reset
+    * by a submission and hold whatever the last writer left there, across submissions AND across processes.
+    * RADV writes them only from radv_emit_tess_factor_ring(), which returns immediately when there is no tess
+    * ring BO - so a title that never tessellates never writes them at all. Under amdgpu that is harmless,
+    * because the kernel never hands a process a GPU whose registers point outside its address space. Here the
+    * last writer was libSceGnmDriver:
+    *
+    *   sceGnmGetTheTessellationFactorRingBufferBaseAddress()  ->  0xff0000000
+    *   sceGnmGetOffChipTessellationBufferSize()               ->  0x800000
+    *
+    * WHY THAT ADDRESS APPEARS IN NO BUFFER, NO DESCRIPTOR AND NO PACKET OF OURS: the register takes va >> 8,
+    * so the only number that exists anywhere is 0x0ff00000, and it lives in a REGISTER rather than in memory.
+    * An exact 64-bit scan over 580 MiB of mapped memory found 0xff0000000 zero times, and that is why.
+    *
+    * It also predicts the shape of the hang measured here. The factor ring sits at base + offchip_size, so
+    * 0xff0000000 + 0x800000 = 0xff0800000 - which is exactly where ORBIS_DECOY_VA=0xff0000000:8 stops. The
+    * decoy covers Sony's offchip buffer and not one byte of the factor ring, so reads through it succeed and
+    * writes to the factor ring land in nothing.
+    *
+    * So this is a lifetime rule of the same shape as the buffer one, one level down: state this driver did
+    * not program is state it does not own.
+    *
+    * The GS rings need no equivalent: on GFX6-8 their addresses travel in ring descriptors written to user
+    * data (radv_set_ring_buffer), not in a register that outlives the submission.
+    *
+    * ⚠ WHAT IS DELIBERATELY NOT TAKEN FROM THE EARLIER EFFORT: it also multiplies the ring ALLOCATION by four
+    * by default (ORBIS_TESS_RING_SCALE), after seeing a write fault one page past a correctly programmed
+    * ring. Its own comment lists two competing explanations - a short sizing from UNCITED CU topology, or
+    * OFFCHIP_BUFFERING being read per-SE - and says the next run separates them. That run has not happened,
+    * so the knob is an open question rather than a fix, and defaulting it on would import the question as a
+    * fact. If the fault reappears with the rings ours, THAT is the measurement which decides it.
+    */
+   needs.tess_rings = true;
+#endif
 
    /* Sanitize scratch size information. */
    needs.scratch_waves =
@@ -1650,6 +2057,48 @@ radv_queue_submit_normal(struct radv_queue *queue, struct vk_queue_submit *submi
          return result;
    }
 
+#ifdef HAVE_ORBIS_PLATFORM
+   /* ⚠ THE OTHER HALF OF THE USE-AFTER-FREE AUDIT, and the half a command stream cannot supply.
+    *
+    * The arm already checks every user-data pointer against the ranges of DESTROYED descriptor pools and
+    * has found nothing. What it structurally cannot see is vkResetDescriptorPool: that frees every set and
+    * hands the same addresses straight back out, so a binding recorded before the reset and one recorded
+    * after it are byte-identical in PM4.
+    *
+    * Comparing the pool's generation at record time with its generation now separates them exactly. A pool
+    * that has vanished entirely is separated by the live registry, without dereferencing a freed pointer. */
+   for (uint32_t i = 0; i < submission->command_buffer_count; i++) {
+      const struct radv_cmd_buffer *const cb =
+         container_of(submission->command_buffers[i], struct radv_cmd_buffer, vk);
+      static unsigned said;
+
+      if (cb->orbis_pool_stamps_dropped != 0 && said < 8) {
+         said++;
+         mesa_logw("radv/orbis: a command buffer binds sets from more descriptor pools than the audit "
+                   "records (%u dropped) - the check below covers a subset",
+                   cb->orbis_pool_stamps_dropped);
+      }
+
+      for (unsigned k = 0; k < cb->orbis_pool_stamps && said < 8; k++) {
+         const struct radv_descriptor_pool *const pool = cb->orbis_pool_stamp[k].pool;
+
+         if (!radv_orbis_pool_is_live(pool)) {
+            said++;
+            mesa_loge("radv/orbis: USE AFTER FREE - a command buffer in this submission binds a descriptor "
+                      "set from a pool that has been DESTROYED. On this platform its memory stays mapped, "
+                      "so every bounds check passes and the shader reads whoever owns it now.");
+         } else if (pool->orbis_generation != cb->orbis_pool_stamp[k].generation) {
+            said++;
+            mesa_loge("radv/orbis: USE AFTER FREE - a command buffer in this submission binds a descriptor "
+                      "set from a pool that has been RESET since the binding was recorded (generation %u "
+                      "at record time, %u now). The addresses are identical, which is why nothing in the "
+                      "command stream could show this.",
+                      cb->orbis_pool_stamp[k].generation, pool->orbis_generation);
+         }
+      }
+   }
+#endif
+
    const unsigned cmd_buffer_count = submission->command_buffer_count;
    const unsigned max_cs_submission = radv_device_fault_detection_enabled(device) ? 1 : cmd_buffer_count;
    const unsigned cs_array_size = (use_ace ? 2 : 1) * MIN2(max_cs_submission, cmd_buffer_count);
@@ -1896,6 +2345,31 @@ fail:
 static VkResult
 radv_queue_submit(struct vk_queue *vqueue, struct vk_queue_submit *submission)
 {
+#ifdef HAVE_ORBIS_PLATFORM
+   /* The watermark, read from the CPU between submissions. It runs backwards from the end, so a ring the
+    * hardware barely touches costs a few pages of reading rather than the whole 9 MiB. */
+   if (orbis_tess_ring_map != NULL) {
+      static uint64_t nth;
+      const uint64_t  every = strtoull(getenv("ORBIS_TESS_RING_WATERMARK"), NULL, 10);
+
+      if (every != 0 && (++nth % every) == 0) {
+         static uint64_t high_water;
+         uint64_t        i = orbis_tess_ring_size;
+
+         while (i > 0 && orbis_tess_ring_map[i - 1] == ORBIS_TESS_RING_POISON)
+            --i;
+
+         if (i > high_water) {
+            high_water = i;
+            mesa_logi("radv/orbis: tess ring watermark %" PRIu64 " B of %" PRIu64 " allocated - ac_gpu_info "
+                      "sizes it at %u, so the hardware wants %.2fx that. A ring of %" PRIu64
+                      " B would have held this frame.",
+                      i, orbis_tess_ring_size, orbis_tess_ring_sized_at,
+                      (double)i / (double)orbis_tess_ring_sized_at, i);
+         }
+      }
+   }
+#endif
    struct radv_queue *queue = (struct radv_queue *)vqueue;
    struct radv_device *device = radv_queue_device(queue);
 

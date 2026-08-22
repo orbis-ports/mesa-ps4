@@ -17,12 +17,19 @@
 #include <inttypes.h>
 #include <pthread.h>
 #include <unistd.h>
+/* xf86drm.h and os_drm.h serve ONE call in this file - the DRM_AMDGPU_GEM_MMAP ioctl in
+ * radv_amdgpu_winsys_bo_map, which the no-DRM arm there routes through ac_drm_bo_cpu_map instead. That
+ * is the only place in this winsys that ever reached the kernel without going through ac_drm_*.
+ */
+#if MESA_SYSTEM_HAS_KMS_DRM
 #include <xf86drm.h>
+#include "util/os_drm.h"
+#endif
 #include "drm-uapi/amdgpu_drm.h"
 #include <sys/mman.h>
 #include "ac_linux_drm.h"
 
-#include "util/os_drm.h"
+#include "util/log.h"
 #include "util/os_time.h"
 #include "util/u_atomic.h"
 #include "util/u_math.h"
@@ -93,8 +100,19 @@ static uint64_t
 radv_amdgpu_bo_va_size(uint64_t bo_size, uint32_t flags)
 {
    if (flags & RADEON_FLAG_VM_PAD_1PAGE) {
-      const uint64_t va_padding = 4096;
-      return align64(bo_size, 4096) + va_padding;
+      /* ⚠ ONE PAGE MEANS ONE PAGE OF THIS DEVICE, not 4 KiB. Where pages are larger, a 4 KiB padding lands
+       * INSIDE the BO's own last page: the reservation is a page short and the guard mapping overlaps the
+       * buffer it exists to protect.
+       *
+       * Measured on a 16 KiB-page platform, for a 0x7e8001-byte buffer: the mapping covers
+       * align64(size, 16384) = 0x7ec000, while the guard page was placed at align64(size, 4096) = 0x7e9000 -
+       * 0x3000 bytes inside it. The allocator reported five such overlaps, one per swapchain image.
+       *
+       * getpagesize() is what this file already rounds its mappings to, so this is the same authority rather
+       * than a new one.
+       */
+      const uint64_t page = getpagesize();
+      return align64(bo_size, page) + page;
    }
 
    return bo_size;
@@ -377,8 +395,19 @@ radv_amdgpu_winsys_bo_destroy(struct radeon_winsys *_ws, struct radeon_winsys_bo
       return;
    }
 
-   if (bo->cpu_map)
+   if (bo->cpu_map) {
+#if MESA_SYSTEM_HAS_KMS_DRM
       munmap(bo->cpu_map, bo->base.size);
+#else
+      /* ⚠ THE CPU MAPPING IS NOT SEPARATELY OWNED HERE, so munmap is not the inverse of the mapping this
+       * arm made. On amdgpu, cpu_map is its own mmap of a GEM object, and unmapping it leaves the GPU's
+       * view untouched. Where one mapping serves both processors, a munmap punches a hole in the very
+       * allocation the GPU is still addressing - and the hole outlives the BO, so the NEXT allocation
+       * handed that address faults on its first write.
+       */
+      ac_drm_bo_cpu_unmap(ws->dev, bo->bo);
+#endif
+   }
 
    if (ws->debug_all_bos)
       radv_amdgpu_global_bo_list_del(ws, bo);
@@ -652,8 +681,11 @@ radv_amdgpu_winsys_bo_create(struct radeon_winsys *_ws, uint64_t size, unsigned 
 
    if (flags & RADEON_FLAG_VM_PAD_1PAGE) {
       /* Map the first page of the same BO as read-only after the BO itself. */
-      r = radv_amdgpu_bo_va_op(ws, kms_handle, 0, 4096, va + align64(size, 4096), flags | RADEON_FLAG_READ_ONLY, 0,
-                               AMDGPU_VA_OP_MAP);
+      /* Same page size radv_amdgpu_bo_va_size reserved with, or the guard is mapped at an address the
+       * reservation does not cover. */
+      const uint64_t page = getpagesize();
+      r = radv_amdgpu_bo_va_op(ws, kms_handle, 0, page, va + align64(size, page), flags | RADEON_FLAG_READ_ONLY,
+                               0, AMDGPU_VA_OP_MAP);
       if (r) {
          result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
          goto error_va_map;
@@ -733,6 +765,34 @@ radv_amdgpu_winsys_bo_map(struct radeon_winsys *_ws, struct radeon_winsys_bo *_b
    }
 #endif
 
+#if !MESA_SYSTEM_HAS_KMS_DRM
+   /* NO DRM, SO NO DRM_AMDGPU_GEM_MMAP - and this is the only place in the whole winsys that reaches the
+    * kernel without going through ac_drm_*. The arm maps through the seam instead, exactly as the virtio
+    * arm above does for the same reason.
+    *
+    * ⚠ UNLIKE THAT ARM, THIS ONE RECORDS bo->cpu_map. radv_amdgpu_winsys_bo_unmap returns early when it
+    * is NULL, so leaving it unset would silently skip every unmap.
+    */
+   {
+      struct radv_amdgpu_winsys *ws = radv_amdgpu_winsys(_ws);
+      void *data = use_fixed_addr ? fixed_addr : NULL;
+
+      if (ac_drm_bo_cpu_map(ws->dev, bo->bo, &data))
+         return NULL;
+
+      /* ⚠ THE HINT IS A HINT. The DRM arm below guarantees the address with MAP_FIXED; ac_drm_bo_cpu_map
+       * has no such contract, so a caller that asked for a particular address has to be told when it did
+       * not get one rather than being handed a different one to write through.
+       */
+      if (use_fixed_addr && data != fixed_addr) {
+         ac_drm_bo_cpu_unmap(ws->dev, bo->bo);
+         return NULL;
+      }
+
+      bo->cpu_map = data;
+      return data;
+   }
+#else
    union drm_amdgpu_gem_mmap args;
    memset(&args, 0, sizeof(args));
    args.in.handle = bo->bo_handle;
@@ -748,6 +808,7 @@ radv_amdgpu_winsys_bo_map(struct radeon_winsys *_ws, struct radeon_winsys_bo *_b
 
    bo->cpu_map = data;
    return data;
+#endif
 }
 
 static void
@@ -761,8 +822,30 @@ radv_amdgpu_winsys_bo_unmap(struct radeon_winsys *_ws, struct radeon_winsys_bo *
 
    assert(bo->cpu_map);
    if (replace) {
+#if !MESA_SYSTEM_HAS_KMS_DRM
+      /* ⚠ NOT REACHABLE HERE, and it must not become reachable by accident. `replace` is
+       * VK_MEMORY_UNMAP_RESERVE_BIT_EXT, which keeps the address reserved by punching an anonymous
+       * PROT_NONE hole over the mapping - and where one mapping serves both processors that hole lands in
+       * the allocation the GPU is still addressing, exactly as the destroy path above explains. The
+       * extension that asks for this is not advertised on such a platform, so this states the contract
+       * rather than guarding a case with a sensible answer.
+       *
+       * Both halves are needed: the assert stops a debug build dead, and the log survives NDEBUG, where
+       * the assert compiles to nothing and the bare return would leak the mapping in silence - the caller
+       * clears bo->cpu_map afterwards, so the destroy path would not free it either.
+       */
+      mesa_loge("radv: VK_MEMORY_UNMAP_RESERVE_BIT_EXT without a separately owned CPU mapping; the mapping "
+                "is leaked");
+      assert(!"VK_MEMORY_UNMAP_RESERVE_BIT_EXT without a separately owned CPU mapping");
+      return;
+#else
       (void)mmap(bo->cpu_map, bo->base.size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+#endif
    } else {
+#if !MESA_SYSTEM_HAS_KMS_DRM
+      /* Paired with the ac_drm_bo_cpu_map arm in radv_amdgpu_winsys_bo_map. */
+      ac_drm_bo_cpu_unmap(radv_amdgpu_winsys(_ws)->dev, bo->bo);
+#else
 #if HAVE_AMDGPU_VIRTIO
       struct radv_amdgpu_winsys *ws = radv_amdgpu_winsys(_ws);
       if (ws->info.is_virtio)
@@ -770,6 +853,7 @@ radv_amdgpu_winsys_bo_unmap(struct radeon_winsys *_ws, struct radeon_winsys_bo *
       else
 #endif
          munmap(bo->cpu_map, bo->base.size);
+#endif
    }
    bo->cpu_map = NULL;
 }

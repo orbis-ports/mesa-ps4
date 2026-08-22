@@ -16,12 +16,15 @@
 #include "nir/radv_meta_nir.h"
 #include "nir/radv_nir.h"
 #include "spirv/nir_spirv.h"
+#include "spirv/spirv.h"
 #include "tools/radv_debug_hang.h"
 #include "tools/radv_debug_nir.h"
 #include "util/memstream.h"
 #include "util/mesa-blake3.h"
 #include "util/streaming-load-memcpy.h"
 #include "util/u_atomic.h"
+#include "util/log.h"
+#include "util/u_call_once.h"
 #include "ac_shader_util.h"
 #include "radv_cs.h"
 #include "radv_entrypoints.h"
@@ -1801,6 +1804,12 @@ radv_precompute_registers_hw_gs(struct radv_device *device, const struct radv_sh
    if (max_stream >= 3)
       offset += num_components[3] * gs_max_out_vertices;
    regs->gs.vgt_gsvs_ring_itemsize = offset;
+
+   /* VGT_GSVS_RING_ITEMSIZE.ITEMSIZE is 15 bits, and every offset above shares that width. radeonsi asserts
+    * this at si_state_shaders.cpp:581; RADV never has, so an overflow here would silently truncate the stride
+    * the VGT allocates ring space from - which is a shader writing over its neighbour, not a validation error.
+    */
+   assert(offset < (1 << 15));
 
    for (uint32_t i = 0; i < 4; i++)
       regs->gs.vgt_gs_vert_itemsize[i] = (max_stream >= i) ? num_components[i] : 0;
@@ -3987,9 +3996,69 @@ radv_get_tess_wg_info(const struct radv_compiler_info *compiler_info, const ac_n
                                tcs_num_input_vertices, lds_input_vertex_size, 0, num_patches_per_wg, lds_size);
 }
 
+static FILE *radv_shader_stats_stream = NULL;
+static util_once_flag radv_shader_stats_stream_once = UTIL_ONCE_FLAG_INIT;
+
+static void
+radv_open_shader_stats_stream(void)
+{
+   const char *path = getenv("RADV_SHADER_STATS_FILE");
+
+   if (!path || !path[0])
+      return;
+
+   radv_shader_stats_stream = fopen(path, "w");
+
+   /* Say so either way: an empty file and an unread variable look identical from the console. */
+   if (radv_shader_stats_stream)
+      mesa_logi("shader statistics are going to %s", path);
+   else
+      mesa_logw("cannot open %s for shader statistics, falling back to stderr", path);
+}
+
+/* RADV_DEBUG=shaderstats writes to stderr, which some platforms discard - the PS4 among them, where
+ * the only way out of the process is a file. RADV_SHADER_STATS_FILE names one; without it, stderr.
+ */
+FILE *
+radv_shader_stats_output(void)
+{
+   util_call_once(&radv_shader_stats_stream_once, radv_open_shader_stats_stream);
+
+   return radv_shader_stats_stream ? radv_shader_stats_stream : stderr;
+}
+
+/* RADV knows a shader only by its hashes, and a statistic nobody can attribute to a source file
+ * cannot be acted on. glslang compiled with -g records the path as the first OpString, so dig it
+ * out of the SPIR-V that produced this shader. Returns NULL when the module carries no debug info.
+ */
+static const char *
+radv_spirv_source_file(const struct radv_shader_stage *stage)
+{
+   const uint32_t *words = (const uint32_t *)stage->spirv.data;
+   const uint32_t num_words = stage->spirv.size / 4;
+
+   if (!words || num_words < 5 || words[0] != SpvMagicNumber)
+      return NULL;
+
+   for (uint32_t i = 5; i < num_words;) {
+      const uint32_t opcode = words[i] & 0xffff;
+      const uint32_t len = words[i] >> 16;
+
+      if (len == 0 || i + len > num_words)
+         break;
+
+      if (opcode == SpvOpString && len > 2)
+         return (const char *)&words[i + 2];
+
+      i += len;
+   }
+
+   return NULL;
+}
+
 VkResult
 radv_dump_shader_stats(struct radv_device *device, struct radv_pipeline *pipeline, struct radv_shader *shader,
-                       FILE *output)
+                       const struct radv_shader_stage *stage_info, FILE *output)
 {
    VkPipelineExecutablePropertiesKHR *props = NULL;
    uint32_t prop_count = 0;
@@ -4039,8 +4108,12 @@ radv_dump_shader_stats(struct radv_device *device, struct radv_pipeline *pipelin
          goto fail;
       }
 
+      const char *source = stage_info ? radv_spirv_source_file(stage_info) : NULL;
+
       fprintf(output, "\n%s:\n", radv_get_shader_name(&shader->info, stage));
       fprintf(output, "*** SHADER STATS ***\n");
+      if (source)
+         fprintf(output, "Source: %s\n", source);
 
       for (unsigned i = 0; i < stat_count; i++) {
          fprintf(output, "%s: ", stats[i].name);
@@ -4069,6 +4142,8 @@ radv_dump_shader_stats(struct radv_device *device, struct radv_pipeline *pipelin
    }
 
 fail:
+   /* A title that dies mid-run must still leave the stats it already produced behind. */
+   fflush(output);
    free(props);
    return result;
 }

@@ -24,7 +24,18 @@
 #include "vk_drm_syncobj.h"
 
 #include <sched.h>
+
+#include "util/log.h"
+/* NOT NEEDED, and its presence is the only thing that confined this file to builds with libdrm. There is
+ * not one drm*() call here: every DRM reference is a CONSTANT from drm-uapi/drm.h, which Mesa vendors,
+ * and all the work goes through util_sync_provider - the abstraction that exists to decouple the two. So
+ * a platform that implements the provider itself gets the whole vk_sync layer out of this one file.
+ *
+ * Guarded rather than deleted, so that a future libdrm-only addition still compiles.
+ */
+#ifdef HAVE_LIBDRM
 #include <xf86drm.h>
+#endif
 
 #include "drm-uapi/drm.h"
 
@@ -291,6 +302,30 @@ vk_drm_syncobj_wait_many(struct vk_device *device,
        * for drivers that don't support timelines.  Instead, we have to spin
        * on DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE until it succeeds.
        */
+      /* ⚠ AND THAT SPIN NEEDS A CAPABILITY THIS PROVIDER MAY NOT HAVE. sync_has_sync_file calls
+       * export_sync_file through the provider without checking it, which is safe over a DRM kernel - where
+       * the entry always exists - and a jump to address zero anywhere else. Measured: the first
+       * vkQueuePresentKHR of a title, straight through
+       * wsi_queue_submit2_unordered -> vk_device_copy_semaphore_payloads -> here.
+       *
+       * A PROVIDER WITH NEITHER TIMELINES NOR SYNC FILES HAS NOTHING TO WAIT FOR. "Pending" means the
+       * payload has been installed but may not have signalled yet, and the only reason it can lag is a
+       * timeline point that has not materialised. Without timelines a binary payload is installed by the
+       * submission itself - which Vulkan requires to have been queued before this wait is reached - so the
+       * condition is already true on arrival, and asking again is asking a question with one answer.
+       *
+       * Stated rather than assumed silently: this is the second NULL entry in this provider that WSI's
+       * present path has reached, and the first cost a run that died with an empty log.
+       */
+      if (device->sync->export_sync_file == NULL) {
+         static bool said = false;
+         if (!said) {
+            said = true;
+            mesa_logi("vk_sync: WAIT_PENDING on a provider with no timelines and no sync-file export is "
+                      "satisfied on arrival - a binary payload is installed by the submission itself");
+         }
+         return VK_SUCCESS;
+      }
       return spin_wait_for_sync_file(device, wait_count, waits,
                                      wait_flags, abs_timeout_ns);
    }
@@ -646,7 +681,29 @@ vk_drm_syncobj_copy_payloads(struct vk_device *device,
    if (wait_count == 0)
       return vk_drm_syncobj_signal_many(device, signal_count, signals);
 
-   if (vk_device_has_timeline_syncobj(device)) {
+   /* ⚠ THE QUESTION IS WHETHER THE PROVIDER CAN TRANSFER, not whether it has timelines.
+    *
+    * A binary transfer IS a payload copy, which is exactly what this function means. Asking about timelines
+    * gets the wrong answer for a provider that has one capability and not the other: the else branch below
+    * goes through sync-file export/import, and a platform with no file descriptors for fences implements
+    * export_sync_file as a refusal - so the copy fails on a platform that could have done it directly.
+    *
+    * ⚠ THIS ARM RESTS ON transfer BEING HONEST, which cost a fix in u_sync_provider.c. The DRM provider
+    * used to fill the entry in unconditionally, so on a kernel whose driver lacks DRIVER_SYNCOBJ_TIMELINE
+    * this test passed and DRM_IOCTL_SYNCOBJ_TRANSFER then returned -EOPNOTSUPP - turning a present that
+    * had worked through sync files into VK_ERROR_UNKNOWN, on every Mesa driver rather than only this one.
+    * The entry is now set only when DRM_CAP_SYNCOBJ_TIMELINE reports that same feature bit, which makes
+    * a non-NULL transfer mean what it says here.
+    *
+    * ⚠ wait_count == 1 IS A CORRECTNESS BOUND, not a conservative one. The many-to-many arm of
+    * vk_drm_syncobj_transfer_payloads builds an intermediary TIMELINE - it transfers each wait to point i+1
+    * of a temporary and relies on a whole chain being waited on at once, which is dma_fence_chain's
+    * behaviour. A provider whose syncobj is a counter rather than a timeline cannot express that, so taking
+    * the branch would be wrong rather than merely unsupported. One wait transfers directly and needs none of
+    * it, and one wait is what a presentation engine hands us.
+    */
+   if (vk_device_has_timeline_syncobj(device) ||
+       (device->sync != NULL && device->sync->transfer != NULL && wait_count == 1)) {
       return vk_drm_syncobj_transfer_payloads(device, wait_count, waits,
                                               signal_count, signals);
    } else {

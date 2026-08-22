@@ -7,3 +7,9 @@
 /build
 .venv/
 *.mda.tar
+
+# build-support/orbis/build.sh
+/build-orbis
+/build-host
+/build-hostorbis
+/.orbis-cross-stamp

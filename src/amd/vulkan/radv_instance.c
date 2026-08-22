@@ -294,7 +294,16 @@ radv_CreateInstance(const VkInstanceCreateInfo *pCreateInfo, const VkAllocationC
          fprintf(stderr, "radv: Failed to open log file: %s.\n", filename);
    }
 
+   /* ⚠ THE PREDICATE IS "IS THIS THE CONSOLE", NOT "IS THERE NO DRM", and getting that backwards put
+    * Windows on the Orbis arm. MESA_SYSTEM_HAS_KMS_DRM is 0 on Windows as well, so `#else` handed a
+    * Windows build an enumerate hook whose device creation calls radv_orbis_winsys_query_info - a
+    * function that platform does not build. Windows keeps upstream's arrangement. */
+#ifdef HAVE_ORBIS_PLATFORM
+   /* try_create_for_drm is reached only by the runtime's DRM-node walk, which does not exist here. */
+   instance->vk.physical_devices.enumerate = enumerate_orbis_physical_devices;
+#else
    instance->vk.physical_devices.try_create_for_drm = create_drm_physical_device;
+#endif
    instance->vk.physical_devices.destroy = radv_physical_device_destroy;
 
    if (instance->debug_flags & RADV_DEBUG_STARTUP)

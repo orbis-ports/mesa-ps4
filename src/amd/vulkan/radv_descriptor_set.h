@@ -91,6 +91,12 @@ struct radv_descriptor_set_header {
    uint64_t va;
    uint32_t *mapped_ptr;
    struct radv_descriptor_range *dynamic_descriptors;
+
+#ifdef HAVE_ORBIS_PLATFORM
+   /* The pool this set's storage belongs to, so a binding can be stamped with the pool's generation.
+    * See radv_descriptor_pool::orbis_generation for why an address is not enough. */
+   struct radv_descriptor_pool *orbis_pool;
+#endif
 };
 
 struct radv_descriptor_set {

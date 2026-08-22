@@ -28,7 +28,34 @@
 #define DETECT_OS_ANDROID 1
 #endif
 
-#if defined(__FreeBSD__) || defined(__FreeBSD_kernel__)
+/* The PS4 is a FreeBSD KERNEL with a musl LIBC, so __FreeBSD__ is defined while none of FreeBSD's own
+ * libc interfaces exist - no sys/umtx.h, no machine/cpu.h, no kinfo_file, no KERN_PROC_ARGS. Every
+ * DETECT_OS_FREEBSD arm in util/ reaches for one of those, so this platform wants the generic POSIX
+ * arms instead. Thirteen of this port's fourteen remaining build errors were exactly that.
+ *
+ * Stated as its own case rather than by editing four call sites: "the kernel is FreeBSD" and "the libc
+ * is FreeBSD's" are different facts, and only the second one is what those arms need.
+ */
+#if defined(__PS4__) || defined(__ORBIS__)
+/* BSD is TRUE - the kernel is one - while FREEBSD is deliberately not set, because that macro is what
+ * util/ uses to reach for FreeBSD's LIBC. The distinction is the whole point of this case.
+ *
+ * ⚠ "DETECT_OS_BSD with no specific BSD set" is a state nothing in the tree had produced before, and two
+ * places assume it cannot happen. Both are guarded by a sysconf() probe today, so both are unreachable
+ * on this toolchain - and both would fail confusingly rather than usefully if that ever changed:
+ *
+ *   os_misc.c, os_get_total_physical_memory()  picks a sysctl mib by BSD flavour and ends its chain in
+ *                                              `#error Unsupported *BSD`. Guarded by HAVE_SYSCONF.
+ *   u_cpu_detect.c, the DETECT_OS_BSD arm      passes `int *` to sysctl()'s `size_t *oldlen`, which is
+ *                                              an incompatible-pointer error rather than a warning
+ *                                              here. Guarded by _SC_NPROCESSORS_CONF, which musl
+ *                                              defines. That one is an upstream bug on every BSD; it is
+ *                                              simply never compiled.
+ */
+#define DETECT_OS_BSD 1
+#define DETECT_OS_POSIX 1
+
+#elif defined(__FreeBSD__) || defined(__FreeBSD_kernel__)
 #define DETECT_OS_FREEBSD 1
 #define DETECT_OS_BSD 1
 #define DETECT_OS_POSIX 1

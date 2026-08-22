@@ -22,6 +22,7 @@
  */
 
 #include "wsi_common_private.h"
+#include "util/orbis_api_probe.h"
 #include "wsi_common_entrypoints.h"
 #include "util/u_debug.h"
 #include "util/macros.h"
@@ -238,6 +239,19 @@ wsi_device_init(struct wsi_device *wsi,
    if (wsi->has_present_wait)
       WSI_GET_CB(WaitSemaphores);
 #undef WSI_GET_CB
+
+   /* ⚠ CHECKED ONCE, HERE, RATHER THAN FAULTED ON LATER. Every present goes through QueueSubmit2 and calls
+    * it through this pointer; a NULL entry is a jump to address zero, which on a platform without a crash
+    * reporter is a dead process and an empty log. It is core Vulkan 1.3 and WSI assumes it unconditionally,
+    * so a driver that does not expose it is misconfigured rather than unlucky - and this says which.
+    *
+    * Not an assert: that vanishes under NDEBUG, which is precisely the build that ships. Not per-submit
+    * either, and not behind a platform ifdef, which is where this check first lived: a null dispatch entry
+    * is nobody's platform-specific hazard. */
+   if (wsi->QueueSubmit2 == NULL) {
+      result = VK_ERROR_FEATURE_NOT_PRESENT;
+      goto fail;
+   }
 
 #if defined(VK_USE_PLATFORM_XCB_KHR)
    result = wsi_x11_init_wsi(wsi, alloc, dri_options);
@@ -2311,6 +2325,7 @@ wsi_AcquireNextImage2KHR(VkDevice _device,
                          const VkAcquireNextImageInfoKHR *pAcquireInfo,
                          uint32_t *pImageIndex)
 {
+   ORBIS_API_PROBE(ORBIS_API_ACQUIRE);
    MESA_TRACE_FUNC();
    VK_FROM_HANDLE(vk_device, device, _device);
 
@@ -2441,6 +2456,20 @@ wsi_common_queue_present(const struct wsi_device *wsi,
    STACK_ARRAY(VkResult, results, pPresentInfo->swapchainCount);
    for (uint32_t i = 0; i < pPresentInfo->swapchainCount; i++)
       results[i] = VK_SUCCESS;
+
+#ifdef HAVE_ORBIS_PLATFORM
+   /* The entry to the whole present. Bounded. Without it, "the application never called
+    * vkQueuePresentKHR" and "present ran and stalled inside" are the same silence.
+    */
+   {
+      static unsigned said;
+      if (said < 4) {
+         ++said;
+         mesa_logi("wsi/orbis: queue_present entered - %u swapchain(s), %u wait semaphore(s)",
+                   pPresentInfo->swapchainCount, pPresentInfo->waitSemaphoreCount);
+      }
+   }
+#endif
 
    /* First, do the throttle waits, creating the throttle fences if needed */
    for (uint32_t i = 0; i < pPresentInfo->swapchainCount; i++) {
@@ -2919,6 +2948,7 @@ wsi_common_queue_present(const struct wsi_device *wsi,
 VKAPI_ATTR VkResult VKAPI_CALL
 wsi_QueuePresentKHR(VkQueue _queue, const VkPresentInfoKHR *pPresentInfo)
 {
+   ORBIS_API_PROBE(ORBIS_API_PRESENT);
    MESA_TRACE_FUNC();
    VK_FROM_HANDLE(vk_queue, queue, _queue);
 

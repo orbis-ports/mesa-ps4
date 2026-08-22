@@ -54,8 +54,12 @@ vulkan_lite_runtime_deps = [
   idep_vulkan_util,
 ]
 
-if dep_libdrm.found()
+# The gate is "can anything supply a util_sync_provider", not "does libdrm exist" - see the note at the
+# top of vk_drm_syncobj.c. The dependency itself stays conditional on actually having libdrm.
+if dep_libdrm.found() or with_platform_orbis
   vulkan_lite_runtime_files += files('vk_drm_syncobj.c')
+endif
+if dep_libdrm.found()
   vulkan_lite_runtime_deps += dep_libdrm
 endif
 

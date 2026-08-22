@@ -7,14 +7,22 @@
 #ifndef AC_DRM_FOURCC_H
 #define AC_DRM_FOURCC_H
 
-#ifdef _WIN32
+#if !MESA_SYSTEM_HAS_KMS_DRM
 #include <stdint.h>
-typedef uint64_t __u64;
+/* uint64_t rather than a local `typedef uint64_t __u64`, which is what this arm used to carry.
+ *
+ * The typedef could not be written correctly. Unconditionally, it collides with Linux's own __u64 as
+ * soon as anything pulls in <linux/types.h> - which happens on a HOST build of a no-DRM platform's arm,
+ * the way such a driver is exercised without the device present. Guarded on __linux__, it tests the
+ * wrong thing: whether __u64 has ALREADY been defined depends on include order, not on the platform, so
+ * the next includer to sort differently gets "unknown type name '__u64'". There is no third spelling.
+ * Since the name is only ever used to widen a constant, the type it aliases will do.
+ */
 #define DRM_FORMAT_MOD_VENDOR_NONE    0
 #define DRM_FORMAT_MOD_VENDOR_AMD     0x02
 #define DRM_FORMAT_RESERVED	      ((1ULL << 56) - 1)
 #define fourcc_mod_code(vendor, val) \
-	((((__u64)DRM_FORMAT_MOD_VENDOR_## vendor) << 56) | ((val) & 0x00ffffffffffffffULL))
+	((((uint64_t)DRM_FORMAT_MOD_VENDOR_## vendor) << 56) | ((val) & 0x00ffffffffffffffULL))
 #define DRM_FORMAT_MOD_INVALID	fourcc_mod_code(NONE, DRM_FORMAT_RESERVED)
 #define DRM_FORMAT_MOD_LINEAR	fourcc_mod_code(NONE, 0)
 #define AMD_FMT_MOD fourcc_mod_code(AMD, 0)

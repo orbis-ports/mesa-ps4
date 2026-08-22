@@ -558,7 +558,7 @@ radv_rt_compile_nir(struct radv_device *device, struct vk_pipeline_cache *cache,
    *out_shader = shader;
 
    if (radv_can_dump_shader_stats(compiler_info, stage->nir))
-      radv_dump_shader_stats(device, &pipeline->base.base, shader, stderr);
+      radv_dump_shader_stats(device, &pipeline->base.base, shader, stage, radv_shader_stats_output());
 
    return shader ? VK_SUCCESS : VK_ERROR_OUT_OF_HOST_MEMORY;
 }

@@ -6,6 +6,7 @@
  */
 
 #include "ac_surface.h"
+#include "util/log.h"
 
 #include "ac_drm_fourcc.h"
 #include "ac_gpu_info.h"
@@ -23,7 +24,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-#ifdef _WIN32
+/* The #else arm below reaches for xf86drm.h, which is libdrm's - so the question is whether this
+ * platform has a DRM userspace at all, not whether it is Windows.
+ */
+#if !MESA_SYSTEM_HAS_KMS_DRM
 #define AMDGPU_TILING_ARRAY_MODE_SHIFT			0
 #define AMDGPU_TILING_ARRAY_MODE_MASK			0xf
 #define AMDGPU_TILING_PIPE_CONFIG_SHIFT			4
@@ -66,10 +70,13 @@
  * to uncompressed. Set when parts of an allocation bypass DCC and read raw data. */
 #define AMDGPU_TILING_GFX12_DCC_WRITE_COMPRESS_DISABLE_SHIFT   14
 #define AMDGPU_TILING_GFX12_DCC_WRITE_COMPRESS_DISABLE_MASK    0x1
+/* uint64_t, not __u64: this arm has no Linux kernel headers to define the latter, and ac_drm_fourcc.h no
+ * longer typedefs it - see the note there.
+ */
 #define AMDGPU_TILING_SET(field, value) \
-	(((__u64)(value) & AMDGPU_TILING_##field##_MASK) << AMDGPU_TILING_##field##_SHIFT)
+	(((uint64_t)(value) & AMDGPU_TILING_##field##_MASK) << AMDGPU_TILING_##field##_SHIFT)
 #define AMDGPU_TILING_GET(value, field) \
-	(((__u64)(value) >> AMDGPU_TILING_##field##_SHIFT) & AMDGPU_TILING_##field##_MASK)
+	(((uint64_t)(value) >> AMDGPU_TILING_##field##_SHIFT) & AMDGPU_TILING_##field##_MASK)
 
 static char *
 drmGetFormatModifierName(uint64_t modifier)
@@ -1502,6 +1509,50 @@ static int gfx6_select_3d_tile_idx(const struct ac_addrlib *const addrlib,
       if (!modes[i].supported)
          continue;
 
+      /* ⚠ THE `supported` FIELD ABOVE SAYS IT COMES FROM THE KERNEL'S TILE MODE ARRAYS AND DOES NOT.
+       *
+       * It is a compile-time constant per entry. The kernel's cik_tiling_mode_table_init() assigns
+       * tile[0..14], tile[16], tile[17] and tile[27..30] and NOTHING ELSE - in all four of its
+       * pipe-count branches - so indices 15 and 18..26 come back as zero, and six of the eight
+       * candidates above name exactly those. A zero register word decodes as ARRAY_LINEAR_GENERAL with
+       * every field clear.
+       *
+       * WHAT THAT COSTS, measured on the host by replaying the selector against addrlib rather than
+       * reasoned about (the throwaway harness that did it is gone; the chain below is its output):
+       *
+       *   CiLib::HwlComputeMacroModeIndex reads m_tileTable[tileIndex].mode, finds LINEAR_GENERAL, takes
+       *   its !IsMacroTiled arm and returns TileIndexNoMacroIndex - which is -3 (addrcommon.h:221), and
+       *   ADDR_OK alongside it. The read below then indexes cik_macrotile_mode_array[-3].
+       *
+       *   That is three words before the array, and si_tile_mode_array[32] is the field immediately in
+       *   front of it (ac_gpu_info.h:445). So the out-of-bounds read lands on si_tile_mode_array[29] - a
+       *   real GB_TILE_MODE word, which decodes into perfectly plausible bank_width / bank_height /
+       *   num_banks / macro_tile_aspect. Silent wrong data, never a crash, which is why this has stood.
+       *
+       *   With those alignments the loop below accepts 3D_TILED_XTHICK for OpenGothic's fog LUT, and
+       *   addrlib then ASSERTS on that mode - it has no table entry to lay it out with. In a build with
+       *   asserts compiled out it proceeds, HwlPostCheckTileIndex finds no matching entry, and the
+       *   surface carries tileIndex -1 into the image descriptor. The earlier effort on this port saw
+       *   exactly that, called it "an invalid tile mode index", and fixed the symptom.
+       *
+       * SO GATE ON THE TABLE, WHICH IS WHAT `supported` CLAIMS TO DO. Not on the platform: this is a
+       * question about the device's own registers and it answers itself on every device. On Liverpool it
+       * leaves 2D_TILED_THIN1 and 1D_TILED_THIN1, both populated, both with a macro mode index in range.
+       *
+       * Limit worth naming: this tests the entry the candidate NAMES, not that the entry holds the mode
+       * the candidate wants. The two are the same on every kernel that fills this table, and checking
+       * the mode as well would duplicate HwlPostCheckTileIndex here.
+       *
+       * ⚠ CLEARS `supported` RATHER THAN SKIPPING, BECAUSE THERE ARE TWO LOOPS. The second one below
+       * selects on the alignments this one computes and gates only on `supported` - so a candidate
+       * merely `continue`d here reaches it with align_width, align_height and align_depth all still
+       * zero, and ac_estimate_size divides by them. That is a SIGFPE at the first 3D image the title
+       * creates, which is what the first attempt at this fix did on the console. */
+      if (info->gfx_level >= GFX7 && info->si_tile_mode_array[modes[i].gfx7_tile_mode_index] == 0) {
+         modes[i].supported = false;
+         continue;
+      }
+
       if (modes[i].tile_mode <= ADDR_TM_1D_TILED_THICK) {
          modes[i].align_width = modes[i].microtile_width;
          modes[i].align_height = modes[i].microtile_height;
@@ -1520,6 +1571,19 @@ static int gfx6_select_3d_tile_idx(const struct ac_addrlib *const addrlib,
          if (AddrGetMacroModeIndex(addrlib->handle, &in, &out) != ADDR_OK) {
             fprintf(stderr, "amdgpu: AddrGetMacroModeIndex failed.\n");
             return -1;
+         }
+
+         /* ADDR_OK does not mean the index is one. TileIndexNoMacroIndex and TileIndexInvalid are both
+          * negative and both arrive with ADDR_OK, and the read below has no bounds of its own. The gate
+          * above should have kept every such entry out; this is the second line, because an
+          * out-of-bounds read that returns plausible numbers is the hardest kind of defect to see.
+          *
+          * Clears `supported` for the same reason the gate above does: the selection loop below would
+          * otherwise divide by this entry's zero alignments. */
+         if (out.macroModeIndex < 0 ||
+             out.macroModeIndex >= (INT_32)ARRAY_SIZE(info->cik_macrotile_mode_array)) {
+            modes[i].supported = false;
+            continue;
          }
 
          uint32_t macro_mode_reg = info->cik_macrotile_mode_array[out.macroModeIndex];
@@ -1585,6 +1649,51 @@ static void gfx6_fill_addr_info_from_surf(const struct ac_addrlib *const addrlib
    if (surf->flags & (RADEON_SURF_Z_OR_SBUFFER) && mode < RADEON_SURF_MODE_1D)
       mode = RADEON_SURF_MODE_1D;
 
+   /* ⚠ TAKE TILING OFF 3D IMAGES, BECAUSE THE ONLY LAYERED PASS IN THIS TITLE IS A 3D TARGET.
+    *
+    * This tree lost three knobs the old one had, all built for one pass. OpenGothic's fog LUT is
+    * `DRAW_INDEX_AUTO 3 indices, 32 instances` with PA_CL_VS_OUT_CNTL.USE_VTX_RENDER_TARGET_INDX set - one
+    * instance per LAYER of a 3D image, drawn by a layered shader, and nothing else this port runs is
+    * layered. The earlier effort found that surface carrying an invalid tile mode index, fixed it, and the
+    * draw still would not execute.
+    *
+    * The artefact this is aimed at now is different but sits in the same place: a rectangular patch at the
+    * top left of the finished frame, visible ONLY where geometry was drawn, its colours following the
+    * scene - transparent, green, purple, white as the camera moves. The old tree never showed it. A 3D
+    * surface whose slices are addressed differently by the driver and by the hardware would produce
+    * exactly a block of somebody else's data in a fixed corner.
+    *
+    * ⚠ ANSWERED, AND THE PATCH WENT. 3776 frames, zero GPU faults, artefact gone. So a TILED 3D surface
+    * IS laid out or addressed wrongly on this part, and this knob is a WORKAROUND standing in for a fix
+    * nobody has written: linear 3D images cost memory and bandwidth, and correctness should not depend on
+    * paying that.
+    *
+    * The earlier effort split this question in two with this very knob - the surface's LAYOUT against the
+    * draw's LAYERED-NESS - and never resolved either half. This resolves the layout half: it is the
+    * layout. What remains is which term of it, and the suspects are the same ones every addrlib input on
+    * this port carries: GB_ADDR_CONFIG's PIPE_CONFIG and BANK/MACRO fields are synthesised from numbers
+    * this arm marks UNCITED, and a 3D surface's slice stride is where a wrong one shows first, because
+    * nothing else in this title has depth.
+    *
+    * LINEAR_ALIGNED is tile mode index 8 with no micro or macro tiling at all, and it is the mode this
+    * port's own scan-out target uses while rendering a correct picture.
+    *
+    * Costs memory and bandwidth, which is why it is an experiment rather than a default.
+    * ORBIS_3D_LINEAR=1. */
+   if (config->is_3d && mode != RADEON_SURF_MODE_LINEAR_ALIGNED) {
+      const char *const linear3d = getenv("ORBIS_3D_LINEAR");
+      if (linear3d != NULL && linear3d[0] == '1' && linear3d[1] == '\0') {
+         mode = RADEON_SURF_MODE_LINEAR_ALIGNED;
+         /* Loud, because a knob that can silently not fire has to say that it did - and the image's own
+          * size changes with it, which is the second proof. */
+         static bool said = false;
+         if (!said) {
+            said = true;
+            mesa_logi("orbis: ORBIS_3D_LINEAR=1 - 3D images are LINEAR_ALIGNED on this device");
+         }
+      }
+   }
+
    /* Set the requested tiling mode. */
    switch (mode) {
    case RADEON_SURF_MODE_LINEAR_ALIGNED:
@@ -1607,6 +1716,28 @@ static void gfx6_fill_addr_info_from_surf(const struct ac_addrlib *const addrlib
          }
       } else if (config->is_3d) {
          AddrSurfInfoIn->tileMode = gfx6_select_3d_tile_idx(addrlib, info, config, surf);
+#ifdef HAVE_ORBIS_PLATFORM
+         /* ⚠ SAY WHICH MODE, ONCE, BECAUSE NOTHING ELSE IN THE LOG CAN.
+          *
+          * The run that confirmed the table gate was read by ruling alternatives out - the workaround
+          * was absent from the env, so the tiled path was the only one left, and the package before it
+          * had crashed proving the gate was live. That reasoning is sound and it is not a measurement.
+          * The driver logs no image sizes and no tile modes, so "which mode did the fog LUT get" had no
+          * answer in 27501 lines.
+          *
+          * One line fixes that for every run after this one. Once, because there are two 3D images in
+          * this title and thousands of frames. */
+         {
+            static bool said = false;
+            if (!said) {
+               said = true;
+               mesa_logi("orbis: 3D images are tile mode %u (%ux%ux%u, %u bpe) - the selector's choice, "
+                         "gated on the kernel's tile table",
+                         AddrSurfInfoIn->tileMode, config->info.width, config->info.height,
+                         config->info.depth, surf->bpe);
+            }
+         }
+#endif
       } else {
          AddrSurfInfoIn->tileMode = ADDR_TM_2D_TILED_THIN1;
       }

@@ -81,6 +81,16 @@ enum radeon_family
    /* GFX7 (Sea Islands) */
    CHIP_BONAIRE,
    CHIP_KAVERI,
+   /* ⚠ AFTER CHIP_BONAIRE ON PURPOSE. ac_get_gfx_level() decides GFX7 with `family >= CHIP_BONAIRE`,
+    * which is the only >= comparison in the tree keyed on a GFX6/7 family - so placing these two here
+    * needs no change to that function at all. Ahead of CHIP_BONAIRE they would classify as GFX6 and the
+    * function would have to grow arms to say otherwise.
+    *
+    * Both are Sony semi-custom parts of the Kaveri family (FAMILY_KV), which is why they sit beside
+    * CHIP_KAVERI rather than beside CHIP_BONAIRE, whose gfx7 tables they otherwise resemble.
+    */
+   CHIP_LIVERPOOL,      /* PlayStation 4 */
+   CHIP_GLADIUS,        /* PlayStation 4 Pro ("Neo") */
    CHIP_KABINI,
    CHIP_HAWAII,         /* Radeon 290, 390 */
    /* GFX8 (Volcanic Islands & Polaris) */

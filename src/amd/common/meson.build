@@ -198,9 +198,22 @@ if with_gfx_compute
   )
 endif
 
-if not with_platform_windows
+# Not MESA_SYSTEM_HAS_KMS_DRM's meson twin: this file is the libdrm-backed implementation of the
+# ac_drm_* surface, so the question is "does this platform get its ac_drm_* from libdrm", and the PS4
+# answers no for the same reason Windows does. Its replacement is a drop-in - ac_linux_drm.h declares
+# every one of these out-of-line, with no static inline - and lands with the rest of the arm.
+if not with_platform_windows and not with_platform_orbis
   amd_common_files += files(
     'ac_linux_drm.c',
+  )
+endif
+
+# The PS4 arm of the same layer. ac_linux_drm.c is REPLACED rather than patched: ac_linux_drm.h declares
+# every one of these out-of-line, with no static inline, so a file providing the same symbols is a
+# drop-in and this port never fights a rebase over that file.
+if with_platform_orbis
+  amd_common_files += files(
+    'ac_orbis_drm.c',
   )
 endif
 

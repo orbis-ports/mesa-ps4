@@ -9,6 +9,7 @@
  */
 
 #include "radv_device_memory.h"
+#include "util/orbis_api_probe.h"
 #include "tools/radv_debug.h"
 #include "tools/radv_rmv.h"
 #include "radv_android.h"
@@ -327,6 +328,7 @@ VKAPI_ATTR VkResult VKAPI_CALL
 radv_AllocateMemory(VkDevice _device, const VkMemoryAllocateInfo *pAllocateInfo,
                     const VkAllocationCallbacks *pAllocator, VkDeviceMemory *pMem)
 {
+   ORBIS_API_PROBE(ORBIS_API_MEM_ALLOC);
    VK_FROM_HANDLE(radv_device, device, _device);
    return radv_alloc_memory(device, pAllocateInfo, pAllocator, pMem, false);
 }

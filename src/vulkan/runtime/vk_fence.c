@@ -22,6 +22,7 @@
  */
 
 #include "vk_fence.h"
+#include "util/orbis_api_probe.h"
 
 #include "util/os_time.h"
 #include "util/perf/cpu_trace.h"
@@ -230,6 +231,7 @@ VKAPI_ATTR VkResult VKAPI_CALL
 vk_common_GetFenceStatus(VkDevice _device,
                          VkFence _fence)
 {
+   ORBIS_API_PROBE(ORBIS_API_FENCE_STATUS);
    VK_FROM_HANDLE(vk_device, device, _device);
    VK_FROM_HANDLE(vk_fence, fence, _fence);
 
@@ -253,6 +255,7 @@ vk_common_WaitForFences(VkDevice _device,
                         VkBool32 waitAll,
                         uint64_t timeout)
 {
+   ORBIS_API_PROBE(ORBIS_API_WAIT_FENCE);
    MESA_TRACE_FUNC();
 
    VK_FROM_HANDLE(vk_device, device, _device);

@@ -13,6 +13,12 @@
 #include "amd_family.h"
 #include "sid.h"
 
+#include "util/log.h"
+
+#include <inttypes.h>
+#include <stdlib.h>
+#include <string.h>
+
 void
 ac_emit_cp_indirect_buffer(struct ac_cmdbuf *cs, uint64_t va, uint32_t cdw,
                            enum ac_cp_indirect_buffer_flags flags,
@@ -37,6 +43,13 @@ void
 ac_emit_cp_cond_exec(struct ac_cmdbuf *cs, enum amd_gfx_level gfx_level,
                      uint64_t va, uint32_t count)
 {
+   /* EXEC_COUNT is bits 13:0 - AMD's PM4 tables in src/amd/packets say so for the PFP and the MEC
+    * form alike. A count past 16383 does not skip further, it skips count & 0x3fff dwords and leaves
+    * the CP resuming inside a packet, so this is a wedge rather than a wrong result. Caught here
+    * because the caller that overflowed it computed the number correctly and only the field was too
+    * small to hold it. */
+   assert(count <= 0x3FFF);
+
    ac_cmdbuf_begin(cs);
    if (gfx_level >= GFX7) {
       ac_cmdbuf_emit(PKT3(PKT3_COND_EXEC, 3, 0));
@@ -343,15 +356,99 @@ void
 ac_emit_cp_tess_rings(struct ac_cmdbuf *cs, const struct radeon_info *info,
                       uint64_t attr_ring_va)
 {
-   const uint64_t va = attr_ring_va + info->tess_offchip_ring_size;
+   uint64_t va = attr_ring_va + info->tess_offchip_ring_size;
+
+   /* ⚠ THE DIAGNOSTIC BIAS IS APPLIED HERE, WHERE THE REGISTER IS ACTUALLY BUILT. Setting it anywhere else
+    * would move the number this driver remembers and leave the number the hardware receives alone, which is
+    * the difference between an experiment and a log line about one. See radv_emit_tess_factor_ring for why
+    * the factor ring's base is being moved on purpose. */
+   if (info->family == CHIP_LIVERPOOL || info->family == CHIP_GLADIUS) {
+      const char *const bias_s = getenv("ORBIS_TF_BASE_BIAS");
+      if (bias_s != NULL)
+         va += strtoull(bias_s, NULL, 0);
+   }
    uint32_t tf_ring_size = info->tess_factor_ring_size / 4;
 
    if (info->gfx_level >= GFX11) {
       /* TF_RING_SIZE is per SE on GFX11. */
       tf_ring_size /= info->max_se;
+   } else if (info->family == CHIP_LIVERPOOL || info->family == CHIP_GLADIUS) {
+      /* ⚠ AND ON THESE TWO PARTS IT APPEARS TO BE PER SE AS WELL. CANDIDATE, NOT ESTABLISHED.
+       *
+       * MEASURED on a PlayStation 4: a GPU write fault at VA 0x212a50000 against a tess ring at
+       * 0x212800000, whose offchip region is 2359296 B and whose factor ring therefore begins at
+       * 0x212a40000 and is 55296 B long, ending at 0x212a4d800. The fault is 0x10000 into the factor
+       * ring - past its end, and inside where a SECOND per-engine copy of it would sit.
+       *
+       * The competing reading of the same address is an offchip overrun: 74 * 32768 is 0x250000, which
+       * hits the same byte exactly. That one was tried first and its prediction failed - programming
+       * OFFCHIP_BUFFERING per SE left the fault at the same address (see ac_gpu_info.c). This candidate
+       * has not been tried, and it explains why writing the full size overruns: the VGT gives each
+       * engine a region of TF_RING_SIZE and the second engine's starts where the allocation ends.
+       *
+       * ⚠ IT RESTS ON max_se = 2, which comes from CU topology this port's arm marks UNCITED.
+       * ORBIS_TF_RING_PER_SE=0 restores the undivided size, which is the control for the run. */
+      /* ⚠ AND THIS PREDICTION FAILED TOO, so it is off by default and kept only as an experiment.
+       *
+       * With TF_RING_SIZE carrying 6912 dwords - 27648 B, one engine's worth - and the read at Sony's base
+       * masked out of the way so the write was observable at all, the writes landed at 0x212a50000,
+       * 0x212a51000 and 0x212a52000: offsets 0x10000, 0x11000 and 0x12000 into a factor ring the register
+       * now describes as 0x6c00 long. They are not bounded by TF_RING_SIZE, and halving it moved them
+       * nowhere. The same measurement had already killed the OFFCHIP_BUFFERING reading.
+       *
+       * Both readings of that address are therefore dead, and what is left is the third possibility the
+       * earlier effort wrote down and never got to test: the ring is simply SHORTER than the hardware uses,
+       * because every term of its size comes from CU topology this port marks UNCITED. That is an
+       * ALLOCATION question, and ORBIS_TESS_RING_SCALE is the knob for it. */
+      const char *const on = getenv("ORBIS_TF_RING_PER_SE");
+      const bool        per_se = on != NULL && strcmp(on, "0") != 0;
+      static bool       said;
+
+      if (per_se)
+         tf_ring_size /= info->max_se;
+
+      /* Stated once, because a run that carries the division and a run that does not are otherwise
+       * indistinguishable in the log - and the whole point of the knob is to compare them. */
+      if (!said) {
+         said = true;
+         mesa_logi("orbis: VGT_TF_RING_SIZE <- %u dwords (%u B) %s; factor ring 0x%" PRIx64 "..0x%" PRIx64
+                   ", %u shader engine(s)",
+                   tf_ring_size, tf_ring_size * 4,
+                   per_se ? "PER SHADER ENGINE - divided by max_se (ORBIS_TF_RING_PER_SE, an experiment "
+                            "whose prediction already failed once)"
+                          : "undivided, as upstream",
+                   va, va + info->tess_factor_ring_size, info->max_se);
+      }
    }
 
-   assert((tf_ring_size & C_030938_SIZE) == 0);
+   /* ⚠ C_030938_SIZE IS THE WRONG MASK TO ASSERT AGAINST, and it let a real overflow through.
+    *
+    * The S_/C_ pair is generated from the widest definition of the field - 17 bits, because GFX11
+    * widened it - so C_030938_SIZE is 0xFFFE0000 and a value of 0x10000 passes on a part whose
+    * field is 16 bits wide. Mesa's own register database has the per-generation truth:
+    * bits [0,15] for GFX6 through GFX10, bits [0,16] from GFX11. A PlayStation 4 asking for 256
+    * tess factor workgroups produced exactly 0x10000, and the register would have been programmed
+    * with zero.
+    *
+    * Clamped rather than only asserted, because an assert is compiled out of a release build and
+    * the hardware's own truncation is silent - a ring size of zero looks like a driver that never
+    * set the register. */
+   {
+      const uint32_t tf_size_max = info->gfx_level >= GFX11 ? 0x1FFFF : 0xFFFF;
+
+      if (tf_ring_size > tf_size_max) {
+         static bool clamped;
+         if (!clamped) {
+            clamped = true;
+            mesa_logw("amd: VGT_TF_RING_SIZE %u dwords does not fit the %u-bit SIZE field on this "
+                      "generation - clamped to %u. The tess factor ring is sized wrong upstream of "
+                      "here; the hardware would otherwise have taken the low bits.",
+                      tf_ring_size, info->gfx_level >= GFX11 ? 17 : 16, tf_size_max);
+         }
+         tf_ring_size = tf_size_max;
+      }
+      assert(tf_ring_size <= tf_size_max);
+   }
 
    ac_cmdbuf_begin(cs);
 

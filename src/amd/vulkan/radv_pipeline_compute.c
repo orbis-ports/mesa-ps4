@@ -218,7 +218,8 @@ radv_compute_pipeline_compile(const VkComputePipelineCreateInfo *pCreateInfo, st
 
    free(cs_binary);
    if (radv_can_dump_shader_stats(&device->compiler_info, cs_stage.nir)) {
-      radv_dump_shader_stats(device, &pipeline->base, pipeline->base.shaders[MESA_SHADER_COMPUTE], stderr);
+      radv_dump_shader_stats(device, &pipeline->base, pipeline->base.shaders[MESA_SHADER_COMPUTE], &cs_stage,
+                             radv_shader_stats_output());
    }
    radv_pipeline_stage_finish(&cs_stage);
 

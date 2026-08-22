@@ -2700,6 +2700,118 @@ const struct amdgpu_device amdgpu_devices[] = {
          },
       },
    },
+   /* ⚠ NOT HAND-WRITTEN, AND NOT COPIED FROM BONAIRE. Emitted by ac_orbis_drm.c's own
+    * orbis_dump_shim_device() under ORBIS_DUMP_SHIM_DEVICE=1, running the PS4 arm as a host ICD
+    * (build-support/orbis/build.sh --host-orbis) - so every number here is the number that arm gives
+    * RADV on the console, rather than a second description that can drift from it.
+    *
+    * WHAT IT IS FOR: running STOCK RADV against this device's description on Linux, where there is a
+    * working kernel, a real allocator and a command-stream dumper.  It is also what feeds
+    * AMDGPU_GPU_ID=liverpool to ac_print_tiling_layouts and the surface tests, which is the only
+    * host-side check of the tile tables this port synthesises.
+    *
+    * PA_SC_RASTER_CONFIG is the one value NOT synthesised: 0x2a00161a was read off the console before
+    * RADV's preamble ran, so it is Sony's.
+    *
+    * ⚠ AND IT NOW AGREES WITH THE DRIVER, which this comment used to say it did not. That was written
+    * before CHIP_LIVERPOOL became a real family; ac_get_raster_config has carried
+    * `case CHIP_LIVERPOOL: raster_config = 0x2a00161a` since, so RADV's preamble writes back exactly
+    * what Sony had. Three independent statements of the same number: this console read, that table
+    * entry, and fpPS4's own context-register defaults (its last entry, context index 0xd4 = 0x28350).
+    *
+    * usable_heap_size is left at zero deliberately; ac_gpu_info.c:552 says those values "can be random
+    * and can't be relied on", and this arm does not invent one.
+    *
+    * To refresh it, re-run the dumper - do not edit by hand. */
+   {
+      .name = "liverpool",
+      .radeon_family = CHIP_LIVERPOOL,
+      .hw_ip_gfx = { .hw_ip_version_major = 7, .ib_start_alignment = 32,
+                     .ib_size_alignment = 32, .available_rings = 0x1, },
+      .hw_ip_compute = { .hw_ip_version_major = 7, .ib_start_alignment = 32,
+                         .ib_size_alignment = 32, .available_rings = 0xf, },
+      .mmr_regs = {
+         0x263d, 0x0000ff00, 0x00000000,   /* CC_RB_BACKEND_DISABLE, SE0 - nothing harvested */
+         0xa0d4, 0x0000ff00, 0x2a00161a,   /* PA_SC_RASTER_CONFIG, SE0 - READ OFF THE CONSOLE */
+         0xa0d5, 0x0000ff00, 0x00000000,   /* PA_SC_RASTER_CONFIG_1, SE0 */
+         0x263d, 0x0000ff01, 0x00000000,   /* CC_RB_BACKEND_DISABLE, SE1 - nothing harvested */
+         0xa0d4, 0x0000ff01, 0x2a00161a,   /* PA_SC_RASTER_CONFIG, SE1 - READ OFF THE CONSOLE */
+         0xa0d5, 0x0000ff01, 0x00000000,   /* PA_SC_RASTER_CONFIG_1, SE1 */
+         0x263e, 0xffffffff, 0x10020003,   /* GB_ADDR_CONFIG */
+         0x09d8, 0xffffffff, 0x00000002,   /* MC_ARB_RAMCFG */
+         0x2644, 0xffffffff, 0x00800310,   /* GB_TILE_MODE0 */
+         0x2645, 0xffffffff, 0x00800b10,   /* GB_TILE_MODE1 */
+         0x2646, 0xffffffff, 0x00801310,   /* GB_TILE_MODE2 */
+         0x2647, 0xffffffff, 0x00801b10,   /* GB_TILE_MODE3 */
+         0x2648, 0xffffffff, 0x00802b10,   /* GB_TILE_MODE4 */
+         0x2649, 0xffffffff, 0x00800308,   /* GB_TILE_MODE5 */
+         0x264a, 0xffffffff, 0x00801318,   /* GB_TILE_MODE6 */
+         0x264b, 0xffffffff, 0x00802b18,   /* GB_TILE_MODE7 */
+         0x264c, 0xffffffff, 0x00000304,   /* GB_TILE_MODE8 */
+         0x264d, 0xffffffff, 0x00000308,   /* GB_TILE_MODE9 */
+         0x264e, 0xffffffff, 0x02000310,   /* GB_TILE_MODE10 */
+         0x264f, 0xffffffff, 0x02000294,   /* GB_TILE_MODE11 */
+         0x2650, 0xffffffff, 0x02000318,   /* GB_TILE_MODE12 */
+         0x2651, 0xffffffff, 0x00400308,   /* GB_TILE_MODE13 */
+         0x2652, 0xffffffff, 0x02400310,   /* GB_TILE_MODE14 */
+         0x2653, 0xffffffff, 0x00000000,   /* GB_TILE_MODE15 */
+         0x2654, 0xffffffff, 0x02400294,   /* GB_TILE_MODE16 */
+         0x2655, 0xffffffff, 0x02400318,   /* GB_TILE_MODE17 */
+         0x2656, 0xffffffff, 0x00000000,   /* GB_TILE_MODE18 */
+         0x2657, 0xffffffff, 0x00000000,   /* GB_TILE_MODE19 */
+         0x2658, 0xffffffff, 0x00000000,   /* GB_TILE_MODE20 */
+         0x2659, 0xffffffff, 0x00000000,   /* GB_TILE_MODE21 */
+         0x265a, 0xffffffff, 0x00000000,   /* GB_TILE_MODE22 */
+         0x265b, 0xffffffff, 0x00000000,   /* GB_TILE_MODE23 */
+         0x265c, 0xffffffff, 0x00000000,   /* GB_TILE_MODE24 */
+         0x265d, 0xffffffff, 0x00000000,   /* GB_TILE_MODE25 */
+         0x265e, 0xffffffff, 0x00000000,   /* GB_TILE_MODE26 */
+         0x265f, 0xffffffff, 0x00c00308,   /* GB_TILE_MODE27 */
+         0x2660, 0xffffffff, 0x02c00310,   /* GB_TILE_MODE28 */
+         0x2661, 0xffffffff, 0x02c00294,   /* GB_TILE_MODE29 */
+         0x2662, 0xffffffff, 0x02c00318,   /* GB_TILE_MODE30 */
+         0x2663, 0xffffffff, 0x00000000,   /* GB_TILE_MODE31 */
+         0x2664, 0xffffffff, 0x000000e8,   /* GB_MACROTILE_MODE0 */
+         0x2665, 0xffffffff, 0x000000d4,   /* GB_MACROTILE_MODE1 */
+         0x2666, 0xffffffff, 0x000000d0,   /* GB_MACROTILE_MODE2 */
+         0x2667, 0xffffffff, 0x000000d0,   /* GB_MACROTILE_MODE3 */
+         0x2668, 0xffffffff, 0x00000080,   /* GB_MACROTILE_MODE4 */
+         0x2669, 0xffffffff, 0x00000040,   /* GB_MACROTILE_MODE5 */
+         0x266a, 0xffffffff, 0x00000000,   /* GB_MACROTILE_MODE6 */
+         0x266b, 0xffffffff, 0x00000000,   /* GB_MACROTILE_MODE7 */
+         0x266c, 0xffffffff, 0x000000ec,   /* GB_MACROTILE_MODE8 */
+         0x266d, 0xffffffff, 0x000000e8,   /* GB_MACROTILE_MODE9 */
+         0x266e, 0xffffffff, 0x000000d4,   /* GB_MACROTILE_MODE10 */
+         0x266f, 0xffffffff, 0x000000d0,   /* GB_MACROTILE_MODE11 */
+         0x2670, 0xffffffff, 0x00000080,   /* GB_MACROTILE_MODE12 */
+         0x2671, 0xffffffff, 0x00000040,   /* GB_MACROTILE_MODE13 */
+         0x2672, 0xffffffff, 0x00000000,   /* GB_MACROTILE_MODE14 */
+         0x2673, 0xffffffff, 0x00000000,   /* GB_MACROTILE_MODE15 */
+      },
+      .mmr_reg_count = 56,
+      .dev = {
+         .device_id = 0x9920, .external_rev = 0x15, .pci_rev = 0x0, .family = 120,
+         .num_shader_engines = 2, .num_shader_arrays_per_engine = 1,
+         .gpu_counter_freq = 100000, .max_engine_clock = 800000, .max_memory_clock = 2750000,
+         .cu_active_number = 18, .cu_ao_mask = 0x0,
+         .cu_bitmap[0][0] = 0x1ff,
+         .cu_bitmap[1][0] = 0x1ff,
+         .enabled_rb_pipes_mask = 0xff, .num_rb_pipes = 8, .num_hw_gfx_contexts = 8,
+         .ids_flags = 0x1, .virtual_address_offset = 0x200000,
+         .virtual_address_max = 0x400000000, .virtual_address_alignment = 4096,
+         .pte_fragment_size = 2097152, .gart_page_size = 4096,
+         .ce_ram_size = 32768, .vram_type = 5, .vram_bit_width = 256,
+         .num_shader_visible_vgprs = 256, .num_cu_per_sh = 9, .num_tcc_blocks = 8,
+         .gs_vgt_table_depth = 32, .gs_prim_buffer_depth = 1792, .max_gs_waves_per_vgt = 16,
+         .gc_double_offchip_lds_buf = 1, .wave_front_size = 64,
+         .high_va_offset = 0x0, .high_va_max = 0x0,
+      },
+      .mem = {
+         .gtt = { .total_heap_size = 0x3ffe00000, .usable_heap_size = 0x0, },
+         .vram = { .total_heap_size = 0x3ffe00000, .usable_heap_size = 0x0, },
+         .cpu_accessible_vram = { .total_heap_size = 0x3ffe00000, .usable_heap_size = 0x0, },
+      },
+   },
 };
 
 const size_t num_amdgpu_devices = ARRAY_SIZE(amdgpu_devices);

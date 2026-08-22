@@ -26,7 +26,11 @@
 
 #if UTIL_FUTEX_SUPPORTED
 
-#if defined(HAVE_LINUX_FUTEX_H)
+/* Guarded exactly as util/futex.h guards the same choice. Without __linux__ here, any non-Linux platform
+ * whose sysroot happens to carry linux/futex.h - OpenOrbis' musl does - compiles the Linux implementation
+ * and then fails on SYS_futex, while the header has already selected a different arm.
+ */
+#if defined(HAVE_LINUX_FUTEX_H) && defined(__linux__)
 
 #include <limits.h>
 #include <stdint.h>

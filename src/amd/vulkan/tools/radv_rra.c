@@ -558,6 +558,13 @@ radv_rra_accel_struct_buffer_unref(struct radv_device *device, struct radv_rra_a
 void
 radv_rra_accel_struct_buffers_unref(struct radv_device *device, struct set *buffers)
 {
+   /* NULL when _mesa_pointer_set_create() failed, which is exactly the state a command buffer is
+    * left in when it is destroyed after an allocation failure - and its return value is not
+    * checked. The _mesa_set_destroy() call that follows this one at the only call site takes NULL
+    * without complaint; taking it here too is what makes the pair consistent. */
+   if (!buffers)
+      return;
+
    set_foreach_remove (buffers, entry)
       radv_rra_accel_struct_buffer_unref(device, (void *)entry->key);
 }

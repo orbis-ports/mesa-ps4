@@ -737,7 +737,9 @@ bool radv_can_dump_shader(const struct radv_compiler_info *compiler_info, nir_sh
 bool radv_can_dump_shader_stats(const struct radv_compiler_info *compiler_info, nir_shader *nir);
 
 VkResult radv_dump_shader_stats(struct radv_device *device, struct radv_pipeline *pipeline, struct radv_shader *shader,
-                                FILE *output);
+                                const struct radv_shader_stage *stage_info, FILE *output);
+
+FILE *radv_shader_stats_output(void);
 
 /* Returns true on success and false on failure */
 bool radv_shader_reupload(struct radv_device *device, struct radv_shader *shader);

@@ -9,6 +9,9 @@
  */
 
 #include "radv_buffer.h"
+#ifdef HAVE_ORBIS_PLATFORM
+#include "ac_linux_drm.h"
+#endif
 #include "tools/radv_rmv.h"
 #include "radv_device.h"
 #include "radv_device_memory.h"
@@ -302,6 +305,19 @@ radv_bo_destroy(struct radv_device *device, struct vk_object_base *object, struc
 
    vk_address_binding_report(&instance->vk, object ? object : &device->vk.base, radv_buffer_get_va(bo), bo->size,
                              VK_DEVICE_ADDRESS_BINDING_TYPE_UNBIND_EXT);
+
+#ifdef HAVE_ORBIS_PLATFORM
+   /* ⚠ ONE LEVEL UP FROM THE POOLS, which were eliminated on hardware.
+    *
+    * Both halves of the descriptor-pool audit ran on the console, both had been seen to fire on the laptop,
+    * and neither fired while the GPU kept faulting on a descriptor read. So the released storage is not a
+    * pool - which leaves ordinary buffer objects, freed while a recorded command buffer still points at
+    * them. Here the address stays mapped afterwards, so nothing catches it.
+    *
+    * Recorded BEFORE the winsys releases the range, because after that the address belongs to whoever
+    * asks next. */
+   ac_orbis_note_freed_range(radv_buffer_get_va(bo), bo->size, "buffer object");
+#endif
 
    ws->buffer_destroy(ws, bo);
 }

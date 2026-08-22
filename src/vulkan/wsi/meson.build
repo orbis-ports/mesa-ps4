@@ -34,6 +34,15 @@ else
   files_vulkan_wsi += files('wsi_common_headless.c')
 endif
 
+# THE PS4's SCAN-OUT, and it rides on the headless platform rather than being a platform of its own: this
+# console has no DRM, no dma-buf and no compositor, so no existing arm describes it - but VK_EXT_headless_surface
+# already exists, RADV already advertises it, and its swapchain skeleton already does the acquire/release/present
+# bookkeeping. A new surface extension would mean touching Mesa's XML and its generated entry points to arrive at
+# the same VkSwapchainKHR the engine asks for. wsi_orbis.c keeps every sceVideoOut call out of Mesa's own files.
+if with_platform_orbis
+  files_vulkan_wsi += files('wsi_orbis.c')
+endif
+
 if with_platform_macos
   files_vulkan_wsi += files('wsi_common_metal.c', 'wsi_common_metal_layer.m')
 endif

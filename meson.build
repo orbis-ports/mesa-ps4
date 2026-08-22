@@ -160,6 +160,14 @@ with_any_opengl = with_opengl or with_gles1 or with_gles2
 
 system_has_kms_drm = ['openbsd', 'netbsd', 'freebsd', 'gnu/kfreebsd', 'dragonfly', 'linux', 'sunos', 'android', 'managarm'].contains(host_machine.system())
 
+# The PS4 (Orbis) runs a FreeBSD kernel, so it matches 'freebsd' above - but it exposes no DRM/KMS
+# interface of any kind, so the OS name alone cannot decide this. get_option() rather than
+# with_platform_orbis because that is not computed until the platform list is resolved, further down.
+# Reassigning here follows the freedreno_kmds check below, which does the same thing for the same reason.
+if get_option('platforms').contains('orbis')
+  system_has_kms_drm = false
+endif
+
 gallium_drivers = get_option('gallium-drivers')
 if gallium_drivers.contains('auto')
   if system_has_kms_drm
@@ -198,6 +206,11 @@ if gallium_drivers.contains('auto')
     gallium_drivers = ['llvmpipe', 'softpipe', 'zink', 'd3d12']
   elif ['darwin', 'cygwin', 'haiku'].contains(host_machine.system())
     gallium_drivers = ['llvmpipe', 'softpipe']
+  elif get_option('platforms').contains('orbis')
+    # Named before the error below, which would otherwise report 'Unknown OS freebsd' - true of the
+    # kernel and useless as a diagnosis. There is no gallium driver for this console: RADV is the point,
+    # and llvmpipe would need an LLVM built for it.
+    gallium_drivers = []
   else
     error('Unknown OS @0@. Please pass -Dgallium-drivers to set driver options. Patches gladly accepted to fix this.'.format(
           host_machine.system()))
@@ -494,6 +507,7 @@ with_platform_wayland = _platforms.contains('wayland')
 with_platform_haiku = _platforms.contains('haiku')
 with_platform_windows = _platforms.contains('windows')
 with_platform_macos = _platforms.contains('macos')
+with_platform_orbis = _platforms.contains('orbis')
 
 with_gfxstream_emulated_android = with_gfxstream_vk and with_platform_android and host_machine.system() == 'linux'
 if with_gfxstream_emulated_android
@@ -789,7 +803,7 @@ _libdrm_checks = {
   },
   'amdgpu': {
     'version': '2.4.133',
-    'enabled': (with_amd_vk and not with_platform_windows) or with_gallium_radeonsi,
+    'enabled': (with_amd_vk and not with_platform_windows and not with_platform_orbis) or with_gallium_radeonsi,
   },
 }
 

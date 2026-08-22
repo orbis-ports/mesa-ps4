@@ -217,6 +217,14 @@ libradv_files = files(
   'radv_wsi.h',
 )
 
+# The device-query half of a no-DRM winsys: the sibling of radv_amdgpu_winsys_query_info, differing from
+# it in exactly two things - it opens no DRM node, and it passes require_pci_bus_info = false.
+if with_platform_orbis
+  libradv_files += files(
+    'radv_orbis_winsys.c',
+  )
+endif
+
 if not with_platform_windows
   libradv_files += files(
     'winsys/amdgpu/radv_amdgpu_bo.c',
@@ -275,36 +283,90 @@ if radv_u_trace
   radv_flags += '-DRADV_U_TRACE=1'
 endif
 
-libvulkan_radeon = shared_library(
-  'vulkan_radeon',
-  [libradv_files, radv_entrypoints, radv_drirc, sha1_h, radix_sort_spv, bvh_spv, radv_annotate_layer],
-  vs_module_defs : vulkan_api_def,
-  include_directories : [
-    inc_include, inc_src, inc_amd, inc_amd_common, inc_amd_common_llvm,
-    inc_util, inc_virtio_gpu
-  ],
-  link_with : [
-    libamd_common, libamd_common_llvm, libamdgpu_addrlib,
-  ],
-  dependencies : [
-    dep_llvm, dep_libdrm_amdgpu, dep_thread, dep_elf, dep_dl, dep_m,
-    dep_valgrind, radv_deps, idep_aco,
-    idep_mesautil, idep_nir, idep_vulkan_util, idep_vulkan_wsi,
-    idep_vulkan_runtime, idep_amd_generated_headers, idep_xmlconfig,
-    idep_radv_tracepoints,
-  ],
-  c_args : [no_override_init_args, radv_flags, c_msvc_compat_args],
-  cpp_args : [radv_flags, cpp_msvc_compat_args],
-  link_args : [
-    ld_args_build_id, ld_args_bsymbolic, ld_args_gc_sections, vulkan_icd_link_args,
-  ],
-  link_depends : vulkan_icd_link_depends,
-  gnu_symbol_visibility : 'hidden',
-  name_prefix : host_machine.system() == 'windows' ? '' : [],
-  install : true,
-)
+# Is this build producing a LOADABLE MODULE? Both halves matter and neither alone is right.
+#
+#   with_platform_orbis alone       - the orbis arm is ALSO built as an ordinary host ICD for the
+#                                     development loop (build.sh --host-orbis), and that build wants a
+#                                     .so and a manifest like any other.
+#   default_library alone           - would make RADV the only one of this tree's twelve Vulkan drivers
+#                                     that answers to -Ddefault_library=static, silently turning an
+#                                     existing static build's loadable driver into an archive.
+#
+# Together they name exactly the cross-compiled console build: no ICD loader, driver linked into the
+# title. Every other configuration, on every platform, keeps the shared object it had.
+radv_is_loadable = not (with_platform_orbis and get_option('default_library') == 'static')
 
-if with_symbols_check
+# ⚠ TWO CALLS RATHER THAN ONE, because the shorter spellings are both wrong here.
+#
+# The console build needs an ARCHIVE - it links the driver into the title, and that link line is an
+# executable's (crt1.o, -pie), so a .so link fails on an undefined `main`.
+#
+#   library()                  - honours -Ddefault_library and so produces it, but makes RADV the only
+#                                Vulkan driver in this tree that answers to that option.
+#   build_target(target_type:) - raises this project's Meson floor from 1.4 to 1.12 for EVERY RADV build:
+#                                vs_module_defs became a build_target() kwarg only in 1.12.0.
+#
+# So the arguments are hoisted and the kind is chosen outright, on radv_is_loadable above.
+# vs_module_defs, link_args, name_prefix and install describe the shared object only; an archive has no
+# use for any of them.
+radv_sources = [
+  libradv_files, radv_entrypoints, radv_drirc, sha1_h, radix_sort_spv, bvh_spv, radv_annotate_layer,
+]
+radv_includes = [
+  inc_include, inc_src, inc_amd, inc_amd_common, inc_amd_common_llvm,
+  inc_util, inc_virtio_gpu,
+]
+radv_link_with = [
+  libamd_common, libamd_common_llvm, libamdgpu_addrlib,
+]
+radv_dependencies = [
+  dep_llvm, dep_libdrm_amdgpu, dep_thread, dep_elf, dep_dl, dep_m,
+  dep_valgrind, radv_deps, idep_aco,
+  idep_mesautil, idep_nir, idep_vulkan_util, idep_vulkan_wsi,
+  idep_vulkan_runtime, idep_amd_generated_headers, idep_xmlconfig,
+  idep_radv_tracepoints,
+]
+radv_c_args = [no_override_init_args, radv_flags, c_msvc_compat_args]
+radv_cpp_args = [radv_flags, cpp_msvc_compat_args]
+
+if radv_is_loadable
+  libvulkan_radeon = shared_library(
+    'vulkan_radeon',
+    radv_sources,
+    vs_module_defs : vulkan_api_def,
+    include_directories : radv_includes,
+    link_with : radv_link_with,
+    dependencies : radv_dependencies,
+    c_args : radv_c_args,
+    cpp_args : radv_cpp_args,
+    link_args : [
+      ld_args_build_id, ld_args_bsymbolic, ld_args_gc_sections, vulkan_icd_link_args,
+    ],
+    link_depends : vulkan_icd_link_depends,
+    gnu_symbol_visibility : 'hidden',
+    name_prefix : host_machine.system() == 'windows' ? '' : [],
+    install : true,
+  )
+else
+  libvulkan_radeon = static_library(
+    'vulkan_radeon',
+    radv_sources,
+    include_directories : radv_includes,
+    link_with : radv_link_with,
+    dependencies : radv_dependencies,
+    c_args : radv_c_args,
+    cpp_args : radv_cpp_args,
+    gnu_symbol_visibility : 'hidden',
+    # ⚠ install, and NOT because anyone installs it. Meson builds an uninstalled static library as a THIN
+    # archive - an index of absolute paths to loose objects, which absorbs nothing from link_with and is
+    # not relocatable. Marking it installed makes meson produce a real archive with the component static
+    # libraries flattened into it, which is what "the driver is linked into the title" needs.
+    install : true,
+  )
+endif
+
+
+if with_symbols_check and radv_is_loadable
   test(
     'radv symbols check',
     symbols_check,
@@ -318,48 +380,51 @@ if with_symbols_check
   )
 endif
 
-icd_file_name = libname_prefix + 'vulkan_radeon.' + libname_suffix
+if radv_is_loadable
+  icd_file_name = libname_prefix + 'vulkan_radeon.' + libname_suffix
 
-icd_command = [
-  prog_python, '@INPUT0@',
-  '--api-version', '1.4', '--xml', '@INPUT1@',
-  '--sizeof-pointer', sizeof_pointer,
-  '--icd-lib-path', vulkan_icd_lib_path,
-  '--icd-filename', icd_file_name,
-  '--out', '@OUTPUT@',
-]
-if with_platform_windows
-  icd_command += '--use-backslash'
-endif
-
-radeon_icd = custom_target(
-  'radeon_icd',
-  input : [vk_icd_gen, vk_api_xml],
-  output : 'radeon_icd.' + vulkan_manifest_suffix,
-  command : icd_command,
-  build_by_default : true,
-  install_dir : with_vulkan_icd_dir,
-  install_tag : 'runtime',
-  install : true,
-)
-
-_dev_icdname = 'radeon_devenv_icd.@0@.json'.format(host_machine.cpu())
-_dev_icd = custom_target(
-  'radeon_devenv_icd',
-  input : [vk_icd_gen, vk_api_xml],
-  output : _dev_icdname,
-  command : [
+  icd_command = [
     prog_python, '@INPUT0@',
     '--api-version', '1.4', '--xml', '@INPUT1@',
     '--sizeof-pointer', sizeof_pointer,
-    '--icd-lib-path', meson.current_build_dir(),
+    '--icd-lib-path', vulkan_icd_lib_path,
     '--icd-filename', icd_file_name,
     '--out', '@OUTPUT@',
-  ],
-  build_by_default : true,
-)
+  ]
+  if with_platform_windows
+    icd_command += '--use-backslash'
+  endif
 
-devenv.append('VK_DRIVER_FILES', _dev_icd.full_path())
+  radeon_icd = custom_target(
+    'radeon_icd',
+    input : [vk_icd_gen, vk_api_xml],
+    output : 'radeon_icd.' + vulkan_manifest_suffix,
+    command : icd_command,
+    build_by_default : true,
+    install_dir : with_vulkan_icd_dir,
+    install_tag : 'runtime',
+    install : true,
+  )
+
+  _dev_icdname = 'radeon_devenv_icd.@0@.json'.format(host_machine.cpu())
+  _dev_icd = custom_target(
+    'radeon_devenv_icd',
+    input : [vk_icd_gen, vk_api_xml],
+    output : _dev_icdname,
+    command : [
+      prog_python, '@INPUT0@',
+      '--api-version', '1.4', '--xml', '@INPUT1@',
+      '--sizeof-pointer', sizeof_pointer,
+      '--icd-lib-path', meson.current_build_dir(),
+      '--icd-filename', icd_file_name,
+      '--out', '@OUTPUT@',
+    ],
+    build_by_default : true,
+  )
+
+  devenv.append('VK_DRIVER_FILES', _dev_icd.full_path())
+endif
+
 
 if with_radv_tests
   test(

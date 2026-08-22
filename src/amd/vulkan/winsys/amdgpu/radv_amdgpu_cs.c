@@ -6,13 +6,14 @@
  */
 
 #include <assert.h>
-#include <libsync.h>
+#include "util/libsync.h"
 #include <pthread.h>
 #include <stdlib.h>
 #include "drm-uapi/amdgpu_drm.h"
 
 #include "tools/radv_debug.h"
 #include "util/detect_os.h"
+#include "util/log.h"
 #include "util/os_time.h"
 #include "util/u_memory.h"
 #include "ac_cmdbuf_cp.h"
@@ -1168,7 +1169,30 @@ radv_amdgpu_cs_submit_zero(struct radv_amdgpu_ctx *ctx, enum amd_ip_type ip_type
    if (!queue_syncobj)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
 
-   if (sem_info->wait.syncobj_count || sem_info->wait.timeline_syncobj_count) {
+   /* ⚠ NO SYNC FILES MEANS NO FDs TO MERGE, so the accumulation happens on the syncobjs themselves.
+    *
+    * The block below exports the queue's syncobj and every wait syncobj as dma-fence FDs, merges them, and
+    * imports the result back - i.e. "the queue's syncobj now waits for the latest of these". A binary
+    * transfer states the same thing directly, one call per wait, and is available wherever the provider can
+    * transfer at all.
+    *
+    * ⚠ TIMELINE WAITS ARE REFUSED RATHER THAN APPROXIMATED. Their whole content is the value; treating a
+    * point as satisfied would let a wait return early, which is corruption rather than a missing feature.
+    */
+   if (!ctx->ws->info.has_fence_to_handle) {
+      if (sem_info->wait.timeline_syncobj_count) {
+         mesa_loge("radv: %u timeline wait(s) in a zero submission need sync files, which this device "
+                   "has none of", sem_info->wait.timeline_syncobj_count);
+         return VK_ERROR_DEVICE_LOST;
+      }
+      for (unsigned i = 0; i < sem_info->wait.syncobj_count; ++i) {
+         ret = ac_drm_cs_syncobj_transfer(ctx->ws->dev, queue_syncobj, 0, sem_info->wait.syncobj[i], 0, 0);
+         if (ret < 0)
+            return VK_ERROR_DEVICE_LOST;
+      }
+      if (sem_info->wait.syncobj_count)
+         ctx->queue_syncobj_wait[hw_ip][queue_idx] = true;
+   } else if (sem_info->wait.syncobj_count || sem_info->wait.timeline_syncobj_count) {
       int fd;
       ret = ac_drm_cs_syncobj_export_sync_file(ctx->ws->dev, queue_syncobj, &fd);
       if (ret < 0)
@@ -1219,7 +1243,10 @@ radv_amdgpu_cs_submit_zero(struct radv_amdgpu_ctx *ctx, enum amd_ip_type ip_type
       uint32_t dst_handle = sem_info->signal.syncobj[i];
       uint32_t src_handle = queue_syncobj;
 
-      if (ctx->ws->info.has_timeline_syncobj) {
+      /* A binary transfer is a payload copy, which is what this loop means. The alternative below is another
+       * export/import of a dma-fence FD, so it is unavailable for the same reason as above.
+       */
+      if (ctx->ws->info.has_timeline_syncobj || !ctx->ws->info.has_fence_to_handle) {
          ret = ac_drm_cs_syncobj_transfer(ctx->ws->dev, dst_handle, 0, src_handle, 0, 0);
          if (ret < 0)
             return VK_ERROR_DEVICE_LOST;

@@ -22,6 +22,7 @@
  */
 
 #include "vk_queue.h"
+#include "util/orbis_api_probe.h"
 
 #include "util/perf/cpu_trace.h"
 #include "util/u_debug.h"
@@ -1280,6 +1281,7 @@ vk_common_QueueSubmit2(VkQueue _queue,
                           const VkSubmitInfo2 *pSubmits,
                           VkFence _fence)
 {
+   ORBIS_API_PROBE(ORBIS_API_SUBMIT);
    VK_FROM_HANDLE(vk_queue, queue, _queue);
    VK_FROM_HANDLE(vk_fence, fence, _fence);
    VkResult result;

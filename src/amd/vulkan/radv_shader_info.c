@@ -681,6 +681,81 @@ radv_get_esgs_gsvs_ring_size(const struct radv_device *device, struct radv_shade
    esgs_ring_size = align(esgs_ring_size, alignment);
    gsvs_ring_size = align(gsvs_ring_size, alignment);
 
+#ifdef HAVE_ORBIS_PLATFORM
+   /* ⚠ ONE VARIABLE, TO SETTLE A THIRD HYPOTHESIS ABOUT THE SAME FAILURE.
+    *
+    * Measured: a geometry shader emitting 3 vertices draws its triangle correctly on this console,
+    * and dEQP-VK.geometry.basic.output_10 and output_128 draw NOTHING - a black framebuffer against
+    * a reference that is 80% white. So the stage works and something about a LARGE emit does not.
+    *
+    * Both of these sizes are computed from num_se = info.max_se, and that number is one this port
+    * SYNTHESISES and has already flagged as self-contradictory: ac_orbis_drm.c:5560 writes 2 under
+    * ORBIS_DRM_UNCITED, while GB_ADDR_CONFIG's own NUM_SHADER_ENGINES field reads 1
+    * (ac_orbis_drm.c:4113, "a contradiction this port has carried since the field was guessed").
+    * The geometry stage is the only one that distributes its output across shader engines through a
+    * ring, so it is the only one that would notice.
+    *
+    * WHAT THE RUNS SETTLED, and where they stopped:
+    *
+    *   ring x2                     geometry.basic 3 pass / 11 fail -> 14 / 1
+    *   ring x4                     no better than x2 for geometry.basic, test for test
+    *   ORBIS_NUM_SE=4, ring x1     IDENTICAL to ring x2, test for test
+    *   ring x2                     multiview + geometry 15 pass / 63 fail - NOT ENOUGH
+    *   ring x8                     multiview + geometry 78 / 0
+    *   ring x4                     multiview + geometry 78 / 0
+    *
+    * ⚠ SO TWO WAS TOO SMALL AND WAS SHIPPED AS THE DEFAULT ANYWAY, on the strength of one family.
+    * Four is the smallest value measured to hold both. A flat multiplier is only ever as adequate as
+    * the tests that have run against it, and that sentence is the whole warranty on this number.
+    *
+    * ⚠ AND THE OBVIOUS READING OF THE SECOND FAMILY IS FALSE. Multiview draws once per view, so the
+    * prediction written down before the run was that the factor IS the view count: four would fix
+    * the four-view masks and leave the six-view ones failing. Four fixed every mask, including
+    * 1_2_4_8_16_32 and max_multi_view_view_count. The requirement is flat, not per-view.
+    *
+    * So the ring needs exactly the size that num_se = 4 produces. ⚠ AND THAT IS AS FAR AS THE CTS
+    * CAN TAKE IT. The experiment was designed to separate "the topology number is wrong" from "the
+    * hardware wants the size PER ENGINE and we hand it the total", and it does not: both predict
+    * that doubling fixes it, because a total of 2X across two real engines IS X per engine. The
+    * separation was wrong when it was written, and saying so is cheaper than acting on it.
+    *
+    * ⚠ SO THIS SCALES THE RING RATHER THAN CHANGING max_se, deliberately. The factor is correct
+    * under BOTH explanations, while max_se also feeds pa_sc_raster_config, cu_bitmap and every
+    * occupancy number RADV derives - none of which any measurement here justifies moving.
+    *
+    * ⚠ AND TWO IS A CEILING IMPOSED BY THE ARENA, NOT BY THE HARDWARE. Four is what multiview +
+    * geometry needs and it passes 78/78 with it - but at four the largest ring reaches the upstream
+    * clamp of 63.999 MB * num_se, the allocation padding then asks for half a gigabyte on top, and
+    * the arena loses the device. Measured at 512 MiB and at 256 MiB and uncapped, all three.  So
+    * multiview + geometry stays broken here on purpose: 63 wrong images beat a device loss that
+    * takes 328 passing tests with it.
+    *
+    * ⚠ AND THIS IS ONE OF TWO FAULTS, NOT THE WHOLE OF IT. Dropping this scale to 1 once the
+    * allocation padding existed took geometry.* from 1 failure to 28 and multiview + geometry from
+    * 78/78 back to 63 failures - wrong IMAGES, not faults, because a ring that wraps early
+    * overwrites its own contents. The padding in radv_orbis_gs_ring_bytes() answers a different
+    * symptom: the hardware writing PAST the declared size, which kills the process. Both are real
+    * and each was, at one point, mistaken for the whole story.
+    *
+    * What would settle it is not another CTS run: it is SQ_WAVE_HW_ID, which carries SE_ID/SH_ID/
+    * CU_ID, so a compute kernel that ORs one bit per (SE, SH, CU) enumerates the real topology from
+    * the hardware. ac_orbis_drm.c already names that as the way to replace this guess.
+    */
+   {
+      static int scale = -1;
+      if (scale < 0) {
+         const char *const e = getenv("ORBIS_GS_RING_SCALE");
+         scale = (e != NULL && *e != '\0') ? MAX2(atoi(e), 1) : 2;
+         mesa_logi("radv/orbis: GS ring SIZES scaled by %d, and the ALLOCATIONS are padded on top of "
+                   "it - see radv_orbis_gs_ring_bytes(). Two different faults, both real; four is "
+                   "what multiview needs and more than this arena survives.",
+                   scale);
+      }
+      esgs_ring_size *= (unsigned)scale;
+      gsvs_ring_size *= (unsigned)scale;
+   }
+#endif
+
    if (pdev->info.gfx_level <= GFX8)
       regs->gs.esgs_ring_size = CLAMP(esgs_ring_size, min_esgs_ring_size, max_size);
 

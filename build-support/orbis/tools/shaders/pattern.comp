@@ -1,0 +1,18 @@
+#version 450
+
+// The smallest shader that can prove the GPU COMPUTED something rather than merely accepting a submission.
+// Each invocation writes a value derived from its own id, so a buffer that comes back full of the pattern
+// cannot be explained by a memset, by stale memory, or by one lucky lane.
+//
+// 0xA5 as the high byte for the same reason the CPU-side readback test uses it: not zero and not 0xFF, so a
+// mapping that reads uninitialised or unmapped memory fails the comparison instead of passing it.
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) buffer Out {
+  uint v[];
+};
+
+void main() {
+  v[gl_GlobalInvocationID.x] = 0xA5000000u | gl_GlobalInvocationID.x;
+}

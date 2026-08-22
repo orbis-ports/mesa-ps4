@@ -18,6 +18,14 @@
 #endif
 
 #include "vk_drm_syncobj.h"
+
+/* See the note at .zeroInitializeDeviceMemory below: this port has no kernel clearing pages behind
+ * it, so the guarantee cannot be met and is not offered. */
+#if defined(__PS4__)
+#define ORBIS_NO_ZERO_INIT_MEMORY 1
+#else
+#define ORBIS_NO_ZERO_INIT_MEMORY 0
+#endif
 #include "vk_log.h"
 #include "vk_shader_module.h"
 
@@ -34,12 +42,29 @@
 #include "radv_video.h"
 #include "radv_wsi.h"
 
-#ifdef _WIN32
-typedef void *drmDevicePtr;
-#else
+/* ac_linux_drm.h declares drmDevicePtr itself when there is no DRM, so the local typedef this file used
+ * to carry for Windows would now be a redefinition. */
+#include "ac_linux_drm.h"
+
+/* radeon_winsys_info and radeon_winsys_heap_info are generic structs that happen to live in the amdgpu
+ * winsys' public header. The header is fine to include wherever it exists - the platform exclusion drops
+ * the winsys .c files, not the tree - so a no-DRM platform gets them from there like the DRM arm does.
+ *
+ * ⚠ NOT ON WINDOWS, though, and the guard is _WIN32 rather than the DRM predicate for once. Windows has
+ * no winsys at all and carries its own copy of radeon_winsys_heap_info further down this file; including
+ * the header there as well would be a redefinition.
+ */
+#ifndef _WIN32
+#include "winsys/amdgpu/radv_amdgpu_winsys_public.h"
+#endif
+
+#if MESA_SYSTEM_HAS_KMS_DRM
 #include "drm-uapi/amdgpu_drm.h"
 #include "util/os_drm.h"
-#include "winsys/amdgpu/radv_amdgpu_winsys_public.h"
+#elif defined(HAVE_ORBIS_PLATFORM)
+/* The no-DRM sibling of radv_amdgpu_winsys_query_info, which lives in winsys/amdgpu/ and is not built on
+ * such a platform. Declared here rather than in a header because it has exactly one caller. */
+VkResult radv_orbis_winsys_query_info(uint64_t debug_flags, struct radeon_winsys_info *info);
 #endif
 #include "git_sha1.h"
 
@@ -748,7 +773,16 @@ radv_physical_device_get_supported_extensions(const struct radv_physical_device 
       .KHR_present_id = true,
       .KHR_present_id2 = true,
       .KHR_present_wait = pdev->info.has_timeline_syncobj,
-      .KHR_present_wait2 = true,
+      /* ⚠ THE SAME CONDITION AS THE LINE ABOVE, and it was missing. WSI folds the two into one
+       * has_present_wait (wsi_common.c:175) and then asserts that timeline semaphores exist, because a
+       * present wait IS a timeline wait; KHR_timeline_semaphore below carries the same condition. Saying
+       * `true` here made a device without timeline syncobjs advertise a wait it cannot perform.
+       *
+       * Latent everywhere until now: on amdgpu has_timeline_syncobj is true for every kernel RADV supports,
+       * so the assert could not fire. This backend is the first with no timeline provider, and the first
+       * run of build.sh --host-orbis found it in the debug build - which is what that loop is for.
+       */
+      .KHR_present_wait2 = pdev->info.has_timeline_syncobj,
 #endif
       .KHR_push_descriptor = true,
       .KHR_ray_query = radv_enable_rt(pdev),
@@ -880,7 +914,16 @@ radv_physical_device_get_supported_extensions(const struct radv_physical_device 
       .EXT_legacy_vertex_attributes = !pdev->use_llvm,
       .EXT_line_rasterization = true,
       .EXT_load_store_op_none = true,
+      /* ⚠ NEEDS A SEPARATELY OWNED CPU MAPPING, which is a DRM property rather than a Vulkan one. Placed
+       * mapping promises the app an address it chose, and unmapping with RESERVE keeps that address
+       * reserved by punching an anonymous PROT_NONE hole over it. Where one mapping serves both
+       * processors - see radv_amdgpu_winsys_bo_map's no-DRM arm - neither is deliverable: the address
+       * comes back from the allocator rather than being dictated, and the hole would land in the very
+       * allocation the GPU is still addressing.
+       */
+#if MESA_SYSTEM_HAS_KMS_DRM
       .EXT_map_memory_placed = true,
+#endif
       .EXT_memory_budget = true,
       .EXT_memory_priority = true,
       .EXT_mesh_shader = radv_taskmesh_enabled(pdev),
@@ -889,8 +932,17 @@ radv_physical_device_get_supported_extensions(const struct radv_physical_device 
       .EXT_mutable_descriptor_type = true, /* Trivial promotion from VALVE. */
       .EXT_nested_command_buffer = true,
       .EXT_non_seamless_cube_map = true,
+      /* Both of these describe a DRM device on a PCI bus, and both are filled in only under
+       * MESA_SYSTEM_HAS_KMS_DRM further down. Advertised without that fill, an app querying
+       * VkPhysicalDeviceDrmPropertiesEXT or VkPhysicalDevicePCIBusInfoPropertiesEXT gets the zeroed
+       * initializer - a wrong answer - instead of the extension simply being absent.
+       *
+       * ⚠ EXT_pci_bus_info was advertised unconditionally before this, so Windows has been in exactly
+       * that state all along; its property fill has always been guarded. Narrowing it here fixes that
+       * too, at the cost of Windows no longer listing an extension it never answered.
+       */
+#if MESA_SYSTEM_HAS_KMS_DRM
       .EXT_pci_bus_info = true,
-#ifndef _WIN32
       .EXT_physical_device_drm = true,
 #endif
       .EXT_pipeline_creation_cache_control = true,
@@ -939,7 +991,9 @@ radv_physical_device_get_supported_extensions(const struct radv_physical_device 
       .EXT_vertex_input_dynamic_state = !pdev->use_llvm,
       .EXT_ycbcr_2plane_444_formats = true,
       .EXT_ycbcr_image_arrays = true,
-      .EXT_zero_initialize_device_memory = true,
+      /* Gated for the same reason as the feature below: offering the extension with the feature
+       * false is legal but says two things at once, and this port has one answer. */
+      .EXT_zero_initialize_device_memory = !ORBIS_NO_ZERO_INIT_MEMORY,
       .AMD_buffer_marker = true,
       .AMD_device_coherent_memory = radv_device_coherent_memory_enabled(pdev),
       .AMD_draw_indirect_count = true,
@@ -998,7 +1052,34 @@ radv_physical_device_get_features(const struct radv_physical_device *pdev, struc
       .imageCubeArray = true,
       .independentBlend = true,
       .geometryShader = true,
+      /* ⚠ A SWITCH, BECAUSE NOBODY HAS EVER RUN TESSELLATION ON THIS HARDWARE OUTSIDE SONY.
+       *
+       * Three independent sources say so. The old GNM backend for this console states it outright -
+       * "milestone B advertises neither tessellation nor geometry shaders, so a pipeline is exactly HW VS +
+       * HW PS". A reimplementation of libSceGnmDriver refuses LS/HS by name for want of ground truth: "no
+       * title in the corpus programs VGT_SHADER_STAGES_EN.HS_EN". And 3057 command streams captured from
+       * four retail PS4 titles contain that register only as 0x0 or 0xb0 - ES/GS/VS, HS_EN never set.
+       *
+       * OpenGothic does tessellate, so this port is the first thing to drive that path here, and the last
+       * unexplained fault lives in it: a texture-cache read at Sony's tessellation factor ring, which is
+       * exactly where reads would go if the stage were running against state we do not own.
+       *
+       * Turning the feature OFF is therefore a measurement rather than a retreat. Tempest propagates this
+       * flag to properties().tesselationShader and OpenGothic checks it per material
+       * (game/graphics/shaders.cpp:591), so the engine has a path without it and the world still draws.
+       *
+       *   the fault disappears  -> it IS the tessellation stage, and the search narrows to a stage nobody
+       *                            else has ever configured on this silicon
+       *   the fault remains     -> tessellation is exonerated, the address was a coincidence of one number,
+       *                            and everything built on it today comes down
+       *
+       * ORBIS_NO_TESS=1. On by default - advertising a feature is the correct behaviour until a run says
+       * otherwise, and a driver that quietly drops one is worse than one that faults visibly. */
+#ifdef HAVE_ORBIS_PLATFORM
+      .tessellationShader = getenv("ORBIS_NO_TESS") == NULL,
+#else
       .tessellationShader = true,
+#endif
       .sampleRateShading = true,
       .dualSrcBlend = true,
       .logicOp = true,
@@ -1052,7 +1133,23 @@ radv_physical_device_get_features(const struct radv_physical_device *pdev, struc
       .storageInputOutput16 = pdev->info.compiler_info.has_packed_math_16bit,
       .multiview = true,
       .multiviewGeometryShader = true,
+#ifdef HAVE_ORBIS_PLATFORM
+      /* ⚠ ORBIS_NO_TESS HAD BEEN HALF A SWITCH, and two runs died on the half it did not cover.
+       *
+       * It turned .tessellationShader off and left this one true, so dEQP - which gates
+       * multiview.*.tessellation_shader.* on multiviewTessellationShader and nothing else
+       * (vktMultiViewRenderTests.cpp:4656) - was told the stage was available, built a pipeline with
+       * it, and took the console down. Both runs halted on exactly
+       * multiview.dynamic_rendering.index.tessellation_shader.no_queries.15, with zero tessellation
+       * cases reported NotSupported: the giveaway that the refusal never reached the query layer.
+       *
+       * A feature that depends on another one has to follow it, or the switch only looks like one.
+       * multiviewGeometryShader stays true: geometry shaders are not in question here - retail
+       * captures show ES/GS/VS in use on this silicon. */
+      .multiviewTessellationShader = getenv("ORBIS_NO_TESS") == NULL,
+#else
       .multiviewTessellationShader = true,
+#endif
       .variablePointersStorageBuffer = true,
       .variablePointers = true,
       .protectedMemory = radv_tmz_enabled(pdev),
@@ -1552,7 +1649,17 @@ radv_physical_device_get_features(const struct radv_physical_device *pdev, struc
       .shaderBFloat16CooperativeMatrix = radv_cooperative_matrix_enabled(pdev),
 
       /* VK_EXT_zero_initialize_device_memory */
-      .zeroInitializeDeviceMemory = true,
+      /* ⚠ TRUE EVERYWHERE ELSE BECAUSE THE KERNEL DOES IT, and there is no kernel here doing it.
+       * On amdgpu a page is cleared before it reaches another process, so RADV can promise this for
+       * free. This port's memory is one arena the process carves up and hands out again, so a fresh
+       * allocation can read what the last one left - which dEQP-VK.memory.zero_initialize_device_
+       * memory.* reported 433 times, and correctly.
+       *
+       * Clearing every range as it is handed out would be a memset on a path that runs thousands of
+       * times, paid by everything, for a promise nothing on this console asks for: Vulkan does not
+       * zero memory by default, and the guarantee only exists for applications that request this
+       * extension. So the honest answer is not to offer it. */
+      .zeroInitializeDeviceMemory = !ORBIS_NO_ZERO_INIT_MEMORY,
 
       /* VK_KHR_video_decode_vp9 */
       .videoDecodeVP9 = true,
@@ -2122,7 +2229,9 @@ radv_get_physical_device_properties(struct radv_physical_device *pdev)
           */
          pdev->info.family != CHIP_NAVI21 && pdev->info.family != CHIP_NAVI22 && pdev->info.family != CHIP_VANGOGH,
 
-#ifndef _WIN32
+/* Reads pdev->bus_info, which radv_physical_device.h now declares only where there is a DRM device to
+ * describe. The two guards have to name the same condition. */
+#if MESA_SYSTEM_HAS_KMS_DRM
       /* VK_EXT_pci_bus_info */
       .pciDomain = pdev->bus_info.domain,
       .pciBus = pdev->bus_info.bus,
@@ -2460,7 +2569,9 @@ radv_get_physical_device_properties(struct radv_physical_device *pdev)
    p->identicalMemoryTypeRequirements = false;
 
    /* VK_EXT_physical_device_drm */
-#ifndef _WIN32
+/* Reads available_nodes / primary_devid / DRM_NODE_PRIMARY, which radv_physical_device.h now declares only where there is a DRM device to
+ * describe. The two guards have to name the same condition. */
+#if MESA_SYSTEM_HAS_KMS_DRM
    if (pdev->available_nodes & (1 << DRM_NODE_PRIMARY)) {
       p->drmHasPrimary = true;
       p->drmPrimaryMajor = (int64_t)major(pdev->primary_devid);
@@ -2563,14 +2674,11 @@ static VkResult
 radv_physical_device_try_create(struct radv_instance *instance, drmDevicePtr drm_device,
                                 struct radv_physical_device **pdev_out)
 {
-#ifdef _WIN32
-   assert(drm_device == NULL);
-   return VK_ERROR_INCOMPATIBLE_DRIVER;
-#else
    VkResult result;
    int fd = -1;
+   enum radv_drm_device_type drm_device_type = RADV_DRM_DEVICE_AMDGPU;
+#if MESA_SYSTEM_HAS_KMS_DRM
    const char *path = drm_device->nodes[DRM_NODE_RENDER];
-   enum radv_drm_device_type drm_device_type;
    drmVersionPtr version;
 
    fd = open(path, O_RDWR | O_CLOEXEC);
@@ -2612,6 +2720,14 @@ radv_physical_device_try_create(struct radv_instance *instance, drmDevicePtr drm
 
    if (instance->debug_flags & RADV_DEBUG_STARTUP)
       fprintf(stderr, "radv: info: Found device '%s'.\n", path);
+#else
+   /* Nothing to discover: no device node to open, no kernel driver to name itself, no version to check.
+    * The only caller is the enumerate hook below, which exists solely on this arm, so the device is known
+    * to be there before this function is entered. */
+   assert(drm_device == NULL);
+   if (instance->debug_flags & RADV_DEBUG_STARTUP)
+      fprintf(stderr, "radv: info: orbis: creating the one physical device.\n");
+#endif
 
    struct radv_physical_device *pdev =
       vk_zalloc2(&instance->vk.alloc, NULL, sizeof(*pdev), 8, VK_SYSTEM_ALLOCATION_SCOPE_INSTANCE);
@@ -2641,7 +2757,18 @@ radv_physical_device_try_create(struct radv_instance *instance, drmDevicePtr drm
 
    struct radeon_winsys_info winsys_info;
 
+   /* ⚠ THREE ARMS, BECAUSE "NOT KMS" IS NOT "ORBIS". Windows has neither, and the two-arm version sent
+    * it into the second one: an incomplete struct radeon_winsys_info (radv_amdgpu_winsys_public.h is
+    * still excluded there by its own #ifndef _WIN32) and an unresolved radv_orbis_winsys_query_info.
+    * Upstream's Windows behaviour was to refuse the device here, so that is what the third arm does. */
+#if MESA_SYSTEM_HAS_KMS_DRM
    result = radv_amdgpu_winsys_query_info(fd, instance->debug_flags, is_virtio, &winsys_info);
+#elif defined(HAVE_ORBIS_PLATFORM)
+   result = radv_orbis_winsys_query_info(instance->debug_flags, &winsys_info);
+#else
+   memset(&winsys_info, 0, sizeof(winsys_info));
+   result = VK_ERROR_INCOMPATIBLE_DRIVER;
+#endif
    if (result != VK_SUCCESS) {
       result = vk_errorf(instance, result, "failed to query GPU info");
       goto fail;
@@ -2672,6 +2799,7 @@ radv_physical_device_try_create(struct radv_instance *instance, drmDevicePtr drm
    pdev->sync_types[num_sync_types++] = NULL;
    pdev->vk.supported_sync_types = pdev->sync_types;
 
+#if MESA_SYSTEM_HAS_KMS_DRM
    if (instance->vk.enabled_extensions.KHR_display) {
       pdev->wsi_master_fd = open(drm_device->nodes[DRM_NODE_PRIMARY], O_RDWR | O_CLOEXEC);
       if (pdev->wsi_master_fd >= 0) {
@@ -2690,6 +2818,7 @@ radv_physical_device_try_create(struct radv_instance *instance, drmDevicePtr drm
       if (fd != -1)
          pdev->wsi_syncobj_fd = os_dupfd_cloexec(fd);
    }
+#endif
 
    /* Allow all devices on a virtual winsys, otherwise do a basic support check. */
    if (!radv_is_gpu_supported(&pdev->info)) {
@@ -2818,6 +2947,7 @@ radv_physical_device_try_create(struct radv_instance *instance, drmDevicePtr drm
    radv_physical_device_get_supported_extensions(pdev, &pdev->vk.supported_extensions);
    radv_physical_device_get_features(pdev, &pdev->vk.supported_features);
 
+#if MESA_SYSTEM_HAS_KMS_DRM
    struct stat primary_stat = {0}, render_stat = {0};
 
    pdev->available_nodes = drm_device->available_nodes;
@@ -2838,6 +2968,7 @@ radv_physical_device_try_create(struct radv_instance *instance, drmDevicePtr drm
       goto fail;
    }
    pdev->render_devid = render_stat.st_rdev;
+#endif
 
    if (radv_device_get_cache_uuid(pdev, pdev->cache_uuid)) {
       result = vk_errorf(instance, VK_ERROR_INITIALIZATION_FAILED, "cannot generate UUID");
@@ -2905,13 +3036,38 @@ fail_fd:
    if (fd != -1)
       close(fd);
    return result;
-#endif
 }
+
+#ifdef HAVE_ORBIS_PLATFORM
+/* WITHOUT THIS, NOTHING EVER CREATES A PHYSICAL DEVICE. RADV registers only try_create_for_drm, and the
+ * Vulkan runtime reaches that exclusively by walking DRM nodes - so on a platform with none, the driver
+ * enumerates zero devices and every ac_drm_* query is unreachable. vk_instance's enumerate callback
+ * replaces that walk and short-circuits it entirely unless it returns VK_ERROR_INCOMPATIBLE_DRIVER, so no
+ * DRM path is faked or bypassed.
+ *
+ * There is exactly one GPU and it is soldered to the board; probing for it would be theatre.
+ */
+VkResult
+enumerate_orbis_physical_devices(struct vk_instance *vk_instance)
+{
+   struct radv_instance *instance = (struct radv_instance *)vk_instance;
+   struct radv_physical_device *pdev = NULL;
+
+   VkResult result = radv_physical_device_try_create(instance, NULL, &pdev);
+   if (result != VK_SUCCESS)
+      return result;
+
+   list_addtail(&pdev->vk.link, &vk_instance->physical_devices.list);
+   return VK_SUCCESS;
+}
+#endif
 
 VkResult
 create_drm_physical_device(struct vk_instance *vk_instance, struct _drmDevice *device, struct vk_physical_device **out)
 {
-#ifndef _WIN32
+/* Reads available_nodes / DRM_NODE_RENDER, which radv_physical_device.h now declares only where there is a DRM device to
+ * describe. The two guards have to name the same condition. */
+#if MESA_SYSTEM_HAS_KMS_DRM
    bool supported_device = false;
 
    if (!(device->available_nodes & (1 << DRM_NODE_RENDER)))
@@ -3180,10 +3336,15 @@ radv_create_drm_device_locked(struct radv_physical_device *pdev)
       return;
 
    UNUSED uint32_t drm_major, drm_minor;
-   drmDevicePtr drm_device;
    ac_drm_device *dev;
    int fd = -1;
    int r;
+
+   /* As in radv_create_winsys: opening a DRM node is how this platform reaches its device, not what
+    * ac_drm_device_initialize means. Where there are no nodes, fd stays -1 and the arm opens nothing.
+    */
+#if MESA_SYSTEM_HAS_KMS_DRM
+   drmDevicePtr drm_device;
 
    if (pdev->drm_device_type == RADV_DRM_DEVICE_AMDGPU || pdev->drm_device_type == RADV_DRM_DEVICE_VIRTIO) {
       r = drmGetDeviceFromDevId(pdev->render_devid, 0, &drm_device);
@@ -3197,6 +3358,7 @@ radv_create_drm_device_locked(struct radv_physical_device *pdev)
       if (fd < 0)
          return;
    }
+#endif
 
    const bool is_virtio =
       pdev->drm_device_type == RADV_DRM_DEVICE_AMDGPU_VPIPE || pdev->drm_device_type == RADV_DRM_DEVICE_VIRTIO;

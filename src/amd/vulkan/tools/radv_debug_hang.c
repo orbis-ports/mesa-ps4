@@ -606,7 +606,7 @@ radv_dump_shader(struct radv_device *device, struct radv_pipeline *pipeline, str
    fprintf(f, "DISASM:\n%s\n", shader->dbg.disasm_string);
 
    if (pipeline)
-      radv_dump_shader_stats(device, pipeline, shader, f);
+      radv_dump_shader_stats(device, pipeline, shader, NULL, f);
 }
 
 static void
@@ -878,7 +878,10 @@ radv_dump_device_name(const struct radv_device *device, FILE *f)
 static void
 radv_dump_umr_ring(const struct radv_queue *queue, FILE *f)
 {
-#ifndef _WIN32
+/* umr is a DRM debugging tool addressed by PCI bus id, and pdev->bus_info only exists where there is a
+ * DRM device to have one.
+ */
+#if MESA_SYSTEM_HAS_KMS_DRM
    const struct radv_device *device = radv_queue_device(queue);
    const struct radv_physical_device *pdev = radv_device_physical(device);
    const enum amd_ip_type ring = radv_queue_ring(queue);

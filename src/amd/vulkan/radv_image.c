@@ -8,6 +8,8 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include <stdlib.h> /* getenv, for the ORBIS_CMASK gate */
+
 #include "radv_image.h"
 #include "tools/radv_debug.h"
 #include "tools/radv_rmv.h"
@@ -137,6 +139,38 @@ radv_image_use_fast_clear_for_image_early(const struct radv_device *device, cons
 
    if (instance->debug_flags & RADV_DEBUG_FORCE_COMPRESS)
       return true;
+
+#ifdef HAVE_ORBIS_PLATFORM
+   /* ⚠ NO CMASK ON THIS CONSOLE BY DEFAULT, AND THIS TREE LOST THE GATE THE OLD ONE HAD.
+    *
+    * The earlier effort measured it and wrote the measurement down: a 1024x1024 OPTIMAL colour target with
+    * CMASK asks for 4202512 bytes where the surface itself is 4194304, and the extra 8208 are 65536 CMASK
+    * nibbles - one per 4x4 block - plus a 16-byte clear value. That surface DIES. The same surface without
+    * CMASK passes, and so do 1920x64 and 64x1080, which carry the failing surface's pitch and height but
+    * fall under the area threshold that refuses CMASK. Neither size, nor macro-tiling, nor pitch, nor the
+    * detiling copy survives as an explanation. CMASK does.
+    *
+    * The suspected mechanism is addressing, not sizing: ac_compute_cmask derives the cache-line block from
+    * the PIPE COUNT alone, while the hardware derives CMASK addressing from GB_ADDR_CONFIG's PIPE_CONFIG -
+    * and eight pipes has six different configs on gfx7. A driver and a chip disagreeing about where a
+    * per-4x4-block metadata element lives produces exactly what is on screen here: a rectangular patch of
+    * wrong colour, visible only where geometry was drawn, changing with the view.
+    *
+    * ⚠ AND THE OLD TREE DID NOT HAVE THAT ARTEFACT. This one has had it since its first rendered world,
+    * which is what sent the search here rather than to another instrument.
+    *
+    * WHAT IT COSTS: fast colour clears, nothing else. GFX7 has no DCC, HTILE is separate and untouched, and
+    * correctness is unaffected - a clear writes the surface instead of writing metadata, and the
+    * eliminate-fast-clear pass a fast clear would have needed disappears with it. The only renderer known
+    * to work on this hardware, the GNM fork, uses no CMASK and no FMASK at all.
+    *
+    * ORBIS_CMASK=1 puts it back, for the work of finding out why it faults. */
+   {
+      const char *const want = getenv("ORBIS_CMASK");
+      if (want == NULL || want[0] != '1' || want[1] != '\0')
+         return false;
+   }
+#endif
 
    if (image->vk.samples <= 1 && image->vk.extent.width * image->vk.extent.height <= 512 * 512) {
       /* Do not enable CMASK or DCC for small surfaces where the cost

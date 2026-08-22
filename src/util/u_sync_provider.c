@@ -133,7 +133,6 @@ util_sync_provider_drm(int drm_fd)
       .reset = drm_syncobj_reset,
       .signal = drm_syncobj_signal,
       .query = drm_syncobj_query,
-      .transfer = drm_syncobj_transfer,
       .finalize = drm_syncobj_finalize,
       .clone = drm_sync_provider_clone,
    };
@@ -143,6 +142,14 @@ util_sync_provider_drm(int drm_fd)
    if (err == 0 && cap != 0) {
       d->base.timeline_signal = drm_syncobj_timeline_signal;
       d->base.timeline_wait = drm_syncobj_timeline_wait;
+      /* transfer belongs here and not in the initialiser above. DRM_IOCTL_SYNCOBJ_TRANSFER is
+       * refused with -EOPNOTSUPP by a kernel whose driver lacks DRIVER_SYNCOBJ_TIMELINE - the same
+       * feature bit this cap reports - so the cap is an exact test for the ioctl rather than an
+       * approximation of it. Set unconditionally, the entry advertised a call that is not there on
+       * amdgpu before 5.2, msm before 5.9 and v3d before 5.15, and a caller that trusts a non-NULL
+       * function pointer takes it instead of a path that works.
+       */
+      d->base.transfer = drm_syncobj_transfer;
    }
 
    return &d->base;

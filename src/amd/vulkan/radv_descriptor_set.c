@@ -6,6 +6,7 @@
  */
 
 #include "radv_descriptor_set.h"
+#include "util/orbis_api_probe.h"
 #include "radv_cmd_buffer.h"
 #include "radv_descriptor_pool.h"
 #include "radv_descriptors.h"
@@ -389,6 +390,9 @@ radv_alloc_descriptor_pool_entry(struct radv_device *device, struct radv_descrip
       pool->current_offset += set->header.size;
    }
 
+#ifdef HAVE_ORBIS_PLATFORM
+   set->header.orbis_pool = pool;
+#endif
    set->header.bo = pool->bo;
    set->header.mapped_ptr = (uint32_t *)(pool->mapped_ptr + current_offset);
    set->header.va = pool->bo ? (radv_buffer_get_va(set->header.bo) + current_offset) : 0;
@@ -495,6 +499,7 @@ VKAPI_ATTR VkResult VKAPI_CALL
 radv_AllocateDescriptorSets(VkDevice _device, const VkDescriptorSetAllocateInfo *pAllocateInfo,
                             VkDescriptorSet *pDescriptorSets)
 {
+   ORBIS_API_PROBE(ORBIS_API_DESC_ALLOC);
    VK_FROM_HANDLE(radv_device, device, _device);
    VK_FROM_HANDLE(radv_descriptor_pool, pool, pAllocateInfo->descriptorPool);
 
@@ -701,6 +706,7 @@ radv_UpdateDescriptorSets(VkDevice _device, uint32_t descriptorWriteCount,
                           const VkWriteDescriptorSet *pDescriptorWrites, uint32_t descriptorCopyCount,
                           const VkCopyDescriptorSet *pDescriptorCopies)
 {
+   ORBIS_API_PROBE(ORBIS_API_DESC_UPDATE);
    VK_FROM_HANDLE(radv_device, device, _device);
 
    radv_update_descriptor_sets_impl(device, NULL, VK_NULL_HANDLE, descriptorWriteCount, pDescriptorWrites,

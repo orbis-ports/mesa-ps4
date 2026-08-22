@@ -10,6 +10,7 @@
 #include "util/u_sync_provider.h"
 #include "ac_gpu_info.h"
 
+#include <errno.h>
 #include <stdlib.h>
 #include <time.h>
 #include <unistd.h>
@@ -489,6 +490,14 @@ int ac_drm_cs_syncobj_export_sync_file2(ac_drm_device *dev, uint32_t syncobj, ui
    if (!point)
       return dev->p->export_sync_file(dev->p, syncobj, sync_file_fd);
 
+   /* A point can only exist on a provider with timelines, which is also the condition under which
+    * the DRM provider fills in transfer - but say so rather than trusting the caller, because a NULL
+    * entry here means "the kernel does not have this ioctl" and dereferencing it is the one outcome
+    * the caller cannot handle.
+    */
+   if (!dev->p->transfer)
+      return -EOPNOTSUPP;
+
    ret = dev->p->create(dev->p, 0, &binary_handle);
    if (ret)
       return ret;
@@ -505,6 +514,15 @@ out:
 int ac_drm_cs_syncobj_transfer(ac_drm_device *dev, uint32_t dst_handle, uint64_t dst_point,
                                uint32_t src_handle, uint64_t src_point, uint32_t flags)
 {
+   /* NULL means the ioctl is absent, not that the provider forgot to fill it in: the DRM provider
+    * sets transfer only when DRM_CAP_SYNCOBJ_TIMELINE reports the feature bit the kernel checks
+    * before it will run DRM_IOCTL_SYNCOBJ_TRANSFER. Returning the errno the kernel would have
+    * returned keeps every caller's existing error path, which is where they already handle a
+    * device too old for this.
+    */
+   if (!dev->p->transfer)
+      return -EOPNOTSUPP;
+
    return dev->p->transfer(dev->p, dst_handle, dst_point, src_handle, src_point, flags);
 }
 

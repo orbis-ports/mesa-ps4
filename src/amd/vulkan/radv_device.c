@@ -1328,9 +1328,17 @@ radv_create_winsys(struct radv_device *device)
 #else
    const struct radv_physical_device *pdev = radv_device_physical(device);
    const struct radv_instance *instance = radv_physical_device_instance(pdev);
-   drmDevicePtr drm_device;
    VkResult result;
    int fd = -1;
+
+   /* OPENING A DRM NODE IS NOT THE SAME THING AS CREATING A WINSYS, and separating the two is what lets
+    * this function serve a platform that has no DRM at all. Such a platform's ac_drm_device_initialize
+    * opens nothing, so it wants exactly what the code below already does when no DRM device matched: fd
+    * stays -1 and is passed on deliberately, so that any path which ever treats it as a real descriptor
+    * fails loudly rather than operating on whatever file happened to be open.
+    */
+#if MESA_SYSTEM_HAS_KMS_DRM
+   drmDevicePtr drm_device;
    int r;
 
    if (pdev->drm_device_type == RADV_DRM_DEVICE_AMDGPU || pdev->drm_device_type == RADV_DRM_DEVICE_VIRTIO) {
@@ -1345,6 +1353,7 @@ radv_create_winsys(struct radv_device *device)
       if (fd < 0)
          return VK_ERROR_INITIALIZATION_FAILED;
    }
+#endif
 
    const bool is_virtio =
       pdev->drm_device_type == RADV_DRM_DEVICE_AMDGPU_VPIPE || pdev->drm_device_type == RADV_DRM_DEVICE_VIRTIO;

@@ -9,9 +9,28 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#if !defined(_WIN32)
+/* amdgpu.h is libdrm's, so the question is whether libdrm is present - which is what having a DRM kernel
+ * interface decides. The #else arm below is a transcription of the parts of it Mesa needs.
+ */
+#if MESA_SYSTEM_HAS_KMS_DRM
 #include "drm-uapi/amdgpu_drm.h"
 #include "amdgpu.h"
+#else
+
+/* ------------------------------------------------------------------ the KERNEL's ABI
+ *
+ * No libdrm does not mean no kernel ABI header. Mesa VENDORS drm-uapi/amdgpu_drm.h, and it is structs and
+ * ioctl numbers - nothing in it needs a Linux system header. So take the real definitions wherever they
+ * compile, and keep the transcriptions below for Windows, which cannot.
+ *
+ * That is not tidiness. The transcriptions were written for a platform that never builds the amdgpu
+ * winsys, so several of them are deliberately INCOMPLETE - `struct drm_amdgpu_cs_chunk` is a bare forward
+ * declaration, enough for the prototypes and no more. A no-DRM platform that DOES build the winsys needs
+ * the real thing; and because the winsys' own .c files already include the vendored header directly, the
+ * transcriptions would collide with it rather than substitute for it.
+ */
+#ifndef _WIN32
+#include "drm-uapi/amdgpu_drm.h"
 #else
 #define DRM_CAP_ADDFB2_MODIFIERS 0x10
 #define DRM_CAP_SYNCOBJ 0x13
@@ -230,6 +249,13 @@ struct drm_amdgpu_info_uq_metadata {
       struct drm_amdgpu_info_uq_metadata_sdma sdma;
    };
 };
+#endif /* !_WIN32 - end of the kernel ABI transcriptions */
+
+/* ------------------------------------------------------------------ what LIBDRM adds on top of it
+ *
+ * These have no kernel header to come from - they are libdrm's own API - so every platform without
+ * libdrm needs them declared here, whether or not it could compile the vendored uapi above.
+ */
 
 typedef struct _drmPciBusInfo {
    uint16_t domain;
@@ -308,23 +334,78 @@ struct amdgpu_gpu_info {
    uint32_t pci_rev_id;
 };
 
-struct amdgpu_bo_metadata;
-struct amdgpu_bo_info;
+/* From libdrm's amdgpu.h. Used by radv_amdgpu_bo.c's VA allocation. */
+#define AMDGPU_VA_RANGE_32_BIT     0x1
+#define AMDGPU_VA_RANGE_HIGH       0x2
+#define AMDGPU_VA_RANGE_REPLAYABLE 0x4
+
+/* ⚠ DEFINED RATHER THAN FORWARD-DECLARED, and the difference is whether this platform builds the
+ * amdgpu winsys. Windows does not, so the prototypes below were all it ever needed and an incomplete
+ * type was enough. A no-DRM platform that DOES build the winsys dereferences these.
+ *
+ * Transcribed from libdrm's amdgpu.h (MIT) field for field. The layout is part of the ABI on the amdgpu
+ * arm, so it is not ours to tidy.
+ */
+struct amdgpu_bo_metadata {
+   uint64_t flags;
+   /** ASIC-specific tiling information, encoded by the AMDGPU_TILING_* definitions. */
+   uint64_t tiling_info;
+   uint32_t size_metadata;
+   /** UMD specific metadata. Opaque to the kernel. */
+   uint32_t umd_metadata[64];
+};
+
+struct amdgpu_bo_info {
+   uint64_t alloc_size;
+   uint64_t phys_alignment;
+   uint32_t preferred_heap;
+   uint64_t alloc_flags;
+   struct amdgpu_bo_metadata metadata;
+};
+
+struct amdgpu_heap_info {
+   /** Theoretical max. available memory in the given heap. */
+   uint64_t heap_size;
+   /** Bytes allocated in the heap, across all processes and the kernel's own allocations. */
+   uint64_t heap_usage;
+   /** Theoretical largest buffer that could still be allocated there. */
+   uint64_t max_allocation;
+};
+
+struct amdgpu_context;
+typedef struct amdgpu_context *amdgpu_context_handle;
+
+struct amdgpu_cs_fence {
+   /** The context the IB was submitted on. RADV never reads it - it identifies the submission through
+    * ctx_handle instead - but the field is part of libdrm's layout. */
+   amdgpu_context_handle context;
+   uint32_t ip_type;
+   /** IP instance index, when there are several IPs of the same type. */
+   uint32_t ip_instance;
+   uint32_t ring;
+   uint64_t fence;
+};
+
 struct drm_amdgpu_cs_chunk;
 struct drm_amdgpu_cs_chunk_data;
-struct amdgpu_heap_info;
 struct drm_amdgpu_userq_signal;
 struct drm_amdgpu_userq_wait;
 struct amdgpu_va;
 typedef struct amdgpu_va *amdgpu_va_handle;
 
-#endif /* !defined(_WIN32) */
+#endif /* MESA_SYSTEM_HAS_KMS_DRM */
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-/* All functions are static inline stubs on Windows. */
+/* All functions are static inline stubs on Windows.
+ *
+ * ⚠ THIS ONE STAYS _WIN32 while the DRM guards above became MESA_SYSTEM_HAS_KMS_DRM, and the difference
+ * is the point: "there is no DRM kernel interface" and "nobody implements these" are separate claims.
+ * Windows makes both. A platform that supplies its own ac_drm_* makes only the first, and stubbing them
+ * out here would silently discard that implementation.
+ */
 #ifdef _WIN32
 #define __U_STUB__
 #endif
@@ -336,7 +417,8 @@ struct util_sync_provider;
 struct radeon_info;
 
 typedef union ac_drm_bo {
-#ifdef _WIN32
+/* amdgpu_bo_handle is libdrm's typedef, so it exists exactly where the DRM arm above was taken. */
+#if !MESA_SYSTEM_HAS_KMS_DRM
    void *abo;
 #else
    amdgpu_bo_handle abo;
@@ -455,6 +537,74 @@ MESAPROC int ac_drm_userq_wait(ac_drm_device *dev, struct drm_amdgpu_userq_wait 
 
 MESAPROC int ac_drm_query_pci_bus_info(ac_drm_device *dev, struct radeon_info *info) TAIL;
 MESAPROC void ac_drm_query_has_vm_always_valid(ac_drm_device *dev, struct radeon_info *info) TAILV;
+
+/* ⚠ NOT ac_drm_* ENTRY POINTS, AND DELIBERATELY NAMED SO. None of these is part of the seam Mesa's amdgpu
+ * winsys calls; they are the PS4 arm's own, and they live in this header only because ac_orbis_drm.c is
+ * compiled with -Werror=missing-prototypes and a prototype has to be somewhere.
+ */
+
+/* "Has the GPU finished everything I submitted", which the CPU needs before reading pixels the GPU wrote.
+ * One queue and one fence label make that a comparison rather than a mechanism. */
+bool ac_orbis_wait_gpu_idle(uint64_t timeout_ns);
+
+/* ⚠ WAIT FOR A NAMED SUBMISSION RATHER THAN FOR THE NEWEST ONE.
+ *
+ * ac_orbis_wait_gpu_idle waits for whatever had been submitted when it was CALLED, which is right only
+ * while the caller presents the frame it has just submitted. Once the present is deferred by a frame,
+ * the next frame is already in flight and "the newest" is the wrong target - the wait then covers the
+ * frame AFTER the one being copied and the deferral gains nothing, which is exactly what the console
+ * measured: 71% of the frame spent waiting, unchanged to the percentage point.
+ *
+ * So the WSI takes ac_orbis_gpu_seq_now() when it defers a frame and waits for that value later. */
+uint64_t ac_orbis_gpu_seq_now(void);
+bool ac_orbis_wait_gpu_seq(uint64_t seq, uint64_t timeout_ns);
+
+/* Whether a device address lies inside this arm's single arena. See the definition for why descriptor
+ * construction asks. */
+bool ac_orbis_va_is_ours(uint64_t va, uint64_t size);
+
+/* Logs a user-data pointer the shader will not be able to use: the 32-bit spelling truncates silently in a
+ * release build, so this replaces an assert that is compiled out. */
+void ac_orbis_check_pointer(const char *what, uint32_t sh_offset, uint64_t va, bool is_32bit);
+
+/* Registers a range that must stay zero. The arm checks it before every submission and reports the first
+ * one at which it is not - which is what separates a CPU writer from a GPU one. */
+void ac_orbis_watch_range(uint64_t va, uint64_t size);
+
+/* Records a descriptor pool's address range at the moment it is DESTROYED.
+ *
+ * ⚠ WHY THIS EXISTS AND WHY NO BOUNDS CHECK CAN REPLACE IT. Every "is this address ours" test in this port
+ * compares against the arena, and the arena keeps every address mapped for the life of the process. So a
+ * descriptor set belonging to a pool that has been freed passes all of them - which is why
+ * ac_orbis_check_pointer has never once fired while the GPU faults on a descriptor read. On Linux the same
+ * bug unmaps its pages and is caught; here the read silently succeeds against whoever owns that memory now.
+ *
+ * With the range recorded at destruction, a user-data pointer that still lands in it is a use-after-free
+ * stated as such, rather than one more address that "looks fine". */
+void ac_orbis_note_freed_range(uint64_t va, uint64_t size, const char *what);
+
+/* Remembers what this driver programmed into VGT_TF_MEMORY_BASE, so the register ladder can write the same
+ * value back when it tests whether that register is reachable at all. */
+void ac_orbis_note_tf_base(uint32_t base_shifted);
+
+/* The same for the two GS ring sizes, in the 256-byte units the registers take. The ladder reads them back
+ * and compares, which is the difference between "this register holds something" and "this register holds
+ * what we put there". Zero until a geometry shader has made the queue emit a preamble. */
+void ac_orbis_note_gs_ring_sizes(uint32_t esgs_shifted, uint32_t gsvs_shifted);
+
+/* Whether a VA lies in a range that was freed; fills in its extent and what it was. */
+bool ac_orbis_va_in_freed_range(uint64_t va, uint64_t *lo, uint64_t *hi, const char **what);
+
+/* Whether a range is inside a mapping that is still live: a descriptor set whose pool was destroyed still
+ * has a plausible address, because this arena never unmaps. */
+bool ac_orbis_va_is_live(uint64_t va, uint64_t size);
+
+/* The handle of the last BO that held this address before it was unmapped, or 0. */
+uint32_t ac_orbis_previous_owner(uint64_t va, uint64_t *start, uint64_t *end);
+
+/* Copies the live mappings out once, so thousands of descriptors can be tested without re-walking the
+ * table. */
+unsigned ac_orbis_live_snapshot(uint64_t *addrs, uint64_t *ends, unsigned max);
 
 #ifdef __cplusplus
 }

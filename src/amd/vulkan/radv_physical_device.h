@@ -29,7 +29,7 @@
 #include "vk_sync.h"
 #include "vk_sync_timeline.h"
 
-#ifndef _WIN32
+#if MESA_SYSTEM_HAS_KMS_DRM
 #include <xf86drm.h>
 #endif
 
@@ -152,7 +152,7 @@ struct radv_physical_device {
    /* Bitmask of memory types that are protected. */
    uint32_t memory_types_protected;
 
-#ifndef _WIN32
+#if MESA_SYSTEM_HAS_KMS_DRM
    int available_nodes;
    drmPciBusInfo bus_info;
 
@@ -273,6 +273,13 @@ bool radv_is_dcc_disabled(const struct radv_physical_device *pdev);
 
 VkResult create_drm_physical_device(struct vk_instance *vk_instance, struct _drmDevice *device,
                                     struct vk_physical_device **out);
+
+#ifdef HAVE_ORBIS_PLATFORM
+/* The enumeration entry point for a platform with no DRM nodes to walk. See radv_physical_device.c.
+ * HAVE_ORBIS_PLATFORM and not !MESA_SYSTEM_HAS_KMS_DRM: Windows satisfies the second and has no
+ * business with this hook. The guard on the definition names the same condition. */
+VkResult enumerate_orbis_physical_devices(struct vk_instance *vk_instance);
+#endif
 
 void radv_physical_device_destroy(struct vk_physical_device *vk_pdev);
 

@@ -14,6 +14,7 @@
 #include "addrlib/src/amdgpu_asic_addr.h"
 #include "amd_family.h"
 #include "amdgfxregs.h"
+#include "util/log.h"
 #include "util/macros.h"
 #include "util/u_math.h"
 #include "util/os_misc.h"
@@ -31,7 +32,12 @@
 #define ASICREV_IS_MI200(r)      ASICREV_IS(r, MI200)
 #define ASICREV_IS_GFX940(r)     ASICREV_IS(r, GFX940)
 
-#ifdef _WIN32
+/* The question is "is there a DRM kernel interface", not "is this Windows". Windows was simply the only
+ * platform without one until now. errno.h because the returns below are errno constants and, off
+ * Windows, nothing else in this block has pulled it in.
+ */
+#if !MESA_SYSTEM_HAS_KMS_DRM
+#include <errno.h>
 static int drmGetCap(int fd, uint64_t capability, uint64_t *value)
 {
    return -EINVAL;
@@ -43,10 +49,16 @@ static int drmGetDevice2(int fd, uint32_t flags, drmDevicePtr *device)
 {
    return -ENODEV;
 }
+/* readlink, on the other hand, really is a Windows question: a no-DRM POSIX platform has the real one.
+ */
+#ifdef _WIN32
 static intptr_t readlink(const char *path, char *buf, size_t bufsiz)
 {
    return -1;
 }
+#else
+#include <unistd.h>
+#endif
 static char *
 drmGetFormatModifierName(uint64_t modifier)
 {
@@ -620,6 +632,8 @@ ac_fill_memory_info(struct radeon_info *info, const struct drm_amdgpu_info_devic
       case CHIP_HAINAN:
       case CHIP_BONAIRE:
       case CHIP_KAVERI:
+      case CHIP_LIVERPOOL:
+      case CHIP_GLADIUS:
       case CHIP_ICELAND:
       case CHIP_CARRIZO:
       case CHIP_FIJI:
@@ -754,6 +768,32 @@ ac_identify_chip(struct radeon_info *info, const struct drm_amdgpu_info_device *
             info->family = CHIP_GFX1210;
          }
          break;
+   }
+
+   /* ⚠ BY PCI DEVICE ID, NOT BY ASIC REVISION, which is a deliberate departure from every chip above.
+    *
+    * Sony's semi-custom parts are Kaveri-family silicon, so identifying them the usual way means carving
+    * a sub-range out of Spooky's inside addrlib's amdgpu_asic_addr.h - vendored AMD code - and any retail
+    * Spooky whose revision fell in that sub-range would then be taken for a console. The device ids are
+    * unambiguous, they are already in hand here, and addrlib distinguishes these revisions for nothing:
+    * isSpooky gates no behaviour, both arms reach the same fail-safe. So this identifies the same
+    * hardware without touching vendored code and without inventing a way to be wrong.
+    *
+    * Placed after the family switch so that it does not depend on which family the part reports - the ids
+    * are the same either way. A console exposes no PCI bus to enumerate, but the id is still what the
+    * part answers with.
+    */
+   switch (device_info->device_id) {
+   case 0x9920:
+   case 0x9922:
+   case 0x9923:
+      info->family = CHIP_LIVERPOOL;
+      break;
+   case 0x9924:
+      info->family = CHIP_GLADIUS;
+      break;
+   default:
+      break;
    }
 
    if (info->family == CHIP_UNKNOWN) {
@@ -1061,7 +1101,22 @@ void ac_fill_feature_info(struct radeon_info *info, const struct drm_amdgpu_info
 {
    info->r600_has_virtual_memory = true;
 
+   /* ⚠ NOT ON THIS CONSOLE, AND THE CTS SAID SO IN TEN TESTS. amdgpu's userptr pins arbitrary
+    * process pages and maps them into the GPU's own address space. There is no second address space
+    * here: the GPU sees one arena this process was given, and a pointer outside it can never be made
+    * visible. ac_orbis_drm.c's create_bo_from_user_mem already refuses those correctly - and its own
+    * comment predicted this exact failure, because it noticed that has_userptr was DERIVED from the
+    * DRM version rather than probed, so RADV believed the feature worked.
+    *
+    * Deriving it was the bug. dEQP-VK.memory.external_memory_host.* asked for it, RADV had
+    * advertised VK_EXT_external_memory_host on the strength of this line, and vkAllocateMemory
+    * returned VK_ERROR_INVALID_EXTERNAL_HANDLE ten times. Not advertising it removes all ten and
+    * costs nothing: nothing on this console can use it either way. */
+#if defined(__PS4__)
+   info->has_userptr = false;
+#else
    info->has_userptr = !info->is_virtio;
+#endif
    info->has_syncobj = true;
    info->has_fence_to_handle = true;
 
@@ -1410,6 +1465,43 @@ void ac_fill_tess_info(struct radeon_info *info)
                                          info->max_sa_per_se, max_workgroups_per_se);
    unsigned num_workgroups = num_workgroups_per_se * info->max_se;
 
+   /* ⚠ LIVERPOOL AND GLADIUS USE 256 OFFCHIP BUFFERS, NOT WHAT CU TOPOLOGY PREDICTS.
+    *
+    * The count above is 4 per CU capped per SE, and every term of it - max_good_cu_per_sa, max_sa_per_se,
+    * max_se - is CU topology this port's arm marks UNCITED. On these parts it comes out 72, and the
+    * hardware overruns the ring that number sizes. Two attempts to explain that as a REGISTER being
+    * misprogrammed were tested on hardware and both failed: dividing OFFCHIP_BUFFERING by max_se and
+    * dividing TF_RING_SIZE by max_se each left the write faults at exactly the same addresses. Neither
+    * register bounds these writes.
+    *
+    * MEASURED instead, by filling the ring with a poison byte and reading back the high-water mark over a
+    * rendered world (ORBIS_TESS_RING_WATERMARK):
+    *
+    *     tess ring watermark 8358144 B of 9658368 allocated - the hardware wants 3.46x
+    *
+    * 8358144 is 255 * 32768 + 2304, so the highest buffer touched is index 255 - and 256 * 32768 is
+    * 0x800000 exactly, which is the number Sony's own driver reports:
+    *
+    *     sceGnmGetOffChipTessellationBufferSize()  ->  0x800000
+    *
+    * Two independent sources for the same figure - a measurement on the part and the vendor's own query -
+    * so this is a corrected term rather than the x4 multiplier the earlier effort left switched on. The
+    * multiplier stayed refused as a default the whole way through precisely so it could be replaced by
+    * this.
+    *
+    * ⚠ THE COUNT IS FIXED, NOT THE BYTES. Sony's figure corroborates at the stride this port measures
+    * (32768 B per workgroup); pinning the byte size instead would break if max_hs_out_vram_dwords_per_wg
+    * ever came out different. ORBIS_TESS_WORKGROUPS=<n> overrides it for a run. */
+   if (info->family == CHIP_LIVERPOOL || info->family == CHIP_GLADIUS) {
+      const char *const override = getenv("ORBIS_TESS_WORKGROUPS");
+      const unsigned    want = override != NULL ? (unsigned)atoi(override) : 256;
+
+      if (want > 0) {
+         num_workgroups = want;
+         num_workgroups_per_se = num_workgroups / MAX2(info->max_se, 1);
+      }
+   }
+
    if (info->gfx_level >= GFX11) {
       /* OFFCHIP_BUFFERING is per SE. */
       info->hs_offchip_param = S_03093C_OFFCHIP_BUFFERING_GFX103(num_workgroups_per_se - 1) |
@@ -1418,8 +1510,43 @@ void ac_fill_tess_info(struct radeon_info *info)
       info->hs_offchip_param = S_03093C_OFFCHIP_BUFFERING_GFX103(num_workgroups - 1) |
                                S_03093C_OFFCHIP_GRANULARITY_GFX103(max_hs_out_vram_dwords_enum);
    } else if (info->gfx_level >= GFX7) {
-      info->hs_offchip_param = S_03093C_OFFCHIP_BUFFERING_GFX7(num_workgroups -
-                                                               (info->gfx_level >= GFX8 ? 1 : 0)) |
+      unsigned offchip_buffering = num_workgroups - (info->gfx_level >= GFX8 ? 1 : 0);
+
+      /* ⚠ LIVERPOOL AND GLADIUS READ THIS FIELD PER SHADER ENGINE, and programming the total overruns the ring.
+       *
+       * MEASURED on a PlayStation 4 (klog, 09:41:37): a GPU write fault at VA 0x212a50000 against a tess ring
+       * allocated 0x212800000..0x212a4d800, whose offchip region is 2359296 bytes = 72 x 32768. The faulting
+       * address is offchip buffer 74 exactly - 74 * 32768 = 0x250000 - and OFFCHIP_BUFFERING had been programmed
+       * with 72, the TOTAL across both shader engines.
+       *
+       * Under any reading where the field is a global count, index 74 is one the hardware would never hand out.
+       * Read per SE it is exactly what follows: the VGT believes it has 72 buffers PER ENGINE, SE1 starts at 72,
+       * and its third workgroup is 74. Mesa already divides by max_se this way, but only from GFX11 up.
+       *
+       * So this is not a PS4 quirk in the operating-system sense and it is not gated as one - it is a property of
+       * these two parts, which is where the gate belongs.
+       *
+       * ⚠ WHAT THIS RESTS ON: max_se for Liverpool comes from CU topology this port's own arm marks UNCITED. The
+       * arithmetic above only closes with max_se = 2. If that number is ever measured and is not 2, this is the
+       * first thing to re-derive. ORBIS_HS_OFFCHIP_PER_SE=0 restores the total, because a workaround nobody can
+       * switch off is one nobody can re-measure. */
+      /* ⚠ AND THE MEASUREMENT REFUTED IT, so this is OFF by default and kept only as an experiment.
+       *
+       * Programming 36 instead of 72 did not move the fault: it came back at 0x212a50000, the same address,
+       * with VGT_HS_OFFCHIP_PARAM demonstrably carrying 0x24. Under the per-SE reading with 36 the legal
+       * indices are 0..71 and 74 is still outside them, so the reading does not survive its own prediction.
+       *
+       * What it rested on was that 74 * 32768 lands exactly on the fault. So does factor_base + 0x10000 -
+       * the same address is an exact fit for a tess-FACTOR ring overrun, and TF_RING_SIZE has a per-SE form
+       * upstream too (ac_cmdbuf_cp.c, GFX11). One exact arithmetic fit is not evidence when a second one
+       * exists; ORBIS_HS_OFFCHIP_PER_SE=1 re-arms this if the factor-ring candidate is eliminated. */
+      if ((info->family == CHIP_LIVERPOOL || info->family == CHIP_GLADIUS) &&
+          getenv("ORBIS_HS_OFFCHIP_PER_SE") != NULL &&
+          strcmp(getenv("ORBIS_HS_OFFCHIP_PER_SE"), "0") != 0) {
+         offchip_buffering = num_workgroups_per_se;
+      }
+
+      info->hs_offchip_param = S_03093C_OFFCHIP_BUFFERING_GFX7(offchip_buffering) |
                                S_03093C_OFFCHIP_GRANULARITY_GFX7(max_hs_out_vram_dwords_enum);
    } else {
       info->hs_offchip_param = S_0089B0_OFFCHIP_BUFFERING(num_workgroups) |
@@ -1434,6 +1561,58 @@ void ac_fill_tess_info(struct radeon_info *info)
    info->tess_offchip_ring_size = num_workgroups * max_hs_out_vram_dwords_per_wg * 4;
    info->tess_factor_ring_size = typical_tess_factor_size_per_wg * num_tess_factor_wg_per_cu *
                                  info->max_good_cu_per_sa * info->max_sa_per_se * info->max_se;
+
+   /* ⚠ AND THE FACTOR RING HAS THE SAME DISEASE AS THE OFFCHIP ONE. Same UNCITED terms, same overrun.
+    *
+    * MEASURED, and this one came with its own discriminator for free. Before the offchip count was
+    * corrected the factor ring sat at 0x212a40000 and the GPU write faults were at +0x10000, +0x11000 and
+    * +0x12000. Correcting offchip to 256 buffers moved the factor ring to 0x213000000 - and the faults
+    * MOVED WITH IT, to +0x11000 and +0x12000 of the new base. They follow the FACTOR ring, not the offchip
+    * region, which is the comparison no amount of growing one allocation could have produced.
+    *
+    * So the writes are the tess factor path, and 0xD800 is not enough for them: the hardware reaches at
+    * least 0x13000. The size above counts 3 workgroups per CU across CU topology this port marks UNCITED,
+    * which is the same construction that made the offchip ring short by a factor of three and a half.
+    *
+    * Sized here from the corrected workgroup count instead, at the same bytes per workgroup the formula
+    * above already assumes. ORBIS_TESS_FACTOR_WORKGROUPS=<n> overrides it, and the watermark reports what
+    * the hardware actually reached - if that mark lands above this, the count is still wrong and the mark
+    * is the number to believe. */
+   if (info->family == CHIP_LIVERPOOL || info->family == CHIP_GLADIUS) {
+      const char *const override = getenv("ORBIS_TESS_FACTOR_WORKGROUPS");
+      unsigned          wg = override != NULL ? (unsigned)atoi(override) : num_workgroups;
+
+      /* ⚠ AND 256 WORKGROUPS DOES NOT FIT THE REGISTER ON THIS GENERATION, WHICH NOTHING CAUGHT.
+       *
+       * 256 * 1024 B = 262144 B = 65536 dwords = 0x10000, and VGT_TF_RING_SIZE.SIZE is bits [0,15]
+       * on GFX6 through GFX10 - Mesa's own register database says so, src/amd/registers/gfx7.json,
+       * which is the citation this number was missing. 0x10000 is one past the field. The hardware
+       * takes the low 16 bits, so it would have been programmed with a ring size of ZERO, and the
+       * first draw with tessellation goes straight back into the class of GPU write faults this
+       * sizing exists to fix.
+       *
+       * The assert in ac_cmdbuf_cp.c did not catch it either: S_030938_SIZE and C_030938_SIZE are
+       * generated from the WIDEST definition of the field, 17 bits for GFX11, so the mask has a
+       * hole exactly where this value sits. That assert is now per-generation.
+       *
+       * 255 workgroups is the largest that fits: 261120 B, 65280 dwords, 0xFF00. The override is
+       * clamped too rather than trusted - a knob that silently programs zero is worse than no knob,
+       * and this file has already been burned by an experiment that did not fire. */
+      const unsigned max_dw = info->gfx_level >= GFX11 ? 0x1FFFF : 0xFFFF;
+      const unsigned max_wg = (max_dw * 4) / typical_tess_factor_size_per_wg;
+
+      if (wg > max_wg) {
+         fprintf(stderr,
+                 "amd: tess factor ring of %u workgroups is %u dwords, past the %u-bit "
+                 "VGT_TF_RING_SIZE.SIZE field on this generation - clamped to %u workgroups\n",
+                 wg, (wg * typical_tess_factor_size_per_wg) / 4,
+                 info->gfx_level >= GFX11 ? 17 : 16, max_wg);
+         wg = max_wg;
+      }
+
+      if (wg > 0)
+         info->tess_factor_ring_size = typical_tess_factor_size_per_wg * wg;
+   }
    info->total_tess_ring_size = info->tess_offchip_ring_size + info->tess_factor_ring_size;
 }
 
@@ -1593,6 +1772,7 @@ ac_query_gpu_info(int fd, void *dev_p, struct radeon_info *info,
    ac_fill_memory_info(info, &device_info, &meminfo);
 
    info->has_timeline_syncobj = ac_drm_device_get_sync_provider(dev)->timeline_wait != NULL;
+
    ac_drm_query_has_vm_always_valid(dev, info);
 
    ac_fill_hw_info(info, &device_info);
@@ -1600,6 +1780,44 @@ ac_query_gpu_info(int fd, void *dev_p, struct radeon_info *info,
    ac_fill_tiling_info(info, &amdinfo);
 
    ac_fill_feature_info(info, &device_info);
+
+   /* ⚠ ASKED, NOT ASSUMED. ac_fill_feature_info, immediately above, sets has_fence_to_handle
+    * unconditionally true - safe while every backend of this layer was libdrm over a DRM kernel. A backend
+    * with no file descriptors for fences cannot export one, and a caller that believes the flag takes an
+    * export/merge/import path that fails; radv_amdgpu_cs_submit_zero turns that failure into
+    * VK_ERROR_DEVICE_LOST.
+    *
+    * ⚠ AFTER ac_fill_feature_info, NOT BEFORE. The first version of this sat beside has_timeline_syncobj
+    * further up, where the fill overwrites it, and was silently inert - which cost a console run to notice.
+    *
+    * Probed rather than assumed: create a signalled syncobj and try to export it. A provider that cannot do
+    * this may report a refusal instead of leaving the entry NULL, so a non-NULL entry proves nothing.
+    */
+   /* ⚠ NOT ON WINDOWS, and this is a _WIN32 question rather than a DRM one. The probe needs
+    * DRM_SYNCOBJ_CREATE_SIGNALED, which arrives through ac_linux_drm.h's drm-uapi include and is
+    * excluded there for Windows, and close(), which needs unistd.h - the same reason this file already
+    * carries a readlink stub a few hundred lines up. A no-DRM POSIX platform has both and is probed
+    * normally. Windows keeps whatever ac_fill_feature_info decided, which is what it had before this
+    * probe existed; its winsys is not this layer. */
+#ifndef _WIN32
+   {
+      struct util_sync_provider *const sync = ac_drm_device_get_sync_provider(dev);
+      uint32_t probe = 0;
+
+      info->has_fence_to_handle = false;
+      if (sync->export_sync_file != NULL && sync->create(sync, DRM_SYNCOBJ_CREATE_SIGNALED, &probe) == 0) {
+         int probe_fd = -1;
+         if (sync->export_sync_file(sync, probe, &probe_fd) == 0) {
+            info->has_fence_to_handle = true;
+            if (probe_fd >= 0)
+               close(probe_fd);
+         }
+         sync->destroy(sync, probe);
+      }
+      if (!info->has_fence_to_handle)
+         mesa_loge("ac: no sync-file export on this device - has_fence_to_handle is false");
+   }
+#endif
 
    info->kernel_has_modifiers = has_modifiers(fd) || (info->is_virtio && fd < 0);
 
@@ -2259,6 +2477,8 @@ int ac_get_gs_table_depth(enum amd_gfx_level gfx_level, enum radeon_family famil
    case CHIP_PITCAIRN:
    case CHIP_VERDE:
    case CHIP_BONAIRE:
+   case CHIP_LIVERPOOL:
+   case CHIP_GLADIUS:
    case CHIP_HAWAII:
    case CHIP_TONGA:
    case CHIP_FIJI:
@@ -2308,6 +2528,30 @@ void ac_get_raster_config(const struct radeon_info *info, uint32_t *raster_confi
    case CHIP_POLARIS12:
       raster_config = 0x16000012;
       raster_config_1 = 0x00000000;
+      break;
+   /* Sony's semi-custom gfx7 parts. Neither value matches the Bonaire entry above, and neither matches
+    * the 2 SE / 8 RB entry below either: the high half is the 2-shader-engine shape and the low half is
+    * Hawaii's. Taken from the Linux-on-PS4 driver stack, which runs on the hardware.
+    */
+   case CHIP_LIVERPOOL:
+      raster_config = 0x2a00161a;
+      raster_config_1 = 0x00000000;
+      break;
+   /* ⚠ THIS PAIR IS INTERNALLY INCONSISTENT AND IS CARRIED ANYWAY, because dropping it would send a
+    * PS4 Pro to the default arm and ac_get_gs_table_depth's UNREACHABLE.
+    *
+    * raster_config's high half is the TWO-shader-engine shape (>> 24 == 0x2a, as Tahiti's), while
+    * raster_config_1 is Hawaii's FOUR-engine SE_PAIR_MAP/SE_PAIR_XSEL/SE_PAIR_YSEL. Every other entry in
+    * this function is self-consistent: 2-SE parts pair with raster_config_1 = 0, and the 4-SE entry pairs
+    * 0x3a00161a with 0x2e. The Linux stack this came from also reports max_se = 4 for Gladius, which
+    * would make the high half wrong rather than the low one.
+    *
+    * Unresolved without the hardware, and it only affects the Pro. Liverpool above is the part this port
+    * targets and its pair is consistent.
+    */
+   case CHIP_GLADIUS:
+      raster_config = 0x2a00161a;
+      raster_config_1 = 0x0000002e;
       break;
    /* 2 SEs / 8 RBs */
    case CHIP_TAHITI:

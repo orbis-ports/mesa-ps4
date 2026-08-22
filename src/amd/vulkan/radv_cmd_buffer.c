@@ -17,6 +17,9 @@
 #include "ac_shader_util.h"
 #include "radv_cp_dma.h"
 #include "radv_cs.h"
+#ifdef HAVE_ORBIS_PLATFORM
+#include "radv_descriptor_pool.h"
+#endif
 #include "radv_descriptor_update_template.h"
 #include "radv_dgc.h"
 #include "radv_event.h"
@@ -1286,19 +1289,34 @@ radv_create_cmd_buffer(struct vk_command_pool *pool, VkCommandBufferLevel level,
       list_inithead(&cmd_buffer->upload.list);
 
       radv_cmd_buffer_init_shader_part_cache(device, cmd_buffer);
-      result =
-         radv_create_cmd_stream(device, ip, cmd_buffer->vk.level == VK_COMMAND_BUFFER_LEVEL_SECONDARY, &cmd_buffer->cs);
-      if (result != VK_SUCCESS) {
-         radv_destroy_cmd_buffer(&cmd_buffer->vk);
-         return vk_error(device, VK_ERROR_OUT_OF_DEVICE_MEMORY);
-      }
 
+      /* Everything radv_destroy_cmd_buffer() touches has to be initialised BEFORE the first call
+       * that can fail, because the failure path below destroys this half-built command buffer.
+       *
+       * These four used to sit after radv_create_cmd_stream(), so an allocation failure there ran
+       * radv_destroy_cmd_buffer() over a zeroed msrtss_transients list: list_for_each_entry_safe()
+       * reads (head)->next, which is NULL, then reads that entry's own .next at offset 8 of a
+       * list_head - a null dereference at address 0x8. The descriptor push sets have the same
+       * shape one step later, with vk_object_base_finish() run over bases that were never
+       * initialised.
+       *
+       * Found by dEQP-VK.api.object_management.max_concurrent.command_buffer_primary, whose whole
+       * job is to allocate command buffers until one fails. A driver that only ever succeeds never
+       * reaches this path.
+       */
       for (unsigned i = 0; i < MAX_BIND_POINTS; i++)
          vk_object_base_init(&device->vk, &cmd_buffer->descriptors[i].push_set.set.base, VK_OBJECT_TYPE_DESCRIPTOR_SET);
 
       cmd_buffer->accel_struct_buffers = _mesa_pointer_set_create(NULL);
       cmd_buffer->ray_history = UTIL_DYNARRAY_INIT;
       list_inithead(&cmd_buffer->msrtss_transients);
+
+      result =
+         radv_create_cmd_stream(device, ip, cmd_buffer->vk.level == VK_COMMAND_BUFFER_LEVEL_SECONDARY, &cmd_buffer->cs);
+      if (result != VK_SUCCESS) {
+         radv_destroy_cmd_buffer(&cmd_buffer->vk);
+         return vk_error(device, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      }
    }
 
    if (device->utrace.context) {
@@ -1322,6 +1340,15 @@ radv_cmd_buffer_reset_rendering(struct radv_cmd_buffer *cmd_buffer)
 static void
 radv_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer, UNUSED VkCommandBufferResetFlags flags)
 {
+#ifdef HAVE_ORBIS_PLATFORM
+   /* A recording that is thrown away takes its pool stamps with it, or the next one inherits an accusation
+    * about bindings it never made. */
+   {
+      struct radv_cmd_buffer *const rcb = container_of(vk_cmd_buffer, struct radv_cmd_buffer, vk);
+      rcb->orbis_pool_stamps = 0;
+      rcb->orbis_pool_stamps_dropped = 0;
+   }
+#endif
    struct radv_cmd_buffer *cmd_buffer = container_of(vk_cmd_buffer, struct radv_cmd_buffer, vk);
    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
    struct radv_cmd_stream *cs = cmd_buffer->cs;
@@ -7909,6 +7936,12 @@ radv_init_default_state(struct radv_cmd_buffer *cmd_buffer)
    }
 }
 
+#ifdef HAVE_ORBIS_PLATFORM
+/* Per thread, because several may record at once and a shared stamp would interleave into nonsense.
+ * Recording does not nest on one thread, so a single slot is enough. */
+static __thread uint64_t orbis_record_t0;
+#endif
+
 VKAPI_ATTR VkResult VKAPI_CALL
 radv_BeginCommandBuffer(VkCommandBuffer commandBuffer, const VkCommandBufferBeginInfo *pBeginInfo)
 {
@@ -7916,6 +7949,14 @@ radv_BeginCommandBuffer(VkCommandBuffer commandBuffer, const VkCommandBufferBegi
    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
    const struct radv_physical_device *pdev = radv_device_physical(device);
    VkResult result = VK_SUCCESS;
+#ifdef HAVE_ORBIS_PLATFORM
+   /* ⚠ AN UPPER BOUND, NOT OUR COST. This measures wall time from Begin to End, which contains the
+    * title's own work between its vkCmd calls as well as ours. Paired with the submit path's timing,
+    * which is a lower bound, it brackets how much of the frame's CPU is spent recording at all -
+    * and if the recording window is a small part of the frame, the CPU is going somewhere neither
+    * of them can see, which is itself the answer. */
+   orbis_record_t0 = os_time_get_nano();
+#endif
 
    vk_command_buffer_begin(&cmd_buffer->vk, pBeginInfo);
 
@@ -7926,7 +7967,20 @@ radv_BeginCommandBuffer(VkCommandBuffer commandBuffer, const VkCommandBufferBegi
 
    radv_init_default_state(cmd_buffer);
 
-   if (cmd_buffer->qf == RADV_QUEUE_COMPUTE || device->vk.enabled_features.taskShader) {
+   bool needs_inv_pred = cmd_buffer->qf == RADV_QUEUE_COMPUTE || device->vk.enabled_features.taskShader;
+
+#ifdef HAVE_ORBIS_PLATFORM
+   /* The graphics queue emulates predication with COND_EXEC here too, so it needs the same scratch
+    * dword for inverted conditions that the compute queue has always needed.
+    *
+    * ⚠ IT SHARES THE COMPUTE QUEUE'S FIELD, and that is safe for a reason worth writing down: the
+    * only way a GENERAL command buffer also drives the compute path is taskShader, and task and
+    * mesh shaders need GFX10.3. This is a GFX7 part. The two cannot both be live in one command
+    * buffer on this hardware, so one address and one "already emitted" flag cover both. */
+   needs_inv_pred = needs_inv_pred || cmd_buffer->qf == RADV_QUEUE_GENERAL;
+#endif
+
+   if (needs_inv_pred) {
       uint32_t pred_value = 0;
       uint32_t pred_offset;
       if (!radv_cmd_buffer_upload_data(cmd_buffer, 4, &pred_value, &pred_offset)) {
@@ -8377,6 +8431,49 @@ radv_CmdBindDescriptorSets2(VkCommandBuffer commandBuffer, const VkBindDescripto
 {
    VK_FROM_HANDLE(radv_cmd_buffer, cmd_buffer, commandBuffer);
 
+#ifdef HAVE_ORBIS_PLATFORM
+   /* The old GNM backend reached 30 fps by writing descriptors straight into PM4 with none of this
+    * machinery, so how often the title rebinds is the first thing to know before blaming it. */
+   {
+      extern uint64_t orbis_desc_binds;
+      orbis_desc_binds += pBindDescriptorSetsInfo->descriptorSetCount;
+   }
+#endif
+
+#ifdef HAVE_ORBIS_PLATFORM
+   /* ⚠ STAMP THE POOL'S GENERATION AT RECORD TIME. This is the half of the use-after-free audit that the
+    * command stream cannot supply.
+    *
+    * A range check over destroyed pools already runs in the arm and found nothing, which leaves the case it
+    * structurally cannot see: vkResetDescriptorPool frees every set and hands the SAME addresses back out,
+    * so a binding recorded before the reset and one recorded after it are byte-identical in PM4. Comparing
+    * the pool's generation at record time against its generation at submit time separates them exactly,
+    * with no heuristic and no false positives from ordinary reuse. */
+   for (uint32_t i = 0; i < pBindDescriptorSetsInfo->descriptorSetCount; i++) {
+      VK_FROM_HANDLE(radv_descriptor_set, set, pBindDescriptorSetsInfo->pDescriptorSets[i]);
+      if (set == NULL || set->header.orbis_pool == NULL)
+         continue;
+
+      bool seen = false;
+      for (unsigned k = 0; k < cmd_buffer->orbis_pool_stamps; k++)
+         if (cmd_buffer->orbis_pool_stamp[k].pool == set->header.orbis_pool) {
+            seen = true;
+            break;
+         }
+      if (seen)
+         continue;
+
+      if (cmd_buffer->orbis_pool_stamps < ARRAY_SIZE(cmd_buffer->orbis_pool_stamp)) {
+         cmd_buffer->orbis_pool_stamp[cmd_buffer->orbis_pool_stamps].pool = set->header.orbis_pool;
+         cmd_buffer->orbis_pool_stamp[cmd_buffer->orbis_pool_stamps].generation =
+            set->header.orbis_pool->orbis_generation;
+         cmd_buffer->orbis_pool_stamps++;
+      } else {
+         cmd_buffer->orbis_pool_stamps_dropped++;
+      }
+   }
+#endif
+
    if (pBindDescriptorSetsInfo->stageFlags & VK_SHADER_STAGE_COMPUTE_BIT) {
       radv_bind_descriptor_sets(cmd_buffer, pBindDescriptorSetsInfo, VK_PIPELINE_BIND_POINT_COMPUTE);
    }
@@ -8515,6 +8612,16 @@ VKAPI_ATTR VkResult VKAPI_CALL
 radv_EndCommandBuffer(VkCommandBuffer commandBuffer)
 {
    VK_FROM_HANDLE(radv_cmd_buffer, cmd_buffer, commandBuffer);
+#ifdef HAVE_ORBIS_PLATFORM
+   /* See the note in radv_BeginCommandBuffer. A zero t0 means recording began before this counter
+    * existed for this thread, which is not a span. */
+   if (orbis_record_t0) {
+      extern uint64_t orbis_record_ns, orbis_record_spans;
+      orbis_record_ns += os_time_get_nano() - orbis_record_t0;
+      orbis_record_spans++;
+      orbis_record_t0 = 0;
+   }
+#endif
    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
    struct radv_cmd_stream *cs = cmd_buffer->cs;
    struct radv_cmd_stream *ace_cs = cmd_buffer->gang.cs;
@@ -10520,6 +10627,35 @@ VKAPI_ATTR void VKAPI_CALL
 radv_CmdBeginRendering(VkCommandBuffer commandBuffer, const VkRenderingInfo *pRenderingInfo)
 {
    VK_FROM_HANDLE(radv_cmd_buffer, cmd_buffer, commandBuffer);
+#ifdef HAVE_ORBIS_PLATFORM
+   /* ⚠ HOW MANY TIMES DOES THIS TITLE TOUCH EVERY PIXEL?
+    *
+    * The frame is now accounted for: ~103 ms of GPU against ~60 ms of CPU, and TWO resolutions pin the
+    * GPU side down completely. With F the resolution-independent cost and P the per-pixel one,
+    * F + P = 103 ms at 1080p and F + P/4 = 26 ms at 540p give P = 103 and F = 0. There is no meaningful
+    * fixed cost: not shadow maps, not geometry, not state. All of it is per pixel.
+    *
+    * Which leaves one number unexplained. 2 Mpixels in 103 ms on 18 CUs at 800 MHz is about 46,000
+    * lane-cycles per pixel, and a heavy deferred renderer spends hundreds to low thousands. Something
+    * is 20-90x off, and there are only three ways that happens: the title covers the screen far more
+    * often than anyone thinks, the shaders are enormous, or the hardware is stalling.
+    *
+    * Counting render passes and the area each covers separates the first from the other two, and it is
+    * the cheapest of the three to measure - this is a counter on a path that runs a few dozen times a
+    * frame, not per draw. If the pixels shaded per frame come to twenty-odd screenfuls then 103 ms is
+    * simply what that costs and the answer is to draw less; if it comes to five, the shaders are the
+    * subject.
+    *
+    * Dispatches are counted separately below, because a compute pass that writes a full-screen image
+    * costs the same as a draw that does and none of this title's post-processing is a draw. */
+   {
+      extern uint64_t orbis_gfx_passes, orbis_gfx_pass_pixels;
+      const VkRect2D *const a = &pRenderingInfo->renderArea;
+      orbis_gfx_passes++;
+      orbis_gfx_pass_pixels += (uint64_t)a->extent.width * a->extent.height *
+                               (pRenderingInfo->layerCount ? pRenderingInfo->layerCount : 1);
+   }
+#endif
    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
    const struct radv_physical_device *pdev = radv_device_physical(device);
    VkExtent2D screen_scissor = {pdev->image_props.max_dims.width, pdev->image_props.max_dims.height};
@@ -11168,6 +11304,353 @@ radv_cs_emit_compute_predication(const struct radv_device *device, struct radv_c
    ac_emit_cp_cond_exec(cs->b, pdev->info.gfx_level, va, dwords);
 }
 
+#ifdef HAVE_ORBIS_PLATFORM
+/**
+ * Predicate the next `dwords` dwords of the GRAPHICS stream with COND_EXEC, because this console's
+ * command processor hangs on SET_PREDICATION.
+ *
+ * ⚠ `dwords` MUST cover whole packets and match them exactly. COND_EXEC skips a counted run, so a
+ * count that lands inside a packet leaves the CP parsing an operand as an opcode. Under-counting is
+ * merely wrong - the tail executes unconditionally; over-counting desyncs the stream. Every caller
+ * therefore passes a literal derived from the PKT3 it is about to emit, the way the MEC callers do.
+ *
+ * ⚠ IT DELIBERATELY DOES NOT RESERVE SPACE, and the reason is the same one that makes the count
+ * matter. The callers already reserve generously - 4096+ dwords around a draw, 30 around a dispatch,
+ * which is the budget upstream's own MEC predication lives inside. A second radeon_check_space here
+ * could chain the stream to a new buffer BETWEEN the COND_EXEC and the packets it counts, and the
+ * skip would then step over whatever the chain wrote instead of over the draw.
+ *
+ * ⚠ KNOWN GAP: THIS CP'S COND_EXEC DOES NOT SEEM TO TEST ALL 32 BITS. dEQP has a group built to
+ * check exactly that - "Tests verifying the condition is interpreted as a 32-bit value" - and it
+ * splits cleanly here:
+ *
+ *     0x00000001  first_byte    execute   PASS
+ *     0x00000100  second_byte   execute   FAIL (skipped)
+ *     0x00010000  third_byte    execute   FAIL (skipped)
+ *     0x01000000  fourth_byte   execute   FAIL (skipped)
+ *
+ * ⚠ Four data points and no documentation: nothing in this tree defines COND_EXEC's fields, so
+ * "it tests bit 0" is the reading that fits, NOT something read off a spec. It could equally be the
+ * low byte. Either way the inverted path inherits it, because that path uses COND_EXEC itself to
+ * decide whether the condition was zero. A predicate of 0 or 1 - which is what everything except
+ * this test group uses - is unaffected.
+ *
+ * ⚠ THE PREDICATE BIT IN THE PKT3 HEADER IS LEFT SET on the draw packets, and that is inert rather
+ * than harmless-by-argument: in this mode nothing ever emits SET_PREDICATION, so the CP's
+ * predication state is never armed. The 906-test baseline run is the evidence - every packet in it
+ * carried the bit with no SET_PREDICATION anywhere, and expect_execution came back 128 pass /
+ * 0 fail. Clearing the bit would mean threading a flag through five emit sites to change nothing
+ * measurable.
+ */
+static bool
+radv_orbis_predicate_next(struct radv_cmd_buffer *cmd_buffer, unsigned dwords)
+{
+   struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
+   const struct radv_physical_device *pdev = radv_device_physical(device);
+   struct radv_cmd_state *state = &cmd_buffer->state;
+   struct radv_cmd_stream *cs = cmd_buffer->cs;
+
+   if (!state->cond_render.enabled || cmd_buffer->qf != RADV_QUEUE_GENERAL)
+      return false;
+   if (radv_orbis_predication_mode() != RADV_ORBIS_PREDICATION_COND_EXEC)
+      return false;
+
+   uint64_t va = state->cond_render.user_va;
+
+   if (!state->cond_render.type) {
+      /* Inverted. Build "the API condition was zero" into a scratch dword, the same three packets
+       * radv_cs_emit_compute_predication() uses for MEC - write 1, then conditionally write 0 back
+       * when the API condition is non-zero. */
+      const uint64_t inv_va = state->cond_render.mec_inv_pred_va;
+
+      if (!state->cond_render.mec_inv_pred_emitted) {
+         state->cond_render.mec_inv_pred_emitted = true;
+
+         radv_emit_copy_data_imm(pdev, cs, 1, inv_va);
+         ac_emit_cp_cond_exec(cs->b, pdev->info.gfx_level, va, 6 /* 1x COPY_DATA */);
+         radv_emit_copy_data_imm(pdev, cs, 0, inv_va);
+
+         /* ⚠ THIS SYNC IS WHY THE GRAPHICS QUEUE NEEDS ITS OWN COPY OF THE SEQUENCE, and leaving it
+          * out cost 85 of the 121 failures in the first COND_EXEC run - every inverted case, and
+          * nothing else. COPY_DATA is executed by the ME; COND_EXEC is a PFP packet, because
+          * skipping dwords is something only the stage that FETCHES them can do. So the PFP reaches
+          * the read while the ME is still behind it, and reads the scratch dword before the write
+          * lands - WR_CONFIRM makes the write reliable, not early.
+          *
+          * The MEC has one stage and no such gap, which is why upstream's version needs nothing
+          * here. radv_begin_conditional_rendering does the same PFP_SYNC_ME after its own COPY_DATA
+          * for exactly this reason. */
+         ac_emit_cp_pfp_sync_me(cs->b, false);
+      }
+
+      va = inv_va;
+   }
+
+   ac_emit_cp_cond_exec(cs->b, pdev->info.gfx_level, va, dwords);
+   return true;
+}
+
+/* The dwords one COND_EXEC costs, or zero when this draw is not predicated at all. Kept next to the
+ * emitter so the two cannot disagree about the packet's size, which is what a reservation is for. */
+static unsigned
+radv_orbis_predicate_dwords(struct radv_cmd_buffer *cmd_buffer)
+{
+   struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
+   const struct radv_physical_device *pdev = radv_device_physical(device);
+   const struct radv_cmd_state *state = &cmd_buffer->state;
+
+   if (!state->cond_render.enabled || cmd_buffer->qf != RADV_QUEUE_GENERAL)
+      return 0;
+   if (radv_orbis_predication_mode() != RADV_ORBIS_PREDICATION_COND_EXEC)
+      return 0;
+
+   return pdev->info.gfx_level >= GFX7 ? 5 : 4;
+}
+
+enum radv_orbis_indirect_draw_mode {
+   RADV_ORBIS_INDIRECT_LOOP = 0, /* no MULTI packet: one plain DRAW_INDIRECT per draw */
+   RADV_ORBIS_INDIRECT_MULTI,    /* upstream DRAW_*_INDIRECT_MULTI - MEASURED TO HANG */
+   RADV_ORBIS_INDIRECT_SINGLE,   /* one draw and no more - the packet-separation experiment */
+};
+
+/**
+ * ⚠ DRAW_*_INDIRECT_MULTI WEDGES THIS COMMAND PROCESSOR, AND THAT IS MEASURED IN TWO RUNS.
+ *
+ * `draw_indexed_indirect_count` hung the GPU outright - 0xa0d0c00a, a submission that never
+ * completed - and a hang ends a whole dEQP session, which made it one of two things capping how far
+ * any sweep could get.
+ *
+ * Two runs over the same 482 tests separated the count buffer from the packet carrying it:
+ *
+ *     COUNT_INDIRECT_ENABLE cleared, MULTI kept    hung, on the same test
+ *     MULTI dropped as well                        482 verdicts, no hang
+ *
+ * So it is the packet, not the count field. And radeonsi has known this all along:
+ * si_gfx_screen.c:866 gates has_draw_indirect_multi on FIRMWARE version - GFX7 needs pfp >= 211 and
+ * me >= 173 - and si_state_draw.cpp:1605 falls back to the plain DRAW_INDIRECT when it is not met.
+ * RADV checks nothing. The packet is a firmware feature of GFX7, not a silicon one, and the firmware
+ * in this console is Sony's.
+ *
+ * ⚠ AND THE FIRMWARE-VERSION QUERY IN ac_orbis_drm.c ALREADY RETURNS ZERO, with a comment auditing
+ * every consumer of it in the tree and concluding "on gfx7 the answer is nothing". That audit was
+ * right about RADV and asked the wrong question: not what the tree does with the numbers, but what
+ * the hardware needs them for. Under radeonsi's rule those zeros give 0 < 211 and the fallback -
+ * so a driver in this same tree would have got this right by accident.
+ *
+ * WHAT THIS DOES INSTEAD, and it needs no new packet: one plain DRAW_INDIRECT per draw, with the
+ * per-draw offset in the packet's own data_offset field. RADV writes 0 there and moves the base
+ * with SET_BASE; radeonsi writes indirect->offset. Only gl_DrawID needs adding by hand, since
+ * carrying it is exactly why upstream reaches for MULTI in the first place.
+ *
+ * ⚠ THE COUNT BUFFER IS NOT HONOURED YET and that is a wrong picture, not a slow one. Building
+ * "execute draw i if i < count" needs a comparison the CP can make, and COND_EXEC only tests a
+ * dword against zero. PKT3_COND_WRITE (0x45) has the compare - AMD's own packet tables in this tree
+ * carry it with function=6 "greater_than_reference_value" - but nothing in Mesa emits it, so it
+ * gets probed on hardware before anything depends on it.
+ *
+ *     loop     no MULTI; one DRAW_INDIRECT per draw. The default
+ *     multi    upstream - reproduces the hang
+ *     single   one draw and no more - the experiment that found this
+ */
+static enum radv_orbis_indirect_draw_mode
+radv_orbis_indirect_draw_mode(void)
+{
+   static int mode = -1;
+
+   if (mode < 0) {
+      const char *const e = getenv("ORBIS_INDIRECT_COUNT");
+
+      /* "on" and "ignore" are what the runs that found this carried; they keep working. */
+      if (e != NULL && (!strcmp(e, "multi") || !strcmp(e, "on")))
+         mode = RADV_ORBIS_INDIRECT_MULTI;
+      else if (e != NULL && !strcmp(e, "single"))
+         mode = RADV_ORBIS_INDIRECT_SINGLE;
+      else
+         mode = RADV_ORBIS_INDIRECT_LOOP;
+
+      mesa_logi("radv/orbis: indirect multi-draw is %s.",
+                mode == RADV_ORBIS_INDIRECT_MULTI    ? "the upstream MULTI packet - EXPECT A HANG"
+                : mode == RADV_ORBIS_INDIRECT_SINGLE ? "forced to a SINGLE draw - THE PICTURE WILL BE WRONG"
+                                                     : "a loop of plain DRAW_INDIRECT packets");
+   }
+
+   return (enum radv_orbis_indirect_draw_mode)mode;
+}
+
+/**
+ * ⚠ HOW MANY PFP_SYNC_ME BETWEEN COND_WRITE AND THE COND_EXEC THAT READS IT.
+ *
+ * The probe in ac_orbis_drm.c measured this on hardware: with ZERO the in-stream COND_EXEC reads the
+ * scratch dword before the write lands, and with one, three or nine it does not. So the hazard is
+ * real and one was enough at that moment.
+ *
+ * ⚠ NINE IS THE DEFAULT ANYWAY, and the gap between "measured once" and "safe" is the whole reason.
+ * r600 spends nine on palm and three on cypress and barts, and its comment calls those calibration
+ * rather than specification - a number that depends on the chip and on what the CP happens to be
+ * doing. Too small a delay does not fail; it draws a picture that depends on a race, which is the
+ * failure mode that survives testing and shows up later as "sometimes wrong". Eight extra dwords a
+ * draw is not worth that.
+ */
+static unsigned
+radv_orbis_indirect_count_syncs(void)
+{
+   static int syncs = -1;
+
+   if (syncs < 0) {
+      const char *const e = getenv("ORBIS_INDIRECT_COUNT_SYNCS");
+      syncs = (e != NULL && *e != '\0') ? (int)strtoul(e, NULL, 0) : 9;
+      if (syncs < 0)
+         syncs = 0;
+   }
+
+   return (unsigned)syncs;
+}
+
+/**
+ * One plain DRAW_INDIRECT per draw, for the parts a MULTI packet would have carried.
+ *
+ * The packet takes the per-draw offset itself, and base_vertex/base_instance still come out of the
+ * indirect structure the way they do for a single draw. Only gl_DrawID has to be written by hand,
+ * since carrying it is exactly why upstream reaches for MULTI.
+ *
+ * ⚠ AND THE COUNT BUFFER IS HONOURED WITH COND_WRITE, which is what r600 does for the same reason
+ * on hardware older than this - r600_state_common.c:2463 builds a boolean with it and guards a plain
+ * DRAW_*_INDIRECT with COND_EXEC. Per draw:
+ *
+ *     COPY_DATA   0 -> flag                     the flag must start clear: COND_WRITE only writes
+ *     COND_WRITE  count > i ? 1 -> flag         function 6, greater_than_reference_value
+ *     PFP_SYNC_ME × N                           the ME wrote it; the PFP is about to read it
+ *     COND_EXEC   flag, skip the draw
+ *     DRAW_INDIRECT
+ *
+ * One scratch dword serves every draw rather than an array of them, and the sync is what makes that
+ * safe: each iteration's PFP_SYNC_ME forces the PFP to wait for the ME, and the ME executes the
+ * zeroing and the COND_WRITE of that iteration in order before it.
+ */
+static void
+radv_orbis_emit_indirect_draw_loop(struct radv_cmd_buffer *cmd_buffer, bool indexed, uint32_t draw_count,
+                                   uint64_t count_va, uint32_t stride, uint32_t vertex_offset_reg,
+                                   uint32_t start_instance_reg, unsigned di_src_sel)
+{
+   struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
+   const struct radv_physical_device *pdev = radv_device_physical(device);
+   struct radv_cmd_state *state = &cmd_buffer->state;
+   struct radv_cmd_stream *cs = cmd_buffer->cs;
+   const bool predicating = state->cond_render.enabled;
+   const bool draw_id_enable = state->uses_drawid;
+   const unsigned syncs = radv_orbis_indirect_count_syncs();
+
+   /* ⚠ ZERO DRAWS MEANS ZERO DRAWS, AND MAX2(draw_count, 1) MADE IT ONE.
+    *
+    * Both spellings of the call reach here with draw_count == 0 legally. vkCmdDrawIndirectCount with
+    * maxDrawCount == 0 executes min(count, 0) = 0 draws whatever the count buffer says - and the
+    * COND_WRITE guard below cannot save it, because that guard only ever compares against the value
+    * IN the buffer and never against maxDrawCount. And plain vkCmdDrawIndirect with drawCount == 0
+    * was worse: no count buffer means no predicate at all, so the one draw MAX2 invented was
+    * unconditional, reading an indirect structure at offset 0 that the application never wrote.
+    *
+    * There is nothing to emit and nothing to reserve, so this returns before either. */
+   if (draw_count == 0)
+      return;
+
+   const uint32_t n = radv_orbis_indirect_draw_mode() == RADV_ORBIS_INDIRECT_SINGLE ? 1 : draw_count;
+
+   /* The dwords COND_EXEC has to skip when the count says this draw does not happen. */
+   const unsigned skipped = 5 /* PKT3(DRAW_*_INDIRECT, 3) */ + (draw_id_enable ? 3 /* SET_SH_REG */ : 0);
+
+   uint64_t flag_va = 0;
+
+   if (count_va) {
+      const uint32_t zero = 0;
+      uint32_t offset;
+
+      if (radv_cmd_buffer_upload_data(cmd_buffer, 4, &zero, &offset)) {
+         flag_va = radv_buffer_get_va(cmd_buffer->upload.upload_bo) + offset;
+      } else {
+         /* Once, loudly. A driver that quietly draws the wrong number of things is worse than one
+          * that says which promise it is not keeping. */
+         static bool warned = false;
+         if (!warned) {
+            warned = true;
+            mesa_logw("radv/orbis: no upload space for the indirect-count predicate, so this draw "
+                      "ignores its count buffer and draws maxDrawCount - the picture will be wrong "
+                      "wherever the count is smaller.");
+         }
+      }
+   }
+
+   const unsigned per_draw =
+      skipped + (flag_va ? 6 /* COPY_DATA */ + 9 /* COND_WRITE */ + 2 * syncs + 5 /* COND_EXEC */ : 0);
+
+   /* ⚠ ONE COND_EXEC PER DRAW, NOT ONE ACROSS THE WHOLE LOOP, AND THE FIELD IS WHY.
+    *
+    * COND_EXEC's EXEC_COUNT is bits 13:0 - AMD's own PM4 tables, shipped in this tree at
+    * src/amd/packets/cp_pm4_table_data_gfx11.json and gfx12, agree on 14 bits for both the PFP and
+    * MEC forms of the packet. So the largest region one COND_EXEC can skip is 16383 dwords. This
+    * loop was predicating per_draw * n of them in a single packet, and per_draw is 46 by default
+    * with the count buffer in play: 357 indirect draws under conditional rendering overflows the
+    * field, the PFP skips only count & 0x3fff dwords, and it resumes IN THE MIDDLE OF A PACKET.
+    * That is a wedged command processor, not a wrong picture.
+    *
+    * Predicating each draw separately keeps every count at per_draw, which cannot overflow, and
+    * costs one extra packet per draw only when conditional rendering is actually on. The one-time
+    * inverted-predicate setup inside radv_orbis_predicate_next guards itself, so calling it in the
+    * loop still emits it once.
+    *
+    * ⚠ RESERVED BEFORE THE PREDICATE AS WELL AS THE DRAWS, and in one call. draw_count is an
+    * application number with no bound, so this path can outgrow whatever the caller reserved; and if
+    * the stream chained in the middle, a skip count would step over the chain instead of over what
+    * it was counting. The 19 dwords are that one-time setup: COPY_DATA, COND_EXEC, COPY_DATA,
+    * PFP_SYNC_ME. */
+   const unsigned pred_dw = radv_orbis_predicate_dwords(cmd_buffer);
+
+   radeon_check_space(device->ws, cs->b, 5 + 19 + (per_draw + pred_dw) * n);
+
+   for (uint32_t i = 0; i < n; i++) {
+      radv_orbis_predicate_next(cmd_buffer, per_draw);
+
+      if (flag_va) {
+         radv_emit_copy_data_imm(pdev, cs, 0, flag_va);
+
+         radeon_begin(cs);
+         radeon_emit(PKT3(PKT3_COND_WRITE, 7, 0));
+         /* function at 2:0, poll_space at 4, write_space at 9:8, wr_confirm at 20 - r600 writes
+          * this same control word and AMD's own packet tables agree bit for bit. */
+         radeon_emit(6u /* greater than reference */ | (1u << 4) /* poll memory */ |
+                     (1u << 8) /* write memory */ | (1u << 20) /* wr_confirm */);
+         radeon_emit(count_va);
+         radeon_emit(count_va >> 32);
+         radeon_emit(i);          /* reference: the draw index */
+         radeon_emit(0xFFFFFFFF); /* mask */
+         radeon_emit(flag_va);
+         radeon_emit(flag_va >> 32);
+         radeon_emit(1); /* what to write when count > i */
+         radeon_end();
+
+         for (unsigned k = 0; k < syncs; k++)
+            ac_emit_cp_pfp_sync_me(cs->b, false);
+
+         ac_emit_cp_cond_exec(cs->b, pdev->info.gfx_level, flag_va, skipped);
+      }
+
+      radeon_begin(cs);
+      if (draw_id_enable) {
+         radeon_set_sh_reg_seq(state->vtx_base_sgpr + 4, 1);
+         radeon_emit(i);
+      }
+
+      radeon_emit(PKT3(indexed ? PKT3_DRAW_INDEX_INDIRECT : PKT3_DRAW_INDIRECT, 3, predicating));
+      radeon_emit(i * stride); /* data_offset - what MULTI's stride field was for */
+      radeon_emit(vertex_offset_reg);
+      radeon_emit(start_instance_reg);
+      radeon_emit(di_src_sel);
+      radeon_end();
+   }
+
+   state->uses_draw_indirect = true;
+}
+#endif
+
 ALWAYS_INLINE static void
 radv_gfx12_emit_wa(const struct radv_device *device, const struct radv_cmd_state *cmd_state, struct radv_cmd_stream *cs)
 {
@@ -11208,6 +11691,10 @@ radv_cs_emit_draw_packet(struct radv_cmd_buffer *cmd_buffer, uint32_t vertex_cou
    const struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
    struct radv_cmd_stream *cs = cmd_buffer->cs;
 
+#ifdef HAVE_ORBIS_PLATFORM
+   radv_orbis_predicate_next(cmd_buffer, 3 /* PKT3(DRAW_INDEX_AUTO, 1) */);
+#endif
+
    radeon_begin(cs);
    radeon_emit(PKT3(PKT3_DRAW_INDEX_AUTO, 1, cmd_buffer->state.cond_render.enabled));
    radeon_emit(vertex_count);
@@ -11230,6 +11717,10 @@ radv_cs_emit_draw_indexed_packet(struct radv_cmd_buffer *cmd_buffer, uint64_t in
 {
    const struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
    struct radv_cmd_stream *cs = cmd_buffer->cs;
+
+#ifdef HAVE_ORBIS_PLATFORM
+   radv_orbis_predicate_next(cmd_buffer, 6 /* PKT3(DRAW_INDEX_2, 4) */);
+#endif
 
    radeon_begin(cs);
    radeon_emit(PKT3(PKT3_DRAW_INDEX_2, 4, cmd_buffer->state.cond_render.enabled));
@@ -11269,6 +11760,20 @@ radv_cs_emit_indirect_draw_packet(struct radv_cmd_buffer *cmd_buffer, bool index
       start_instance_reg = ((base_reg + (draw_id_enable ? 8 : 4)) - SI_SH_REG_OFFSET) >> 2;
    if (draw_id_enable)
       draw_id_reg = ((base_reg + 4) - SI_SH_REG_OFFSET) >> 2;
+
+#ifdef HAVE_ORBIS_PLATFORM
+   /* The MULTI packet hangs this CP - see radv_orbis_indirect_draw_mode(). Everything it carried is
+    * emitted as ordinary indirect draws instead, except the count buffer, which is not honoured yet
+    * and says so in the log. */
+   if (use_multi && radv_orbis_indirect_draw_mode() != RADV_ORBIS_INDIRECT_MULTI) {
+      radv_orbis_emit_indirect_draw_loop(cmd_buffer, indexed, draw_count, count_va, stride, vertex_offset_reg,
+                                         start_instance_reg, di_src_sel);
+      return;
+   }
+
+   radv_orbis_predicate_next(cmd_buffer, use_multi ? 10 /* PKT3(DRAW_*_INDIRECT_MULTI, 8) */
+                                                   : 5 /* PKT3(DRAW_*_INDIRECT, 3) */);
+#endif
 
    radeon_begin(cs);
 
@@ -13733,6 +14238,15 @@ radv_bind_graphics_shaders(struct radv_cmd_buffer *cmd_buffer)
 ALWAYS_INLINE static bool
 radv_before_draw(struct radv_cmd_buffer *cmd_buffer, const struct radv_draw_info *info, uint32_t drawCount, bool dgc)
 {
+#ifdef HAVE_ORBIS_PLATFORM
+   /* Every draw path in this file funnels through here, so one increment covers all seventeen entry
+    * points. What it is for: the frame is CPU-bound now, and cost per draw is the number that says
+    * whether the CPU is going into RADV's per-draw work or into the title above it. */
+   {
+      extern uint64_t orbis_draws;
+      orbis_draws += drawCount;
+   }
+#endif
    const struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
    const struct radv_physical_device *pdev = radv_device_physical(device);
    const bool has_prefetch = pdev->info.gfx_level >= GFX7;
@@ -14647,6 +15161,11 @@ radv_emit_dispatch_packets(struct radv_cmd_buffer *cmd_buffer, const struct radv
                                              &cmd_buffer->state.cond_render.mec_inv_pred_emitted, 3 /* PKT3_DISPATCH_INDIRECT */);
             predicating = false;
          }
+#ifdef HAVE_ORBIS_PLATFORM
+         else if (radv_orbis_predicate_next(cmd_buffer, 3 /* PKT3_DISPATCH_INDIRECT */)) {
+            predicating = false;
+         }
+#endif
 
          radeon_begin(cs);
          radeon_emit(PKT3(PKT3_DISPATCH_INDIRECT, 1, predicating) | PKT3_SHADER_TYPE_S(1));
@@ -14734,6 +15253,13 @@ radv_emit_dispatch_packets(struct radv_cmd_buffer *cmd_buffer, const struct radv
                                           &cmd_buffer->state.cond_render.mec_inv_pred_emitted, 5 /* DISPATCH_DIRECT size */);
          predicating = false;
       }
+#ifdef HAVE_ORBIS_PLATFORM
+      /* Nothing is emitted between here and the DISPATCH_DIRECT below on the graphics queue - the
+       * threadgroup workaround that sits in between only touches locals and is compute-only. */
+      else if (radv_orbis_predicate_next(cmd_buffer, 5 /* DISPATCH_DIRECT size */)) {
+         predicating = false;
+      }
+#endif
 
       if (pdev->info.has_async_compute_threadgroup_bug && cmd_buffer->qf == RADV_QUEUE_COMPUTE) {
          for (unsigned i = 0; i < 3; i++) {
@@ -14950,6 +15476,15 @@ radv_CmdDispatchBase(VkCommandBuffer commandBuffer, uint32_t base_x, uint32_t ba
 {
    VK_FROM_HANDLE(radv_cmd_buffer, cmd_buffer, commandBuffer);
    struct radv_dispatch_info info = {0};
+#ifdef HAVE_ORBIS_PLATFORM
+   /* Workgroups rather than threads: the local size lives in the shader and this path does not have it.
+    * A full-screen 8x8 compute pass over 1080p is 32400 groups, which is the scale to read this by. */
+   {
+      extern uint64_t orbis_dispatches, orbis_dispatch_groups;
+      orbis_dispatches++;
+      orbis_dispatch_groups += (uint64_t)x * y * z;
+   }
+#endif
 
    info.blocks[0] = x;
    info.blocks[1] = y;
@@ -16021,6 +16556,89 @@ radv_CmdWaitEvents2(VkCommandBuffer commandBuffer, uint32_t eventCount, const Vk
    radv_barrier(cmd_buffer, eventCount, pDependencyInfos, RGP_BARRIER_EXTERNAL_CMD_WAIT_EVENTS);
 }
 
+#ifdef HAVE_ORBIS_PLATFORM
+/* ⚠ WHICH CALLER ASKED MATTERS, AND FOR A WHILE THIS DID NOT DISTINGUISH THEM.
+ *
+ * Only ONE caller has ever been measured to wedge this command processor: radv_meta_fast_clear.c,
+ * whose DCC fast-clear eliminate asks for PREDICATION_OP_BOOL64 on line 238 with no gfx_level gate
+ * at all. That is the hang recorded in 69801831429 - a world load stopped at 42% of a 197000-dword
+ * submission for eight consecutive runs, with per-packet markers putting the last executed packet
+ * immediately before a SET_PREDICATION.
+ *
+ * The switch that answered it suppressed the FUNCTION, so it took conditional rendering with it -
+ * and conditional rendering had never been measured at all. The CTS then read the consequence
+ * exactly: 75 pass / 0 fail where predicated work must RUN, 24 pass / 48 fail where it must be
+ * SKIPPED. That is not a driver defect, it is this workaround being wider than its evidence.
+ *
+ * ⚠ AND IT IS THE OPERATION, NOT THE CALLER - THAT IS NOW MEASURED TOO. has_32bit_predication
+ * requires GFX9+ (ac_gpu_info.c), so radv_begin_conditional_rendering takes the emulated path here
+ * and also arrives at PREDICATION_OP_BOOL64. Running the family with SET_PREDICATION restored for
+ * conditional rendering alone hung the console on the FIRST predicated test, with five samples over
+ * three minutes showing the result file, the driver log and the trace identical to the byte:
+ *
+ *     dEQP-VK.conditional_rendering.clear_attachments.condition_host_memory_expect_execution.*
+ *
+ * The six unpredicated api.smoke controls ahead of it passed. And the test that hung is an
+ * expect_execution one - the predicate says RUN - so this is not a CP mis-evaluating a condition,
+ * it is a CP that does not implement the opcode.
+ *
+ * So predication here is emulated with COND_EXEC instead, which skips a counted run of dwords when
+ * the 32-bit value at an address is zero. That is a better fit than SET_PREDICATION ever was: the
+ * Vulkan predicate IS 32-bit, so the whole BOOL64 dance that upstream needs on pre-GFX9 parts falls
+ * away with it. radv_cs_emit_compute_predication() already does exactly this for MEC, inverted
+ * conditions included, because the compute queue never had predication either.
+ *
+ * ⚠ THE MODES ARE A LADDER AND EVERY RUNG IS REACHABLE, because a workaround nobody can switch off
+ * is a workaround nobody can re-measure:
+ *
+ *     none      nothing predicates - the old default; 128/0 pass, 24/104 fail, no hang
+ *     condexec  conditional rendering via COND_EXEC, no SET_PREDICATION anywhere - the default
+ *     cond      conditional rendering via SET_PREDICATION - REPRODUCES THE HANG ABOVE
+ *     all       upstream, meta included - reproduces the world-load hang of 69801831429
+ *
+ * ⚠ The default cannot affect the TITLE. OpenGothic does not use VK_EXT_conditional_rendering, so
+ * its stream gains no packet from any of this; only the CTS changes.
+ */
+enum radv_orbis_predication_mode
+radv_orbis_predication_mode(void)
+{
+   static int mode = -1;
+
+   if (mode < 0) {
+      const char *const e = getenv("ORBIS_PREDICATION");
+
+      if (e != NULL && *e != '\0') {
+         if (!strcmp(e, "none"))
+            mode = RADV_ORBIS_PREDICATION_NONE;
+         else if (!strcmp(e, "all"))
+            mode = RADV_ORBIS_PREDICATION_ALL;
+         else if (!strcmp(e, "cond"))
+            mode = RADV_ORBIS_PREDICATION_COND;
+         else
+            mode = RADV_ORBIS_PREDICATION_COND_EXEC;
+      } else {
+         /* ORBIS_NO_PREDICATION is what the env files and 69801831429's reproducer carry, so it
+          * keeps working: =1 is the whole-function suppression it always meant, =0 is upstream. */
+         const char *const old = getenv("ORBIS_NO_PREDICATION");
+
+         if (old != NULL && *old != '\0')
+            mode = (*old != '0') ? RADV_ORBIS_PREDICATION_NONE : RADV_ORBIS_PREDICATION_ALL;
+         else
+            mode = RADV_ORBIS_PREDICATION_COND_EXEC;
+      }
+
+      mesa_logi("radv/orbis: predication mode is %s. SET_PREDICATION hangs this CP for conditional "
+                "rendering as well as for meta, measured on both; COND_EXEC is the way round it.",
+                mode == RADV_ORBIS_PREDICATION_NONE   ? "NONE (nothing predicates)"
+                : mode == RADV_ORBIS_PREDICATION_ALL  ? "ALL (upstream, expect the world-load hang)"
+                : mode == RADV_ORBIS_PREDICATION_COND ? "COND (SET_PREDICATION - EXPECT A HANG)"
+                                                      : "CONDEXEC (conditional rendering via COND_EXEC)");
+   }
+
+   return (enum radv_orbis_predication_mode)mode;
+}
+#endif
+
 void
 radv_emit_set_predication_state(struct radv_cmd_buffer *cmd_buffer, bool draw_visible, unsigned pred_op, uint64_t va)
 {
@@ -16028,6 +16646,44 @@ radv_emit_set_predication_state(struct radv_cmd_buffer *cmd_buffer, bool draw_vi
    const struct radv_physical_device *pdev = radv_device_physical(device);
    struct radv_cmd_stream *cs = cmd_buffer->cs;
    uint32_t op = 0;
+
+#ifdef HAVE_ORBIS_PLATFORM
+   /* ⚠ THE PACKET THE COMMAND PROCESSOR STOPS ON, MEASURED RATHER THAN SUSPECTED.
+    *
+    * A world load wedges this GPU at 42% of one 197000-dword submission, reproducibly, and per-packet
+    * markers put the last thing the CP executed immediately before a SET_PREDICATION:
+    *
+    *   @83051  WRITE_DATA (marker)     landed
+    *   @83056  EVENT_WRITE_EOP         landed
+    *   @83062  EVENT_WRITE_EOP         landed
+    *   @83068  SET_PREDICATION         <- nothing after this ever ran
+    *   @83078  WRITE_DATA (marker)     never written
+    *
+    * The two packets between are SET_CONTEXT_REGs, which cannot block, and the address it reads is in a
+    * live mapping - the audit checks that. What is left is the operation. radv_meta_fast_clear.c asks for
+    * PREDICATION_OP_BOOL64 with no gfx_level gate, and ac_emit_cp_set_predication branches on the
+    * generation for the packet LAYOUT only. On GFX6/7 the defined predication ops are clear, ZPASS and
+    * PRIMCOUNT; Bool64 is the DX12 one that arrives later. Under amdgpu nothing notices, because a GFX7
+    * part with a predicated fast-clear eliminate is not a configuration anyone runs.
+    *
+    * ⚠ SKIPPING IT IS SAFE IN ONE DIRECTION ONLY, AND THIS IS THAT DIRECTION. Predication makes work
+    * CONDITIONAL; without it the decompress runs every time instead of when the flag says it must. That
+    * costs performance and cannot produce a wrong picture. The reverse - honouring a predicate this CP does
+    * not implement - is what we have.
+    *
+    * ⚠ AND THE EVIDENCE NAMES A CALLER, NOT THIS FUNCTION. Only meta's fast-clear eliminate has ever
+    * been seen to wedge the CP, so only meta is suppressed here by default. Conditional rendering
+    * gets its packet - radv_orbis_predication_mode() above carries the argument in full.
+    */
+   {
+      const enum radv_orbis_predication_mode mode = radv_orbis_predication_mode();
+
+      /* COND_EXEC mode emits no SET_PREDICATION at all - that is the point of it. NONE emits none
+       * either. Only the two modes kept for reproducing the hangs let the packet through. */
+      if (mode != RADV_ORBIS_PREDICATION_COND && mode != RADV_ORBIS_PREDICATION_ALL)
+         return;
+   }
+#endif
 
    radeon_check_space(device->ws, cs->b, 4);
 
@@ -16057,6 +16713,22 @@ radv_begin_conditional_rendering(struct radv_cmd_buffer *cmd_buffer, uint64_t va
    uint64_t emulated_va = 0;
 
    radv_emit_cache_flush(cmd_buffer);
+
+#ifdef HAVE_ORBIS_PLATFORM
+   /* ⚠ COND_EXEC READS THE USER'S 32-BIT VALUE DIRECTLY, so none of the emulation below applies:
+    * no upload allocation, no COPY_DATA widening it to 64 bits, no PFP sync and no packet. The
+    * whole BOOL64 workaround exists because AMD's predication hardware is 64-bit and Vulkan's
+    * predicate is not - and COND_EXEC is 32-bit, which is the width we were given. */
+   if (radv_orbis_predication_mode() == RADV_ORBIS_PREDICATION_COND_EXEC) {
+      cond_render->enabled = true;
+      cond_render->type = draw_visible;
+      cond_render->op = PREDICATION_OP_BOOL32;
+      cond_render->user_va = va;
+      cond_render->emulated_va = 0;
+      cond_render->mec_inv_pred_emitted = false;
+      return;
+   }
+#endif
 
    if (cmd_buffer->qf == RADV_QUEUE_GENERAL) {
       if (pdev->info.has_32bit_predication) {

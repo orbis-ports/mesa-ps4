@@ -232,6 +232,16 @@ radv_emit_set_predication_state_from_image(struct radv_cmd_buffer *cmd_buffer, s
 {
    uint64_t va = 0;
 
+#ifdef HAVE_ORBIS_PLATFORM
+   /* ⚠ THIS IS THE CALLER THAT WEDGED THE COMMAND PROCESSOR, and the only one that has. It asks for
+    * PREDICATION_OP_BOOL64 unconditionally, on a part where GFX6/7 defines clear, ZPASS and
+    * PRIMCOUNT and nothing else. Suppressing it costs performance and cannot produce a wrong
+    * picture: without predication the decompress runs every time instead of when the flag says it
+    * must. Honouring a predicate this CP does not implement is the failure we had. */
+   if (radv_orbis_predication_mode() != RADV_ORBIS_PREDICATION_ALL)
+      return;
+#endif
+
    if (value)
       va = image->bindings[0].addr + pred_offset;
 

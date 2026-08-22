@@ -3021,7 +3021,8 @@ radv_graphics_pipeline_compile(struct radv_graphics_pipeline *pipeline, const Vk
       free(binaries[i]);
       if (stages[i].nir) {
          if (radv_can_dump_shader_stats(&device->compiler_info, stages[i].nir) && pipeline->base.shaders[i]) {
-            radv_dump_shader_stats(device, &pipeline->base, pipeline->base.shaders[i], stderr);
+            radv_dump_shader_stats(device, &pipeline->base, pipeline->base.shaders[i], &stages[i],
+                                   radv_shader_stats_output());
          }
       }
    }

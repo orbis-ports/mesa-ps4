@@ -101,6 +101,15 @@ radv_init_wsi(struct radv_physical_device *pdev)
    if (result != VK_SUCCESS)
       return result;
 
+#ifdef HAVE_ORBIS_PLATFORM
+   /* ⚠ LINEAR SWAPCHAIN IMAGES, BECAUSE THE DISPLAY CONTROLLER READS THEM DIRECTLY. This console's scan-out is
+    * linear, so a tiled swapchain image would have to be detiled every frame by something. With wants_linear
+    * set, wsi_cpu_image_needs_buffer_blit returns false and the image is a linear one that is directly
+    * CPU-mapped - which is what wsi_orbis copies from.
+    */
+   pdev->wsi_device.wants_linear = true;
+#endif
+
    pdev->wsi_device.supports_modifiers = pdev->info.gfx_level >= GFX9;
    pdev->wsi_device.set_memory_ownership = radv_wsi_set_memory_ownership;
    pdev->wsi_device.get_blit_queue = radv_wsi_get_prime_blit_queue;

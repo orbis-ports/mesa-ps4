@@ -16,6 +16,79 @@
 
 #include "vk_log.h"
 
+#include "util/simple_mtx.h"
+#include "util/log.h"
+
+#ifdef HAVE_ORBIS_PLATFORM
+#include "ac_linux_drm.h"
+#endif
+
+
+#ifdef HAVE_ORBIS_PLATFORM
+/* ⚠ A REGISTRY OF LIVE POOLS, because a stamp holds a POINTER and a destroyed pool's pointer dangles.
+ *
+ * The submit check has to distinguish three states: the pool is alive and unchanged, the pool is alive but
+ * has been reset since recording, and the pool is gone entirely. Only the first is legitimate. Comparing
+ * generations answers the middle one; this answers the last, without ever dereferencing a freed pointer.
+ *
+ * A flat array under a mutex: pools are created a handful of times, not per frame, and a hash table here
+ * would be machinery in a diagnostic. It says so when it overflows - a registry that silently forgets a
+ * pool would report that pool as destroyed, which is a false accusation rather than a missed one. */
+#define RADV_ORBIS_POOLS 128
+static struct {
+   const struct radv_descriptor_pool *pool;
+} radv_orbis_live_pool[RADV_ORBIS_POOLS];
+static simple_mtx_t radv_orbis_pool_lock = SIMPLE_MTX_INITIALIZER;
+static bool radv_orbis_pool_overflowed;
+
+static void
+radv_orbis_pool_register(const struct radv_descriptor_pool *pool)
+{
+   simple_mtx_lock(&radv_orbis_pool_lock);
+   for (unsigned i = 0; i < RADV_ORBIS_POOLS; i++) {
+      if (radv_orbis_live_pool[i].pool == NULL) {
+         radv_orbis_live_pool[i].pool = pool;
+         simple_mtx_unlock(&radv_orbis_pool_lock);
+         return;
+      }
+   }
+   if (!radv_orbis_pool_overflowed) {
+      radv_orbis_pool_overflowed = true;
+      mesa_logw("radv/orbis: more than %u descriptor pools live at once - the use-after-free check cannot "
+                "tell whether the ones past that are destroyed, so it will not accuse them",
+                RADV_ORBIS_POOLS);
+   }
+   simple_mtx_unlock(&radv_orbis_pool_lock);
+}
+
+static void
+radv_orbis_pool_unregister(const struct radv_descriptor_pool *pool)
+{
+   simple_mtx_lock(&radv_orbis_pool_lock);
+   for (unsigned i = 0; i < RADV_ORBIS_POOLS; i++)
+      if (radv_orbis_live_pool[i].pool == pool)
+         radv_orbis_live_pool[i].pool = NULL;
+   simple_mtx_unlock(&radv_orbis_pool_lock);
+}
+
+bool
+radv_orbis_pool_is_live(const struct radv_descriptor_pool *pool)
+{
+   bool live = false;
+   simple_mtx_lock(&radv_orbis_pool_lock);
+   for (unsigned i = 0; i < RADV_ORBIS_POOLS; i++)
+      if (radv_orbis_live_pool[i].pool == pool) {
+         live = true;
+         break;
+      }
+   /* An overflowed registry cannot prove absence, so it never reports it. */
+   if (!live && radv_orbis_pool_overflowed)
+      live = true;
+   simple_mtx_unlock(&radv_orbis_pool_lock);
+   return live;
+}
+#endif
+
 static void
 radv_destroy_descriptor_pool_entries(struct radv_device *device, struct radv_descriptor_pool *pool)
 {
@@ -40,6 +113,21 @@ radv_destroy_descriptor_pool(struct radv_device *device, const VkAllocationCallb
 
    if (!pool->host_memory_base && pool->size)
       util_vma_heap_finish(&pool->bo_heap);
+#ifdef HAVE_ORBIS_PLATFORM
+   radv_orbis_pool_unregister(pool);
+   pool->orbis_generation++;
+   /* ⚠ RECORDED BEFORE THE BO GOES, because after it the address is somebody else's business.
+    *
+    * On this platform freeing a pool does NOT take its pages away - the arena maps the whole window for the
+    * life of the process - so a command buffer still holding a descriptor set from this pool keeps passing
+    * every bounds check the driver has, and the shader reads whatever allocation lands here next. That is
+    * invisible until the bytes happen to decode as a wild address, which is the GPU fault this port is left
+    * with, and it is visible long before that as geometry that scrambles more the longer the title runs.
+    *
+    * Linux catches this by accident. Here it has to be recorded deliberately. */
+   if (pool->bo)
+      ac_orbis_note_freed_range(radv_buffer_get_va(pool->bo), pool->size, "descriptor pool");
+#endif
    if (pool->bo)
       radv_bo_destroy(device, &pool->base, pool->bo);
    if (pool->host_bo)
@@ -194,6 +282,10 @@ radv_create_descriptor_pool(struct radv_device *device, const VkDescriptorPoolCr
    pool->size = bo_size;
    pool->max_entry_count = pCreateInfo->maxSets;
 
+   #ifdef HAVE_ORBIS_PLATFORM
+   radv_orbis_pool_register(pool);
+#endif
+
    *pDescriptorPool = radv_descriptor_pool_to_handle(pool);
    radv_rmv_log_descriptor_pool_create(device, pCreateInfo, *pDescriptorPool);
 
@@ -231,6 +323,12 @@ radv_ResetDescriptorPool(VkDevice _device, VkDescriptorPool descriptorPool, VkDe
    VK_FROM_HANDLE(radv_descriptor_pool, pool, descriptorPool);
 
    radv_destroy_descriptor_pool_entries(device, pool);
+
+#ifdef HAVE_ORBIS_PLATFORM
+   /* Every set in this pool has just ceased to exist, and the next allocation will hand its address back
+    * out. Anything recorded against the old generation is now stale. */
+   pool->orbis_generation++;
+#endif
 
    if (!pool->host_memory_base && pool->size) {
       util_vma_heap_finish(&pool->bo_heap);

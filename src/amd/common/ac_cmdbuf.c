@@ -12,6 +12,9 @@
 #include "sid.h"
 
 #include "util/u_math.h"
+#ifdef HAVE_ORBIS_PLATFORM
+#include "util/log.h"
+#endif
 
 #define SI_GS_PER_ES 128
 
@@ -262,6 +265,59 @@ gfx6_init_graphics_preamble_state(const struct ac_preamble_state *state,
       ac_pm4_set_reg(pm4, R_028A5C_VGT_GS_PER_VS, 0x2);
       ac_pm4_set_reg(pm4, R_028AB8_VGT_VTX_CNT_EN, 0x0);
    }
+
+#ifdef HAVE_ORBIS_PLATFORM
+   /* ⚠ CLEAR_STATE DOES NOT COVER THIS REGISTER HERE, AND IT IS MEASURED RATHER THAN SUSPECTED.
+    *
+    * RADV emits PKT3_CLEAR_STATE and then skips nine context registers on the strength of it, this one
+    * among them. An earlier effort on this port read all nine back AFTER the preamble had run, with
+    * eleven registers RADV writes itself as controls in the same set. Every control matched to the bit.
+    * Eight of the nine held exactly what the !has_clear_state branch above would have written. This one
+    * held:
+    *
+    *     PA_CL_NANINF_CNTL = 0x8b47008d       and this branch would write 0
+    *
+    * The decisive part is not the low half but 0x8b470000 - TWELVE BITS SET OUTSIDE EVERY DEFINED FIELD
+    * of the register, whose fields occupy 0x00107fff. A driver writing a considered value does not set
+    * reserved bits, so this is not Sony choosing different defaults: the other eight prove Sony's clear
+    * state covers what it covers. This register is not in it and holds whatever was there before.
+    *
+    * THE DEFINED BITS THAT ARE SET ARE NOT INERT. VTE_XY_INF_DISCARD and VTE_W_INF_DISCARD make the
+    * vertex transform engine DISCARD primitives whose XY or W came out infinite, where 0 discards
+    * nothing - and ACO compiles against the value Mesa believes it wrote.
+    *
+    * WHAT IT WOULD LOOK LIKE, and it is why this is being tried on the remaining artefact: whether a
+    * transformed vertex lands on infinity depends on the view matrix, so the effect needs MOTION and is
+    * DIRECTION-DEPENDENT, and it shows on geometry at effectively infinite distance - the sky. The
+    * artefact left in this title is a soft wedge in the sky, present in one frame and gone the next,
+    * only when facing one direction.
+    *
+    * ⚠ THAT IS A FIT, NOT A DIAGNOSIS. The earlier effort noted this same mechanism did not explain the
+    * SHAPE of the artefact IT was chasing, which was quarter-screen rectangles. A wedge in a skydome fan
+    * is a shape discarded primitives could take; a quadrant is not. The negative control settles it
+    * either way: ORBIS_NANINF=0x8b47008d puts the measured value back, and if the wedge returns with it
+    * the register is the cause.
+    *
+    * Mesa writes this register unconditionally on gfx10 and gfx12 - only the gfx6/7 path defers to
+    * CLEAR_STATE - so this is the gfx7 path doing what the others already do.
+    *
+    * AFTER the block above rather than before it, so the override wins on any device regardless of
+    * has_clear_state instead of depending on which write lands last. */
+   {
+      const char *const naninf_env = getenv("ORBIS_NANINF");
+      const uint32_t naninf = naninf_env != NULL ? (uint32_t)strtoul(naninf_env, NULL, 0) : 0u;
+      static bool naninf_said = false;
+
+      if (!naninf_said) {
+         naninf_said = true;
+         mesa_logi("orbis: PA_CL_NANINF_CNTL <- 0x%08x, written because CLEAR_STATE was measured leaving "
+                   "0x8b47008d there (twelve bits of it in reserved space)%s",
+                   naninf, naninf_env != NULL ? " [ORBIS_NANINF override]" : "");
+      }
+
+      ac_pm4_set_reg(pm4, R_028820_PA_CL_NANINF_CNTL, naninf);
+   }
+#endif
 
    ac_pm4_set_reg(pm4, R_028080_TA_BC_BASE_ADDR, state->border_color_va >> 8);
    if (info->gfx_level >= GFX7)

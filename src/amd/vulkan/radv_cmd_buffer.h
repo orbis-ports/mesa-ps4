@@ -628,6 +628,24 @@ struct radv_cmd_buffer {
    struct util_dynarray ray_history;
 
    struct list_head msrtss_transients;
+
+#ifdef HAVE_ORBIS_PLATFORM
+   /* ⚠ WHICH DESCRIPTOR POOLS THIS RECORDING DEPENDS ON, AND WHAT STATE THEY WERE IN.
+    *
+    * The remaining GPU fault on this platform is a descriptor read at an address the driver neither builds
+    * nor emits, and every address-based test passes because the arena keeps all of it mapped for the life of
+    * the process. So the question is not "is this address valid" - it always is here - but "was this set's
+    * storage released between recording this command buffer and submitting it".
+    *
+    * Sixteen is far more pools than a frame binds from, and if it ever overflows the submit check says so
+    * rather than quietly checking a subset. */
+   struct {
+      const struct radv_descriptor_pool *pool;
+      uint32_t generation;
+   } orbis_pool_stamp[16];
+   unsigned orbis_pool_stamps;
+   unsigned orbis_pool_stamps_dropped;
+#endif
 };
 
 struct radv_msrtss_transient {
@@ -835,6 +853,20 @@ void radv_emit_cache_flush(struct radv_cmd_buffer *cmd_buffer);
 
 void radv_emit_set_predication_state(struct radv_cmd_buffer *cmd_buffer, bool draw_visible, unsigned pred_op,
                                      uint64_t va);
+
+#ifdef HAVE_ORBIS_PLATFORM
+/* SET_PREDICATION has two callers and only one of them is known to wedge this console's command
+ * processor, so the switch that suppresses it has to tell them apart. See the long comment on
+ * radv_orbis_predication_mode() in radv_cmd_buffer.c. */
+enum radv_orbis_predication_mode {
+   RADV_ORBIS_PREDICATION_NONE = 0,  /* suppress every SET_PREDICATION, predicate nothing */
+   RADV_ORBIS_PREDICATION_COND_EXEC, /* conditional rendering via COND_EXEC; no SET_PREDICATION */
+   RADV_ORBIS_PREDICATION_COND,      /* conditional rendering via SET_PREDICATION - MEASURED TO HANG */
+   RADV_ORBIS_PREDICATION_ALL,       /* upstream behaviour */
+};
+
+enum radv_orbis_predication_mode radv_orbis_predication_mode(void);
+#endif
 
 void radv_begin_conditional_rendering(struct radv_cmd_buffer *cmd_buffer, uint64_t va, bool draw_visible);
 
