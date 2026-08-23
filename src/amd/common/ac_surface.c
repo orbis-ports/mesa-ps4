@@ -1678,18 +1678,39 @@ static void gfx6_fill_addr_info_from_surf(const struct ac_addrlib *const addrlib
     * LINEAR_ALIGNED is tile mode index 8 with no micro or macro tiling at all, and it is the mode this
     * port's own scan-out target uses while rendering a correct picture.
     *
-    * Costs memory and bandwidth, which is why it is an experiment rather than a default.
-    * ORBIS_3D_LINEAR=1. */
+    * ⚠ ON BY DEFAULT ON THIS PLATFORM, AND THAT INVERTS WHAT THIS COMMENT USED TO SAY. It said the
+    * memory and bandwidth cost made this "an experiment rather than a default". The cost is real and
+    * the alternative is not a slower picture, it is a title that loads and dies on entering 3D -
+    * measured twice on 2026-08-19, same binary, only the env file different. A knob every operator
+    * must know to set is not a default, it is a trap with documentation attached, and the
+    * documentation only reaches people who already know. Anyone who downloads this driver gets the
+    * configuration it was tested in.
+    *
+    * ORBIS_3D_LINEAR=0 restores tiled 3D surfaces, for whoever goes after the addrlib inputs above. */
    if (config->is_3d && mode != RADEON_SURF_MODE_LINEAR_ALIGNED) {
       const char *const linear3d = getenv("ORBIS_3D_LINEAR");
-      if (linear3d != NULL && linear3d[0] == '1' && linear3d[1] == '\0') {
+#ifdef HAVE_ORBIS_PLATFORM
+      const bool off = linear3d != NULL && linear3d[0] == '0' && linear3d[1] == '\0';
+#else
+      /* Every other AMD part this file is compiled for tiles 3D surfaces correctly. */
+      const bool off = !(linear3d != NULL && linear3d[0] == '1' && linear3d[1] == '\0');
+#endif
+      if (!off) {
          mode = RADEON_SURF_MODE_LINEAR_ALIGNED;
          /* Loud, because a knob that can silently not fire has to say that it did - and the image's own
           * size changes with it, which is the second proof. */
          static bool said = false;
          if (!said) {
             said = true;
-            mesa_logi("orbis: ORBIS_3D_LINEAR=1 - 3D images are LINEAR_ALIGNED on this device");
+            mesa_logi("orbis: 3D images are LINEAR_ALIGNED on this device (ORBIS_3D_LINEAR=0 disables "
+                      "it, and the title then dies on entering 3D)");
+         }
+      } else {
+         static bool said_off = false;
+         if (!said_off) {
+            said_off = true;
+            mesa_logw("orbis: ORBIS_3D_LINEAR=0 - 3D images are TILED. Two runs have died entering 3D "
+                      "in this configuration; this run is an experiment, not a configuration.");
          }
       }
    }

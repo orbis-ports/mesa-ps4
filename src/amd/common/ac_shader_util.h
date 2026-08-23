@@ -257,6 +257,12 @@ unsigned ac_get_safe_fetch_size(const enum amd_gfx_level gfx_level, const struct
                                 const unsigned offset, const unsigned max_channels, const unsigned alignment,
                                 const unsigned num_channels);
 
+/* ORBIS_VS_STRICT_ALIGN=1 - see ac_shader_util.c. Exposed because it changes emitted shader code,
+ * so the pipeline cache UUID has to include it, and because RADV has to make the same decision on
+ * the vertex-prolog path that ACO makes on the fetch path. Two places deciding this from two
+ * different reads of the environment is how they end up disagreeing. */
+bool ac_orbis_strict_vtx_align(void);
+
 enum ac_image_dim ac_get_sampler_dim(enum amd_gfx_level gfx_level, enum glsl_sampler_dim dim,
                                      bool is_array);
 

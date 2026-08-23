@@ -6063,7 +6063,11 @@ lookup_vs_prolog(struct radv_cmd_buffer *cmd_buffer, const struct radv_shader *v
    uint32_t misaligned_mask = d->vertex_input.vbo_misaligned_mask;
    uint32_t unaligned_mask = d->vertex_input.vbo_unaligned_mask;
    if (d->vertex_input.vbo_misaligned_mask_invalid) {
-      bool misalignment_possible = pdev->info.gfx_level == GFX6 || pdev->info.gfx_level >= GFX10;
+      /* ORBIS_VS_STRICT_ALIGN puts GFX7-GFX9 in the same class - see ac_shader_util.c. The prolog
+       * and the fetch lowering have to agree, or the shader splits its loads while the prolog it is
+       * paired with does not. */
+      bool misalignment_possible =
+         pdev->info.gfx_level == GFX6 || pdev->info.gfx_level >= GFX10 || ac_orbis_strict_vtx_align();
       u_foreach_bit (index, d->vertex_input.vbo_misaligned_mask_invalid & attribute_mask) {
          uint8_t binding = d->vertex_input.bindings[index];
          if (!(cmd_buffer->state.vertex_buffer.bound_mask & BITFIELD_BIT(binding)))
@@ -8236,9 +8240,15 @@ radv_CmdBindVertexBuffers3KHR(VkCommandBuffer commandBuffer, uint32_t firstBindi
       VkDeviceSize stride = binding_info->setStride ? binding_info->addressRange.stride : 0;
       uint64_t addr = size ? binding_info->addressRange.address : 0;
 
+      /* ⚠ THE WIDTH OF THIS COMPARISON IS THE WIDTH OF THE STRICTEST ALIGNMENT ANY FORMAT ASKS FOR.
+       * Upstream needs 2 bits because the only requirement it can have is dword. Under
+       * ORBIS_VS_STRICT_ALIGN an 8-byte element asks for 3, so a rebind that moves a buffer from
+       * 8-aligned to 4-aligned differs only in bit 2 - and with a 2-bit compare the masks are never
+       * recomputed and the knob quietly stops applying to that binding. */
+      const uint64_t align_bits = ac_orbis_strict_vtx_align() ? 0x7 : 0x3;
       if (!!vertex_buffer->bindings[idx].addr != !!addr ||
-          (addr && ((vertex_buffer->bindings[idx].addr & 0x3) != (addr & 0x3) ||
-                    (d->vk.vi_binding_strides[idx] & 0x3) != (stride & 0x3)))) {
+          (addr && ((vertex_buffer->bindings[idx].addr & align_bits) != (addr & align_bits) ||
+                    (d->vk.vi_binding_strides[idx] & align_bits) != (stride & align_bits)))) {
          misaligned_mask_invalid |= d->vertex_input.bindings_match_attrib ? BITFIELD_BIT(idx) : 0xffffffff;
       }
 
@@ -9732,7 +9742,9 @@ radv_CmdSetVertexInputEXT(VkCommandBuffer commandBuffer, uint32_t vertexBindingD
       if (vertex_buffer->bound_mask & BITFIELD_BIT(attrib->binding)) {
          uint32_t stride = binding->stride;
          uint64_t addr = vertex_buffer->bindings[attrib->binding].addr + vertex_input->offsets[loc];
-         if ((chip == GFX6 || chip >= GFX10) && ((stride | addr) & format_align_req_minus_1))
+         /* ORBIS_VS_STRICT_ALIGN - see ac_shader_util.c. */
+         if ((chip == GFX6 || chip >= GFX10 || ac_orbis_strict_vtx_align()) &&
+             ((stride | addr) & format_align_req_minus_1))
             vertex_input->vbo_misaligned_mask |= BITFIELD_BIT(loc);
          if ((stride | addr) & component_align_req_minus_1)
             vertex_input->vbo_unaligned_mask |= BITFIELD_BIT(loc);

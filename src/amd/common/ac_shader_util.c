@@ -8,9 +8,11 @@
 #include "ac_gpu_info.h"
 
 #include "amdgfxregs.h"
+#include "util/log.h"
 #include "util/u_math.h"
 
 #include <assert.h>
+#include <stdlib.h>
 
 unsigned ac_get_spi_shader_z_format(bool writes_z, bool writes_stencil, bool writes_samplemask,
                                     bool writes_mrt0_alpha)
@@ -496,6 +498,77 @@ ac_get_vtx_format_info(enum amd_gfx_level level, bool has_alpha_adjust_bug, enum
 }
 
 /**
+ * ORBIS_VS_STRICT_ALIGN - require a typed vertex fetch to be naturally aligned even on GFX7-GFX9.
+ * ⚠ ON by default on this console. It is a correctness fix, not an experiment.
+ *
+ * THE GFX7-GFX9 ARM OF is_fetch_size_safe() BELOW IS A CLAIM ABOUT SILICON, and this port ran on
+ * silicon nobody had validated it against. It says a Sea Islands part can fetch an N-byte vertex
+ * element from an address that is not a multiple of N. On a discrete CIK part that holds because the
+ * kernel driver programs SH_MEM_CONFIG.ALIGNMENT_MODE to UNALIGNED at init; on this console that
+ * register belongs to a kernel we do not write and cannot read back - the same privileged window that
+ * refused GB_ADDR_CONFIG. So the claim was inherited rather than checked.
+ *
+ * ⚠ IT DOES NOT HOLD HERE, and the Vulkan CTS said so on 2026-08-23 with names and counts.
+ * dEQP-VK.pipeline.monolithic.vertex_input, 1853 cases, same case list and same binary both times:
+ *
+ *     believing the claim    Passed 1657   Failed 98
+ *     splitting instead      Passed 1754   Failed  1     97 Fail -> Pass, 0 Pass -> anything else
+ *
+ * Every one of the 97 is a multi-byte typed element read from an address that is not a multiple of
+ * its size. Two shapes reach it: a three-channel 8- or 16-bit format, whose stride is 6 or 3 bytes so
+ * every odd vertex is misaligned by construction, and VK_EXT_legacy_vertex_attributes' odd strides.
+ * The single remaining failure is a geometry-shader path and is a different defect.
+ *
+ * ⚠ THE FAILURE IS SILENT. No fault, no log, wrong bytes. Formats built from 32-bit channels are
+ * immune, because dword alignment is element alignment there - so a mixed layout comes back with its
+ * float attributes correct and its 8- and 16-bit ones shredded, which is what sent us looking.
+ *
+ * WHAT IT COSTS: extra VMEM instructions for sub-32-bit typed vertex attributes, and only those.
+ * 32-bit formats never reach this code at all - can_use_untyped_load() sends them to an untyped
+ * buffer_load, which has no format alignment rule. The split happens whenever RADV cannot PROVE
+ * natural alignment, not only when the address is actually misaligned, because all it knows at
+ * compile time is the widest attribute alignment in the binding.
+ *
+ * ORBIS_VS_STRICT_ALIGN=0 restores the old behaviour, for measuring that cost against a known-wrong
+ * driver. Nothing else should use it.
+ *
+ * ⚠ IT CHANGES THE CODE ACO EMITS, so it is folded into the pipeline cache UUID in
+ * radv_device_get_cache_uuid(). Without that, flipping it would answer the new run with the previous
+ * run's shaders and the measurement would report whatever it was told first.
+ */
+bool
+ac_orbis_strict_vtx_align(void)
+{
+   static int cached = -1;
+
+   if (cached < 0) {
+      const char *const v = getenv("ORBIS_VS_STRICT_ALIGN");
+      const bool off = v != NULL && v[0] == '0' && v[1] == '\0';
+
+#ifdef HAVE_ORBIS_PLATFORM
+      /* ⚠ THE DEFAULT IS ON HERE AND NOWHERE ELSE. Every other AMD part this file is compiled for -
+       * including the drm-shim that pretends to be one - has a kernel driver that programs the
+       * alignment mode, so upstream's claim is true for them and splitting would be pure cost. */
+      cached = !off;
+#else
+      cached = v != NULL && v[0] == '1' && v[1] == '\0';
+#endif
+
+      /* ⚠ LOUD IN BOTH DIRECTIONS, because now it is the OFF state that is dangerous, and a run made
+       * with wrong vertex data has to be identifiable from its own log rather than from memory. */
+      if (cached)
+         mesa_logi("orbis: vertex fetches are split to natural alignment "
+                   "(ORBIS_VS_STRICT_ALIGN=0 disables it, and 97 CTS cases fail when it is off)");
+      else if (off)
+         mesa_logw("orbis: ORBIS_VS_STRICT_ALIGN=0 - typed vertex fetches are NOT split. "
+                   "Sub-32-bit vertex attributes at unaligned addresses will read the wrong bytes, "
+                   "silently. This run is not evidence about anything but the cost of the fix.");
+   }
+
+   return cached != 0;
+}
+
+/**
  * Check whether the specified fetch size is safe to use with MTBUF.
  *
  * Split typed vertex buffer loads when necessary to avoid any
@@ -512,7 +585,7 @@ is_fetch_size_safe(const enum amd_gfx_level gfx_level, const struct ac_vtx_forma
       return false;
 
    unsigned vertex_byte_size = vtx_info->chan_byte_size * channels;
-   return (gfx_level >= GFX7 && gfx_level <= GFX9) ||
+   return (gfx_level >= GFX7 && gfx_level <= GFX9 && !ac_orbis_strict_vtx_align()) ||
           (offset % vertex_byte_size == 0 && MAX2(alignment, 1) % vertex_byte_size == 0);
 }
 

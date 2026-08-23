@@ -29,6 +29,7 @@
 #include "vk_log.h"
 #include "vk_shader_module.h"
 
+#include "ac_shader_util.h"
 #include "tools/radv_debug.h"
 #include "util/disk_cache.h"
 #include "util/hex.h"
@@ -359,6 +360,14 @@ radv_device_get_cache_uuid(struct radv_physical_device *pdev, void *uuid)
    if (pdev->use_llvm && !disk_cache_get_function_identifier(LLVMInitializeAMDGPUTargetInfo, &ctx))
       return -1;
 #endif
+
+   /* ⚠ ORBIS_VS_STRICT_ALIGN CHANGES THE INSTRUCTIONS ACO EMITS FOR EVERY VERTEX FETCH, so it has to
+    * be part of the key. A knob that changes shaders but not the cache key is an experiment that can
+    * answer with the previous run's shaders - and it reads as a clean measurement while doing it. */
+   {
+      const uint8_t strict = ac_orbis_strict_vtx_align();
+      _mesa_blake3_update(&ctx, &strict, sizeof(strict));
+   }
 
    _mesa_blake3_final(&ctx, blake3);
 
@@ -1034,6 +1043,43 @@ radv_physical_device_get_supported_extensions(const struct radv_physical_device 
    *out_ext = ext;
 }
 
+#ifdef HAVE_ORBIS_PLATFORM
+/* ⚠ ONE READER FOR ORBIS_NO_TESS, BECAUSE IT WAS TWO AND THAT KILLED TWO RUNS.
+ *
+ * The knob turned .tessellationShader off and left .multiviewTessellationShader true, so dEQP -
+ * which gates multiview.*.tessellation_shader.* on the second and nothing else - was told the
+ * stage was available, built a pipeline with it, and took the console down. A feature that
+ * depends on another has to follow it, and two getenv() calls in two structs is not a switch,
+ * it is two switches that happen to share a name.
+ *
+ * ⚠ AND THE DEFAULT IS NOW OFF, WHICH INVERTS WHAT THIS FILE USED TO ARGUE. The old comment
+ * said "advertising a feature is the correct behaviour until a run says otherwise". Runs said
+ * otherwise: this stage faults this silicon, and it has been switched off in every
+ * configuration this port has ever shipped or measured. A default that every operator must
+ * know to change is not a default, it is a trap with documentation - and the documentation
+ * only reaches people who already know. Anyone who downloads this driver gets the
+ * configuration it was tested in.
+ *
+ * ORBIS_NO_TESS=0 advertises it again, for whoever eventually goes after the stage itself. */
+static bool
+orbis_tessellation_available(void)
+{
+   static int cached = -1;
+
+   if (cached < 0) {
+      const char *const v = getenv("ORBIS_NO_TESS");
+      cached = v != NULL && v[0] == '0' && v[1] == '\0';
+
+      if (cached)
+         mesa_logw("orbis: ORBIS_NO_TESS=0 - tessellation is ADVERTISED. No run has ever survived "
+                   "a pipeline that uses it on this silicon; this run is an experiment, not a "
+                   "configuration.");
+   }
+
+   return cached != 0;
+}
+#endif
+
 static void
 radv_physical_device_get_features(const struct radv_physical_device *pdev, struct vk_features *features)
 {
@@ -1073,10 +1119,9 @@ radv_physical_device_get_features(const struct radv_physical_device *pdev, struc
        *   the fault remains     -> tessellation is exonerated, the address was a coincidence of one number,
        *                            and everything built on it today comes down
        *
-       * ORBIS_NO_TESS=1. On by default - advertising a feature is the correct behaviour until a run says
-       * otherwise, and a driver that quietly drops one is worse than one that faults visibly. */
+       * ⚠ OFF BY DEFAULT HERE - see orbis_tessellation_available(). ORBIS_NO_TESS=0 turns it back on. */
 #ifdef HAVE_ORBIS_PLATFORM
-      .tessellationShader = getenv("ORBIS_NO_TESS") == NULL,
+      .tessellationShader = orbis_tessellation_available(),
 #else
       .tessellationShader = true,
 #endif
@@ -1146,7 +1191,7 @@ radv_physical_device_get_features(const struct radv_physical_device *pdev, struc
        * A feature that depends on another one has to follow it, or the switch only looks like one.
        * multiviewGeometryShader stays true: geometry shaders are not in question here - retail
        * captures show ES/GS/VS in use on this silicon. */
-      .multiviewTessellationShader = getenv("ORBIS_NO_TESS") == NULL,
+      .multiviewTessellationShader = orbis_tessellation_available(),
 #else
       .multiviewTessellationShader = true,
 #endif

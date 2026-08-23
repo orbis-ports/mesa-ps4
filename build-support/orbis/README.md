@@ -71,6 +71,7 @@ and 244 errors to zero. Account in `~/src-ps4/ps4-mesa-docs/docs/research/03-the
 | `tools/linkprobe.{c,sh}` | links a minimal PS4 executable against the driver. An archive is not a driver until something links it |
 | `tools/infoprobe.c` | enumerates and dumps `radeon_info` without `vkCreateDevice`, so the dump is not truncated by a cleanup path |
 | `tools/acoprobe.c` | creates one compute pipeline from a `.sprv`, so ACO compiles for a GPU that is not in the machine |
+| `tools/vsfetchprobe.c` | creates one **graphics** pipeline for a chosen vertex format, offset and stride, and prints the fetch instructions ACO emitted for gfx7. Built for `ORBIS_VS_STRICT_ALIGN` |
 | `tools/tilecheck.{cpp,sh}` | tiling and surface-layout probe. Kept for an open item: point it at a layered MSAA image - multiview + multisample halts a CTS run and was never investigated |
 | `tools/gen-tile-tables.py` | ⚠ **generates `src/amd/common/orbis_tile_tables.h`**, which is a driver source. Not a probe; do not remove it as one |
 | ~~`notes/`~~, ~~`docs/`~~ | **moved 2026-08-21** to `~/src-ps4/ps4-mesa-docs/`. Neither is about building; both are the record of the port |

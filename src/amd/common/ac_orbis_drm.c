@@ -32,6 +32,7 @@
 #include "util/simple_mtx.h"
 #include <pthread.h>
 #include <sys/syscall.h>
+#include <sys/mman.h>
 
 #include "util/futex.h"
 #include "util/u_atomic.h"
@@ -3021,6 +3022,30 @@ orbis_dump_hung_enabled(void)
 }
 
 
+#if !defined(__PS4__)
+/* ⚠ THE HOST ARM'S HALF OF orbis_test_mirror_mapping(), AND IT EXISTS TO REFUSE OUT LOUD.
+ *
+ * The real ladder is inside the `#if defined(__PS4__)` region below, because every call it makes is
+ * Sony's. Without this stub the whole function would simply not exist on the laptop, `--host-orbis`
+ * with ORBIS_TEST_MIRROR=1 would print nothing at all, and silence would be read as "the probe found
+ * nothing" rather than "the probe was not there". That distinction is the one this project keeps
+ * paying for.
+ *
+ * A green ladder here would in any case be a statement about orbis-compat's shims and not about the
+ * console's kernel, which is not the question being asked. */
+static void
+orbis_test_mirror_mapping(void)
+{
+   const char *const e = getenv("ORBIS_TEST_MIRROR");
+   if (e == NULL || e[0] == '0')
+      return;
+
+   mesa_logw("orbis-drm: MIRROR ladder asked for, but this is the HOST arm - sceKernelMapDirectMemory "
+             "here is orbis-compat's shim, not Sony's kernel, so any answer would be about the "
+             "overlay. NOT RUN. Ask a console.");
+}
+#endif /* !__PS4__ */
+
 #if defined(__PS4__)
 /* ---------------------------------------------------------------- the backing-store seam
  *
@@ -3093,6 +3118,506 @@ static const uint64_t orbis_arena_ladder[] = {
    128ull * 1024 * 1024,
 };
 
+/* The refusals rung 5 and rung 6 collect are only worth anything if the reader can tell EACCES from
+ * EINVAL without a header open beside the log: the first says the kernel understood the request and
+ * declined it on policy, the second says the request was malformed and the policy was never reached.
+ * Rung 5a returned 0x8002000d and that distinction was the entire content of the result.
+ * Values from orbis/_types/errors.h; anything not listed is printed as its raw code. */
+static const char *
+orbis_kernel_error_name(int32_t rc)
+{
+   switch ((uint32_t)rc) {
+   case 0x80020001u: return "EPERM - not permitted";
+   case 0x80020008u: return "ENOEXEC - not an executable object";
+   case 0x80020009u: return "EBADF - bad file descriptor, so the flags word was not anonymous";
+   case 0x8002000Cu: return "ENOMEM - out of memory or address space";
+   case 0x8002000Du: return "EACCES - understood and refused on policy";
+   case 0x8002000Eu: return "EFAULT - bad address argument";
+   case 0x80020016u: return "EINVAL - malformed request, policy never reached";
+   case 0x8002002Du: return "EOPNOTSUPP - not supported on this object";
+   default:          return "not in this file's table";
+   }
+}
+
+/* ⚠ CAN THE SAME PHYSICAL DIRECT MEMORY BE MAPPED AT TWO LIVE VIRTUAL ADDRESSES AT ONCE?
+ * ORBIS_TEST_MIRROR=1, and nothing else in this driver depends on the answer.
+ *
+ * WHY IT IS ASKED HERE. RetroArch's Beetle PSX HW runs the MIPS INTERPRETER on this console because
+ * Lightrec, its dynamic recompiler, wants the emulated machine's RAM visible at several addresses at
+ * once - which on Linux it builds with memfd_create/MAP_SHM. `RetroArch/ps4/HANDOFF.md` records that
+ * as the wall: "neither exists here". That is true of POSIX shared memory and says nothing about the
+ * platform's own direct-memory API, which this file uses on every run:
+ *
+ *     sceKernelAllocateDirectMemory(..., &phys)          physical pages
+ *     sceKernelMapDirectMemory(&va, len, prot, flags, phys, align)
+ *
+ * Nothing in that shape forbids calling the map a second time with the SAME phys. If it is allowed
+ * and the two views are coherent, the wall is not a wall, and the measured cost of the interpreter -
+ * one CPU core saturated for a frame in which this driver spends 0.6% and the GPU waits 0 ms - has a
+ * route out. If it is refused, the refusal is on the record with a return code instead of an
+ * assumption, and nobody spends a day rediscovering it.
+ *
+ * ⚠ THE RUNGS ARE ORDERED SO THAT EACH ONE IS MEANINGLESS WITHOUT THE ONE BEFORE, and each prints
+ * what it measured rather than a verdict. A ladder whose control rung is skipped proves nothing:
+ * "the second mapping worked" is not a fact about mirrors if the first mapping never held data.
+ *
+ *   rung 0   allocate, map once, write a pattern, read it back through THAT SAME address.
+ *            The harness itself. A failure here means the rest of the run says nothing.
+ *   rung 1   map the same phys AGAIN. Return code and both addresses, and whether they differ -
+ *            a kernel that hands back the same VA has not made a mirror.
+ *   rung 2   coherence, BOTH WAYS. Write through the first view, read through the second; then
+ *            write a different word through the second and read it through the first. One
+ *            direction is not enough: a copy-on-map would pass the first and fail the second.
+ *   rung 3   how MANY. Lightrec wants about four. Keep mapping until the kernel refuses and say
+ *            the number, because "more than one" and "as many as you like" are different answers.
+ *   rung 4   independence: unmap one view and check the others still read the pattern. If tearing
+ *            one down poisons the rest, the mirrors are not usable however many there were.
+ *
+ * ⚠ AND IT SAYS WHERE IT RAN. Under --host-orbis this file is built for Linux against the overlay's
+ * shims, and those shims are not Sony's kernel. A green ladder there would be a statement about
+ * orbis-compat, which is not the question. __ORBIS__ is defined only by the cross build.
+ */
+static void
+orbis_test_mirror_mapping(void)
+{
+   const char *const e = getenv("ORBIS_TEST_MIRROR");
+   if (e == NULL || e[0] == '0')
+      return;
+
+   /* One page-aligned 2 MiB block: the platform's own direct-memory granule, and small enough that
+    * taking it changes nothing for the title that is about to start. */
+   const size_t len = (size_t)ORBIS_DIRECT_ALIGN;
+   /* CPU read/write only. The GPU has no part in this question, and asking for GPU rights as well
+    * would make a refusal ambiguous between "no mirrors" and "not that protection". */
+   const int32_t prot = 0x03;
+   enum { ORBIS_MIRROR_MAX = 8 };
+   void *view[ORBIS_MIRROR_MAX] = {0};
+   unsigned views = 0;
+   off_t phys = 0;
+
+   mesa_logi("orbis-drm: MIRROR ladder - %llu KiB of direct memory, prot 0x%02x, align %llu KiB",
+             (unsigned long long)(len / 1024), (unsigned)prot,
+             (unsigned long long)(ORBIS_DIRECT_ALIGN / 1024));
+
+   int32_t err = sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), len,
+                                               ORBIS_DIRECT_ALIGN, ORBIS_KERNEL_WB_ONION, &phys);
+   if (err != 0) {
+      mesa_loge("orbis-drm: MIRROR rung 0 FAILED - sceKernelAllocateDirectMemory -> 0x%08x. "
+                "Nothing below this ran; the ladder says nothing about mirrors.", (unsigned)err);
+      return;
+   }
+   mesa_logi("orbis-drm: MIRROR rung 0: phys 0x%llx", (unsigned long long)phys);
+
+   err = sceKernelMapDirectMemory(&view[0], len, prot, 0, phys, ORBIS_DIRECT_ALIGN);
+   if (err != 0) {
+      mesa_loge("orbis-drm: MIRROR rung 0 FAILED - sceKernelMapDirectMemory -> 0x%08x. The phys was "
+                "allocated and could not be mapped even once.", (unsigned)err);
+      sceKernelReleaseDirectMemory(phys, len);
+      return;
+   }
+   views = 1;
+
+   /* Two words, far apart, so that a mapping which only shares its first page still fails rung 2. */
+   const size_t far = len - orbis_page_size();
+   volatile uint32_t *const a0 = (volatile uint32_t *)view[0];
+   volatile uint32_t *const a1 = (volatile uint32_t *)((char *)view[0] + far);
+
+   a0[0] = 0xa5c0ffeeu;
+   a1[0] = 0x0badf00du;
+   if (a0[0] != 0xa5c0ffeeu || a1[0] != 0x0badf00du) {
+      mesa_loge("orbis-drm: MIRROR rung 0 FAILED - wrote 0xa5c0ffee/0x0badf00d at %p and %p, read "
+                "back 0x%08x/0x%08x. The mapping does not hold data; nothing below is meaningful.",
+                (void *)a0, (void *)a1, a0[0], a1[0]);
+      goto done;
+   }
+   mesa_logi("orbis-drm: MIRROR rung 0 OK - view 0 at %p, %llu KiB, holds what was written to it "
+             "at offset 0 and at offset %llu KiB",
+             view[0], (unsigned long long)(len / 1024), (unsigned long long)(far / 1024));
+
+   /* rung 1 - the actual question. */
+   err = sceKernelMapDirectMemory(&view[1], len, prot, 0, phys, ORBIS_DIRECT_ALIGN);
+   if (err != 0) {
+      mesa_logw("orbis-drm: MIRROR rung 1: the SECOND mapping of phys 0x%llx was REFUSED -> 0x%08x. "
+                "One physical range, one virtual view. A dynamic recompiler that needs mirrored RAM "
+                "cannot get it this way, and that is now measured rather than assumed.",
+                (unsigned long long)phys, (unsigned)err);
+      goto done;
+   }
+   views = 2;
+   if (view[1] == view[0]) {
+      mesa_logw("orbis-drm: MIRROR rung 1: the second mapping SUCCEEDED but landed at the SAME "
+                "address %p. That is not a mirror - the kernel returned the existing view.",
+                view[1]);
+      goto done;
+   }
+   mesa_logi("orbis-drm: MIRROR rung 1 OK - view 1 at %p, %lld KiB from view 0 at %p",
+             view[1], (long long)(((char *)view[1] - (char *)view[0]) / 1024), view[0]);
+
+   /* rung 2 - coherence, both ways. */
+   {
+      volatile uint32_t *const b0 = (volatile uint32_t *)view[1];
+      volatile uint32_t *const b1 = (volatile uint32_t *)((char *)view[1] + far);
+
+      const uint32_t saw0 = b0[0], saw1 = b1[0];
+      if (saw0 != 0xa5c0ffeeu || saw1 != 0x0badf00du) {
+         mesa_logw("orbis-drm: MIRROR rung 2 FAILED forwards - view 0 holds 0xa5c0ffee/0x0badf00d, "
+                   "view 1 reads 0x%08x/0x%08x. Two mappings of one phys that do not share their "
+                   "contents; this is a copy, not a mirror.", saw0, saw1);
+         goto done;
+      }
+
+      b0[0] = 0x1eaf1eafu;
+      b1[0] = 0xdeadbeefu;
+      if (a0[0] != 0x1eaf1eafu || a1[0] != 0xdeadbeefu) {
+         mesa_logw("orbis-drm: MIRROR rung 2 FAILED backwards - wrote 0x1eaf1eaf/0xdeadbeef through "
+                   "view 1, view 0 reads 0x%08x/0x%08x. Forwards worked and backwards did not, which "
+                   "is what a copy-on-map looks like and is why this rung is two-sided.",
+                   a0[0], a1[0]);
+         goto done;
+      }
+      mesa_logi("orbis-drm: MIRROR rung 2 OK - both directions, at offset 0 and at offset %llu KiB. "
+                "The two views are the same memory.", (unsigned long long)(far / 1024));
+   }
+
+   /* rung 3 - how many. */
+   while (views < ORBIS_MIRROR_MAX) {
+      err = sceKernelMapDirectMemory(&view[views], len, prot, 0, phys, ORBIS_DIRECT_ALIGN);
+      if (err != 0) {
+         mesa_logi("orbis-drm: MIRROR rung 3: mapping %u was refused -> 0x%08x", views, (unsigned)err);
+         break;
+      }
+      views++;
+   }
+   mesa_logi("orbis-drm: MIRROR rung 3: %u simultaneous view(s) of one phys%s (the ladder stops "
+             "asking at %u; Lightrec wants about four)",
+             views, views >= ORBIS_MIRROR_MAX ? ", and it did not refuse" : "", ORBIS_MIRROR_MAX);
+
+   /* rung 4 - does tearing one down poison the others. */
+   if (views >= 2) {
+      void *const dropped = view[views - 1];
+      err = sceKernelMunmap(dropped, len);
+      if (err != 0) {
+         mesa_logw("orbis-drm: MIRROR rung 4: sceKernelMunmap(%p) -> 0x%08x - could not drop one "
+                   "view, so independence is untested", dropped, (unsigned)err);
+      } else {
+         views--;
+         if (a0[0] != 0x1eaf1eafu || a1[0] != 0xdeadbeefu) {
+            mesa_logw("orbis-drm: MIRROR rung 4 FAILED - after unmapping %p the surviving view reads "
+                      "0x%08x/0x%08x instead of 0x1eaf1eaf/0xdeadbeef. Dropping one mirror destroys "
+                      "the rest, so they cannot be managed independently.", dropped, a0[0], a1[0]);
+            goto done;
+         }
+         mesa_logi("orbis-drm: MIRROR rung 4 OK - unmapped %p, the remaining %u view(s) still hold "
+                   "the pattern", dropped, views);
+      }
+   }
+
+
+   /* ⚠ RUNG 5 - THE CODE BUFFER, AND IT IS THE ONE THAT CAN KILL THE PROCESS.
+    *
+    * Everything above asked whether the emulated machine's RAM can be mirrored. A recompiler also
+    * needs somewhere to put the instructions it writes and then RUN them, and rungs 0-4 only ever
+    * asked for prot 0x03 - CPU read and write. This asks for 0x05, read and EXECUTE, on the same
+    * phys, which is the W^X shape a JIT actually wants: write through the writable view, execute
+    * through the executable one, never both rights on one mapping.
+    *
+    * It is split into three because they fail differently and only the last one is dangerous:
+    *
+    *   5a  does the kernel GRANT the mapping at all. A return code, and nothing runs.
+    *   5b  read the instruction bytes back THROUGH the executable view. Free, non-fatal, and it
+    *       separates "the mirror carries the code" from "the page will execute" - two claims that a
+    *       single jump would answer together and therefore answer badly.
+    *   5c  CALL it. ⚠ If the page is not really executable this does not return an error, it takes
+    *       the process down. So it is behind its own value: ORBIS_TEST_MIRROR=exec. With =1 the
+    *       ladder stops after 5b and says what to set.
+    *
+    * ⚠ AND 5a SUCCEEDING IS NOT AN ANSWER. This console's kernel can accept a protection and not
+    * honour it - the same lesson the GB_ADDR_CONFIG and tessellation-register work paid for, where
+    * a call returned zero and the hardware disagreed. Only 5c is evidence about execution, which is
+    * exactly why it is the one that costs something.
+    *
+    * The stub is six bytes of x86-64 and returns a value nothing else in this process produces:
+    *   b8 ee ff c0 00   mov eax, 0x00c0ffee
+    *   c3               ret
+    * Self-modifying code needs no cache maintenance on x86-64, so a wrong answer here is about
+    * mapping rather than about coherency. */
+   {
+      static const uint8_t stub[] = {0xb8, 0xee, 0xff, 0xc0, 0x00, 0xc3};
+      const int32_t prot_rx = 0x01 | 0x04; /* CPU read | CPU execute; VM_PROT_EXECUTE is 0x04 */
+      void *xview = NULL;
+
+      const int32_t xerr =
+         sceKernelMapDirectMemory(&xview, len, prot_rx, 0, phys, ORBIS_DIRECT_ALIGN);
+      if (xerr != 0) {
+         mesa_logw("orbis-drm: MIRROR rung 5a: a READ|EXECUTE view of phys 0x%llx was REFUSED -> "
+                   "0x%08x. Direct memory cannot hold a recompiler's code buffer this way. The "
+                   "remaining route is sceKernelJitCreateSharedMemory and its alias call, which the "
+                   "SDK declares as `void f();` - no argument shapes, so that is reverse "
+                   "engineering rather than another rung.",
+                   (unsigned long long)phys, (unsigned)xerr);
+         goto rung5_done;
+      }
+      mesa_logi("orbis-drm: MIRROR rung 5a: READ|EXECUTE view granted at %p (prot 0x%02x asked). "
+                "⚠ A granted protection is not an honoured one - 5c is what tests that.",
+                xview, (unsigned)prot_rx);
+
+      /* Write the stub through the WRITABLE view. This is the whole point of the W^X shape: the
+       * mapping being written is not the mapping being executed. */
+      memcpy(view[0], stub, sizeof(stub));
+
+      const uint8_t *const seen = (const uint8_t *)xview;
+      if (memcmp(seen, stub, sizeof(stub)) != 0) {
+         mesa_logw("orbis-drm: MIRROR rung 5b FAILED - wrote %02x %02x %02x %02x %02x %02x through "
+                   "the writable view, the executable view reads %02x %02x %02x %02x %02x %02x. The "
+                   "code never arrives, so whether the page would execute does not matter.",
+                   stub[0], stub[1], stub[2], stub[3], stub[4], stub[5],
+                   seen[0], seen[1], seen[2], seen[3], seen[4], seen[5]);
+         sceKernelMunmap(xview, len);
+         goto rung5_done;
+      }
+      mesa_logi("orbis-drm: MIRROR rung 5b OK - the six instruction bytes written through %p are "
+                "readable through %p. The mirror carries code as well as data.", view[0], xview);
+
+      if (e[0] != 'e') {
+         mesa_logi("orbis-drm: MIRROR rung 5c NOT RUN - calling into %p is the only test of whether "
+                   "the page really executes, and a page that does not takes this process down "
+                   "rather than returning an error. Set ORBIS_TEST_MIRROR=exec and run again; "
+                   "nothing needs rebuilding or reinstalling, only that one line in the env file.",
+                   xview);
+         sceKernelMunmap(xview, len);
+         goto rung5_done;
+      }
+
+      /* ⚠ SAY IT BEFORE JUMPING. If the next line is the last thing in the log, the answer is that
+       * the page did not execute - and that is a result rather than a lost run, provided this line
+       * reached the file first. */
+      mesa_loge("orbis-drm: MIRROR rung 5c: CALLING %p NOW. If this is the last MIRROR line in the "
+                "log, the mapping was granted READ|EXECUTE and did not execute, and the process died "
+                "on the jump. That is the answer, not a crash to be investigated.", xview);
+
+      uint32_t (*fn)(void);
+      memcpy(&fn, &xview, sizeof(fn)); /* ⚠ not a cast: object pointer to function pointer is not one */
+      const uint32_t got = fn();
+
+      if (got != 0x00c0ffeeu)
+         mesa_logw("orbis-drm: MIRROR rung 5c: the call RETURNED, which means the page executes - "
+                   "but it produced 0x%08x instead of 0x00c0ffee. The page is executable and "
+                   "something about the bytes or the calling convention is wrong.", got);
+      else
+         mesa_logi("orbis-drm: MIRROR rung 5c OK - code written through a writable mirror and CALLED "
+                   "through an executable one returned 0x00c0ffee. W^X works on direct memory, and "
+                   "every mechanism a MIPS recompiler needs from this platform is now measured.");
+
+      sceKernelMunmap(xview, len);
+   }
+rung5_done:
+
+   /* ⚠ RUNG 6 - CAN THIS PROCESS GET EXECUTABLE PAGES BY ANY ROUTE AT ALL?
+    *
+    * Rung 5a settled that DIRECT memory will not carry them: EACCES, not EINVAL, so the call was
+    * well formed and the kernel said no on policy. That is one route, and the two requirements it
+    * was standing in for are separable:
+    *
+    *   the emulated machine's RAM    must be MIRRORED     - rungs 1-4, and it works
+    *   the recompiler's code buffer  must be EXECUTABLE   - and it need NOT be mirrored
+    *
+    * So the question that is left is smaller than the one rung 5 asked, and this process is not
+    * categorically barred from executing memory: its own .text runs. Three routes, none of them
+    * direct memory, each with its own policy check:
+    *
+    *   6a  sceKernelMprotect adding EXEC to a range that is ALREADY mapped read-write. A different
+    *       syscall from the one that refused, and this driver already establishes elsewhere that
+    *       mprotect on direct memory reaches even the GPU's page tables - so the call works there
+    *       for other bits, and only this bit is in question.
+    *   6b  sceKernelMapFlexibleMemory. A different pool entirely, with its own accounting and
+    *       plausibly its own policy. This is the pool musl's malloc grows into.
+    *   6c  sceKernelMmap with MAP_ANON. The plainest form there is.
+    *
+    * Each is tried at RWX first and at RX second, and BOTH codes are logged. A route that refuses
+    * RWX and grants RX is a W^X platform and a perfectly good answer; one that refuses both is a
+    * closed door. Collapsing them into one attempt would turn the first case into the second.
+    *
+    * ⚠ NOTHING HERE EXECUTES. A granted protection is not an honoured one - rung 5's split made
+    * that point and it holds here too - so rung 6 collects return codes and addresses only, and
+    * names which route to point rung 5c at. Turning the jump on stays a deliberate second run. */
+   {
+      static const struct {
+         const char *name;
+         unsigned    which;
+      } routes[] = {
+         {"6a sceKernelMprotect on an already-mapped RW direct range", 0},
+         {"6b sceKernelMapFlexibleMemory", 1},
+         {"6c sceKernelMmap MAP_ANON|MAP_PRIVATE", 2},
+      };
+      /* RWX first, then RX. 0x01 read, 0x02 write, 0x04 execute - VM_PROT_* in the SDK's
+       * _types/kernel.h, and the same bits ORBIS_GRAPHICS_PROT's low nibble uses. */
+      static const int32_t want[2] = {0x07, 0x05};
+      mesa_logi("orbis-drm: MIRROR rung 6c will pass flags 0x%04x for MAP_PRIVATE|MAP_ANON "
+                "(FreeBSD wants 0x1002; the SDK's musl header would give 0x0022)",
+                (unsigned)(MAP_PRIVATE | MAP_ANON));
+
+      const char *granted_by = NULL;
+      void       *granted_at = NULL;
+      int32_t     granted_prot = 0;
+      unsigned    granted_which = 0;
+
+      for (unsigned r = 0; r < ARRAY_SIZE(routes); r++) {
+         for (unsigned p = 0; p < 2; p++) {
+            void   *at = NULL;
+            int32_t rc = 0;
+
+            switch (routes[r].which) {
+            case 0:
+               /* view[0] is still mapped read-write from rung 0. Ask for the bit to be added in
+                * place, which is what a JIT that allocates first and protects later would do. */
+               at = view[0];
+               rc = sceKernelMprotect(view[0], len, want[p]);
+               break;
+            case 1:
+               rc = sceKernelMapFlexibleMemory(&at, len, want[p], 0);
+               break;
+            default:
+               /* ⚠ THE SYMBOLS, NOT THE NUMBERS. The first version of this rung passed 0x20 for
+                * MAP_ANON, read out of the SDK's own sys/mman.h - which is musl's header and carries
+                * LINUX's value. This kernel is FreeBSD-derived and wants 0x1000, so the flags word
+                * was not anonymous, the kernel went on to validate fd = -1, and BOTH protections
+                * came back EBADF. Identical codes for two different protections is the signature of
+                * a call that failed before it ever looked at prot: it read as "executable pages are
+                * refused" and was nothing of the kind.
+                *
+                * orbis-compat/src/orbis_mmap.cpp:53 carries a static_assert that
+                * MAP_PRIVATE|MAP_ANON == 0x1002 for exactly this reason. The value is logged below
+                * so the next reader does not have to trust that this one got it right. */
+               rc = sceKernelMmap(NULL, len, want[p], MAP_PRIVATE | MAP_ANON, -1, 0, &at);
+               break;
+            }
+
+            if (rc != 0) {
+               mesa_logi("orbis-drm: MIRROR rung %s at prot 0x%02x -> 0x%08x (%s)", routes[r].name,
+                         (unsigned)want[p], (unsigned)rc, orbis_kernel_error_name(rc));
+               continue;
+            }
+
+            mesa_logi("orbis-drm: MIRROR rung %s at prot 0x%02x -> GRANTED at %p", routes[r].name,
+                      (unsigned)want[p], at);
+            if (granted_by == NULL) {
+               granted_by = routes[r].name;
+               granted_at = at;
+               granted_prot = want[p];
+               granted_which = routes[r].which;
+            } else if (routes[r].which != 0) {
+               /* Not the route rung 7 will use, so give the pages straight back. Leaving a flexible
+                * or anonymous mapping behind would be a leak in a function that exists to measure. */
+               sceKernelMunmap(at, len);
+            }
+            break; /* this route answered; do not also ask it for the weaker protection */
+         }
+      }
+
+      if (granted_by == NULL)
+         mesa_logw("orbis-drm: MIRROR rung 6: NO route gave this process an executable page - "
+                   "direct memory (5a), mprotect, flexible memory and anonymous mmap all refused. "
+                   "What is left is sceKernelJitCreateSharedMemory and its alias call, which the "
+                   "SDK declares as `void f();` with no argument shapes at all. That is reverse "
+                   "engineering of the kind sceGnmSetHsShader has already cost days on, not another "
+                   "rung. A recompiler on this console goes through that door or not at all.");
+      else
+         mesa_logi("orbis-drm: MIRROR rung 6: %s granted prot 0x%02x at %p. ⚠ GRANTED IS NOT "
+                   "HONOURED - nothing in rung 6 executed. Rung 7 is what tests that.",
+                   granted_by, (unsigned)granted_prot, granted_at);
+
+      /* ⚠ RUNG 7 - RUN SOMETHING OUT OF THE PAGE RUNG 6 WAS GIVEN.
+       *
+       * Rung 5a established that direct memory cannot be MAPPED executable, and rung 6 that the same
+       * pages can be MPROTECTED to it afterwards - a policy applied at map time and not at protect
+       * time. That asymmetry is interesting and it is still only a return code. The platform has
+       * answered "yes" to a question about permissions twice now and never once to a question about
+       * execution, and those are not the same question: this console's kernel has form for accepting
+       * a value and not honouring it.
+       *
+       * Same six bytes as rung 5, same gate. ORBIS_TEST_MIRROR=1 stops after the read-back;
+       * =exec calls it and accepts that a page which is not really executable takes the process
+       * down rather than returning an error. */
+      if (granted_by != NULL) {
+         static const uint8_t stub7[] = {0xb8, 0xee, 0xff, 0xc0, 0x00, 0xc3};
+         bool writable = (granted_prot & 0x02) != 0;
+
+         /* If the grant was read-execute only, put the write rights back for as long as it takes to
+          * place the stub and then take them away again. That IS the W^X dance a recompiler does,
+          * so doing it here measures the thing rather than working around it. Only route 6a can:
+          * the other two would need their own mprotect and that is a different question. */
+         if (!writable && granted_which == 0) {
+            if (sceKernelMprotect(granted_at, len, 0x03) == 0) {
+               memcpy(granted_at, stub7, sizeof(stub7));
+               const int32_t back = sceKernelMprotect(granted_at, len, granted_prot);
+               writable = (back == 0);
+               mesa_logi("orbis-drm: MIRROR rung 7: W^X dance - RW to write the stub, then back to "
+                         "0x%02x -> 0x%08x (%s)", (unsigned)granted_prot, (unsigned)back,
+                         orbis_kernel_error_name(back));
+            }
+         } else if (writable) {
+            memcpy(granted_at, stub7, sizeof(stub7));
+         }
+
+         if (!writable) {
+            mesa_logw("orbis-drm: MIRROR rung 7 NOT RUN - the granted page could not be made "
+                      "writable long enough to put six bytes in it, so there is nothing to call.");
+         } else if (memcmp(granted_at, stub7, sizeof(stub7)) != 0) {
+            const uint8_t *const b = (const uint8_t *)granted_at;
+            mesa_logw("orbis-drm: MIRROR rung 7 FAILED - the six bytes did not stay: %02x %02x %02x "
+                      "%02x %02x %02x", b[0], b[1], b[2], b[3], b[4], b[5]);
+         } else if (e[0] != 'e') {
+            mesa_logi("orbis-drm: MIRROR rung 7 READY at %p and NOT CALLED - calling it is the only "
+                      "test of whether the page really executes, and a page that does not takes this "
+                      "process down rather than returning an error. Set ORBIS_TEST_MIRROR=exec and "
+                      "run again; nothing needs rebuilding or reinstalling, only that one line.",
+                      granted_at);
+         } else {
+            /* ⚠ SAY IT BEFORE JUMPING. logger_file() fflushes every message, so this line is on
+             * disk before the call. If it is the last MIRROR line in the log, the answer is that the
+             * page did not execute - a result, not a crash to be investigated. */
+            mesa_loge("orbis-drm: MIRROR rung 7: CALLING %p NOW, from %s at prot 0x%02x. If this is "
+                      "the last MIRROR line, that route grants execute and does not honour it.",
+                      granted_at, granted_by, (unsigned)granted_prot);
+
+            uint32_t (*fn7)(void);
+            memcpy(&fn7, &granted_at, sizeof(fn7));
+            const uint32_t got7 = fn7();
+
+            if (got7 != 0x00c0ffeeu)
+               mesa_logw("orbis-drm: MIRROR rung 7: the call RETURNED - the page executes - but "
+                         "produced 0x%08x instead of 0x00c0ffee.", got7);
+            else
+               mesa_logi("orbis-drm: MIRROR rung 7 OK - code placed in a page from %s and CALLED "
+                         "returned 0x00c0ffee. This process can execute memory it wrote. Together "
+                         "with the mirrors of rungs 1-4, every mechanism a MIPS recompiler needs "
+                         "from this platform is now measured rather than assumed.",
+                         granted_by);
+         }
+
+         if (granted_which != 0)
+            sceKernelMunmap(granted_at, len);
+      }
+   }
+
+   mesa_logi("orbis-drm: MIRROR: mirrored direct memory WORKS on this console - %u coherent views of "
+             "one physical range, independently unmappable. This is the mechanism Lightrec needs and "
+             "the reason it was skipped (memfd_create/MAP_SHM absent) does not apply to it. The "
+             "remaining question about PLACEMENT is answered elsewhere in this file: "
+             "ORBIS_MAP_FIXED puts a direct-memory mapping at an address of our choosing, on "
+             "hardware, every time a BO moves to GARLIC. Rung 5 above is the code buffer.",
+             views);
+
+done:
+   for (unsigned i = 0; i < views; i++)
+      if (view[i] != NULL)
+         sceKernelMunmap(view[i], len);
+   sceKernelReleaseDirectMemory(phys, len);
+   mesa_logi("orbis-drm: MIRROR ladder done - %u view(s) unmapped, phys 0x%llx released",
+             views, (unsigned long long)phys);
+}
+
+
 /* THE ARM'S OWN SLICE, TAKEN OFF THE FRONT AND NOT REPORTED. The VA window RADV is told about starts AFTER
  * it, so nothing RADV allocates can land on the arm's fence label or its command buffer - which would be a
  * corruption whose symptom is a fence that never signals. One page for the labels, one for the PM4. */
@@ -3144,6 +3669,7 @@ static const uint64_t orbis_arena_ladder[] = {
  *
  * ⚠ THE SDK'S LAYOUT FOR THIS STRUCT IS NOT TRUSTED. OpenOrbis names the first two members unk01/unk02 and
  * this project has already been bitten by one of its structs being wrong in a way nothing detects
+
  * (struct stat reports st_blocks where st_size belongs). So the raw words are logged
  * alongside the interpretation - if the two disagree, the raw ones are the evidence. */
 static void
@@ -5305,6 +5831,7 @@ ac_drm_device_initialize(int fd, bool is_virtio, uint32_t *major_version, uint32
          failure it finds and the timed arm is an independent claim. */
       orbis_selftest_futex_timed();
       orbis_characterise_clocks();
+      orbis_test_mirror_mapping();
       orbis_watchdog_start();
    }
 
