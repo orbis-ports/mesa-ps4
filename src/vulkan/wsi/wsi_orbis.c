@@ -544,6 +544,50 @@ wsi_orbis_frame_stats(const uint8_t *fb, uint32_t width, uint32_t height, uint32
                 (unsigned long long)(still_frames != 0 ? still_sum / still_frames : 0));
 }
 
+/* ⚠ FLIPS FAIL ON THIS PLATFORM, AND NOTHING IN THIS TREE HAS EVER MADE ONE FAIL ON PURPOSE.
+ *
+ * They fail for real: 21 flips went out in 110 ms and presentation stopped, which is the measurement
+ * wsi_orbis_wait_for_flip_slot exists because of. The WSI above has a whole exit path for that case -
+ * it must give the image back rather than keep it, or vkAcquireNextImageKHR runs out of images and
+ * the title stops with an empty log - and that path was reached exactly once, on a console, by
+ * accident, and has never been reached since. A path that only runs when the display misbehaves is a
+ * path that is never tested, and this one was WRONG for the whole life of the port.
+ *
+ * So it can be asked for: ORBIS_WSI_FAIL_FLIP=N reports failure on every Nth flip, counting the flips
+ * this function submits. N=1 fails every one. The failure is injected AT sceVideoOutSubmitFlip and
+ * nowhere earlier, because that is where the real one happens - everything before it (the GPU wait,
+ * the copy, the throttle) must still run, or the injected failure would be a different event from the
+ * one it stands in for.
+ *
+ * Off unless the variable is set, read once, and announced once - the same shape as every other knob
+ * in this file. */
+static bool
+wsi_orbis_fail_this_flip(uint64_t flip)
+{
+   static int64_t every = -1;
+
+   if (every < 0) {
+      const char *const e = getenv("ORBIS_WSI_FAIL_FLIP");
+      every = 0;
+      if (e != NULL && *e != '\0') {
+         every = (int64_t)strtoll(e, NULL, 10);
+         if (every > 0)
+            mesa_logw("wsi/orbis: ORBIS_WSI_FAIL_FLIP - every %lld%s flip will be REPORTED AS FAILED. "
+                      "The picture is meaningless in this run; what is being tested is what the WSI "
+                      "does with an image whose flip did not happen.",
+                      (long long)every, every == 1 ? "" : "th");
+         else
+            every = 0;
+      }
+   }
+
+   if (every <= 0 || flip == 0 || (flip % (uint64_t)every) != 0)
+      return false;
+
+   mesa_logi("wsi/orbis: ORBIS_WSI_FAIL_FLIP - failing flip %llu", (unsigned long long)flip);
+   return true;
+}
+
 bool
 wsi_orbis_scanout_present(struct wsi_orbis_scanout *so, uint32_t index, const void *src,
                           uint32_t src_pitch, uint64_t gpu_seq)
@@ -846,8 +890,13 @@ wsi_orbis_scanout_present(struct wsi_orbis_scanout *so, uint32_t index, const vo
       mesa_logi("wsi/orbis: present copied %u KiB, flipping index %u",
                 (unsigned)((uint64_t)dst_pitch * so->height / 1024), index);
 
-   const int32_t err = sceVideoOutSubmitFlip(so->video, (int32_t)index, ORBIS_VIDEO_OUT_FLIP_VSYNC,
-                                             (int64_t)++so->flips);
+   int32_t err = sceVideoOutSubmitFlip(so->video, (int32_t)index, ORBIS_VIDEO_OUT_FLIP_VSYNC,
+                                       (int64_t)++so->flips);
+   /* After the call, not instead of it: the flip really is submitted and the display really does take
+    * it, so the state this leaves behind is the state a genuine late failure leaves behind. Only the
+    * answer handed back to the WSI is forced. */
+   if (err == 0 && wsi_orbis_fail_this_flip(so->flips))
+      err = -1;
    if (trace)
       mesa_logi("wsi/orbis: present flip %llu -> 0x%08x", (unsigned long long)so->flips, (unsigned)err);
    if (err != 0) {

@@ -56,7 +56,27 @@ wsi_headless_surface_get_support(VkIcdSurfaceBase *surface,
 }
 
 static const VkPresentModeKHR present_modes[] = {
+#ifndef HAVE_ORBIS_PLATFORM
+   /* ⚠ NOT OFFERED ON ORBIS, BECAUSE THIS BACKEND CANNOT DO IT AND NEVER COULD.
+    *
+    * MAILBOX is defined as "never block the producer, show the newest image, discard the rest".
+    * Nothing in this file or in wsi_orbis.c ever discards an undisplayed image, and nothing branches
+    * on the mode at all: chain->base.present_mode is written once, in wsi_headless_surface_create_
+    * swapchain below, and never read again. The one consumer anywhere in the WSI tree is
+    * wsi_google_display_timing_process (wsi_common.c:1811), behind VK_GOOGLE_display_timing, which
+    * this ICD does not expose - and even there MAILBOX and FIFO share an arm.
+    *
+    * What actually paces the loop on the console is FIFO-shaped through and through: the flip is
+    * submitted with ORBIS_VIDEO_OUT_FLIP_VSYNC, the rate is pinned by sceVideoOutSetFlipRate, and
+    * wsi_orbis_wait_for_flip_slot() blocks the producer once it gets ahead. So an application that
+    * selected MAILBOX expecting not to block was blocked anyway, by a wait it could not see. That is
+    * a contract this file was advertising and not keeping.
+    *
+    * FIFO is the honest answer and it is what we already implement. It is also the one mode the spec
+    * guarantees, so removing MAILBOX leaves the list non-empty by construction.
+    */
    VK_PRESENT_MODE_MAILBOX_KHR,
+#endif
    VK_PRESENT_MODE_FIFO_KHR,
 };
 
@@ -476,8 +496,12 @@ wsi_headless_swapchain_acquire_next_image(struct wsi_swapchain *wsi_chain,
           * should be unreachable. It is here because "should be" is what the next title will test,
           * and a driver that only works for the swapchain shape it was written against is not a
           * driver. If this ever fires, the reservation is wrong for that application, not for this
-          * one. */
-         if (chain->orbis_zero_copy) {
+          * one.
+          *
+          * ⚠ NOT FOR A POLL. A zero timeout that finds nothing is a question answered, not a stall -
+          * and this warning fires ONCE, so letting a poll consume it would spend the one line that
+          * was meant to name a real deadlock. */
+         if (chain->orbis_zero_copy && info->timeout != 0) {
             static bool said;
             if (!said) {
                mesa_logw("wsi/orbis: no free image after %llu ns with %u images, %u held for the "
@@ -488,7 +512,17 @@ wsi_headless_swapchain_acquire_next_image(struct wsi_swapchain *wsi_chain,
             }
          }
 #endif
-         return VK_NOT_READY;
+         /* ⚠ TWO DIFFERENT ANSWERS, AND THIS FILE ONLY EVER GAVE ONE. The spec makes the distinction
+          * on the timeout the caller passed: a zero timeout is a poll and "no image right now" is
+          * VK_NOT_READY, while a non-zero timeout that expires is VK_TIMEOUT. Returning VK_NOT_READY
+          * for both says "there is no image" where the truth was "the wait ran out", and a caller
+          * that tells those apart - zink/kopper does - reads an expired wait as a swapchain that has
+          * gone unusable and rebuilds it, or stalls.
+          *
+          * wsi_common_drm.c and wsi_common_wayland.c already spell exactly this out; headless (and
+          * metal) did not, which is upstream's omission rather than this port's. Same expression as
+          * theirs so the three read alike. */
+         return info->timeout != 0 ? VK_TIMEOUT : VK_NOT_READY;
       }
    }
 }
