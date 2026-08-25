@@ -642,7 +642,18 @@ kopperGetSyncValues(struct dri_drawable *drawable, int64_t target_msc, int64_t d
 #ifdef VK_USE_PLATFORM_XCB_KHR
    struct kopper_loader_info *info = &drawable->info;
 
-   assert(info->bos.sType == VK_STRUCTURE_TYPE_XCB_SURFACE_CREATE_INFO_KHR);
+   /* Only the xcb path can answer this. The MSC comes from the X server's present
+    * extension, never from Vulkan, so a drawable that is not an xcb one has no
+    * sync values to report - and would otherwise assert here and then dereference
+    * an xcb_connection_t and a special_event that were never set (kopper_init_-
+    * drawable only fills those in for the xcb sType). That is reachable as soon as
+    * a build has BOTH the xcb platform and a non-xcb kopper drawable, which is
+    * exactly what KOPPER_HEADLESS makes possible.
+    *
+    * Returning 0 is the documented "no sync values available" answer and is what
+    * kopper_stubs.c returns for every drawable in a build without kopper at all. */
+   if (info->bos.sType != VK_STRUCTURE_TYPE_XCB_SURFACE_CREATE_INFO_KHR)
+      return 0;
 
    VkXcbSurfaceCreateInfoKHR *xcb = (VkXcbSurfaceCreateInfoKHR *)&info->bos;
    xcb_connection_t *conn = xcb->connection;

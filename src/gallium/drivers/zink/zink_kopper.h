@@ -74,7 +74,12 @@ struct kopper_swapchain {
 enum kopper_type {
    KOPPER_X11,
    KOPPER_WAYLAND,
-   KOPPER_WIN32
+   KOPPER_WIN32,
+   /* VK_EXT_headless_surface: a swapchain with no window system behind it.
+    * The presented image is consumed by the WSI backend rather than a
+    * compositor, so there is no native handle, no dmabuf and no implicit sync.
+    */
+   KOPPER_HEADLESS
 };
 
 struct kopper_displaytarget

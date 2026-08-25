@@ -3445,6 +3445,30 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
 
    u_trace_state_init();
 
+#ifdef HAVE_ORBIS_PLATFORM
+   /* ⚠ THERE IS NO LOADER AND NO SHARED OBJECT ON THIS CONSOLE, so there is nothing to dlopen. RADV is
+    * a static archive linked into the title's own executable, and orbis-compat's vkloader is what
+    * stands in for the loader: it defines the vk* symbols a program references and forwards them
+    * through vk_icdGetInstanceProcAddr, which is the only door the driver offers. Declared here rather
+    * than included because that entry point has no public header - the loader finds it by name, and on
+    * this platform we ARE the loader.
+    *
+    * zink therefore needs EXACTLY ONE symbol statically. Everything past vkCreateInstance it looks up
+    * dynamically through the two pointers below, so vkloader's gen.py - which reads a consumer's object
+    * files and emits one thunk per entry point referenced - has nothing to emit for zink at all. That is
+    * a cheaper contract than the loader was written for and worth knowing before anyone generates thunks.
+    *
+    * ⚠ vkGetDeviceProcAddr IS NOT RESOLVABLE HERE, and that is the one asymmetry with the arm below.
+    * Mesa's vk_instance_get_proc_addr answers only the global entry points for a NULL instance -
+    * vkCreateInstance and the two enumerations - and vkGetDeviceProcAddr is not one of them. A real
+    * loader exports it as an ordinary symbol, which is why the other arm can ask for both at once.
+    * It is picked up immediately after the instance exists; nothing dereferences it before then.
+    */
+   PFN_vkVoidFunction vk_icdGetInstanceProcAddr(VkInstance instance, const char *pName);
+
+   screen->loader_lib = NULL;
+   screen->vk_GetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)vk_icdGetInstanceProcAddr;
+#else
    screen->loader_lib = util_dl_open(VK_LIBNAME);
    if (!screen->loader_lib) {
       if (!screen->driver_name_is_inferred)
@@ -3460,6 +3484,7 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
          mesa_loge("ZINK: failed to get proc address");
       goto fail;
    }
+#endif
 
    if (config) {
       driParseConfigFiles(config->options, config->options_info,
@@ -3486,6 +3511,18 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
    screen->instance = instance;
    screen->instance_info = &instance_info;
    simple_mtx_unlock(&instance_lock);
+
+#ifdef HAVE_ORBIS_PLATFORM
+   /* Deferred from the loader block above - see the note there for why a NULL instance could not
+    * answer this one. Placed after the unlock because `goto fail` from here on assumes it. */
+   screen->vk_GetDeviceProcAddr =
+      (PFN_vkGetDeviceProcAddr)screen->vk_GetInstanceProcAddr(instance, "vkGetDeviceProcAddr");
+   if (!screen->vk_GetDeviceProcAddr) {
+      if (!screen->driver_name_is_inferred)
+         mesa_loge("ZINK: the instance did not answer for vkGetDeviceProcAddr");
+      goto fail;
+   }
+#endif
 
    if (zink_debug & ZINK_DEBUG_VALIDATION) {
       if (!screen->instance_info->have_layer_KHRONOS_validation &&

@@ -51,8 +51,18 @@ zink_kopper_set_present_mode_for_interval(struct kopper_displaytarget *cdt, int 
       if (cdt->present_modes & BITFIELD_BIT(VK_PRESENT_MODE_IMMEDIATE_KHR) &&
           cdt->type != KOPPER_WAYLAND)
          cdt->present_mode = VK_PRESENT_MODE_IMMEDIATE_KHR;
-      else
+      /* ⚠ MAILBOX WAS ASKED FOR WITHOUT CHECKING IT EXISTS, unlike IMMEDIATE one line above.
+       *
+       * The assert at the end of this function is the only thing that ever noticed, so on a release
+       * build against a backend offering just FIFO this handed an unsupported mode straight to
+       * vkCreateSwapchainKHR - and wsi_swapchain_get_present_mode (wsi_common.c:659) passes
+       * pCreateInfo->presentMode through without validating it, so nothing downstream noticed either.
+       * FIFO is guaranteed by the spec, which makes it the one safe thing to fall back to.
+       */
+      else if (cdt->present_modes & BITFIELD_BIT(VK_PRESENT_MODE_MAILBOX_KHR))
          cdt->present_mode = VK_PRESENT_MODE_MAILBOX_KHR;
+      else
+         cdt->present_mode = VK_PRESENT_MODE_FIFO_KHR;
    } else if (interval > 0) {
       cdt->present_mode = VK_PRESENT_MODE_FIFO_KHR;
    }
@@ -80,6 +90,9 @@ init_dt_type(struct kopper_displaytarget *cdt)
       cdt->type = KOPPER_WIN32;
       break;
 #endif
+   case VK_STRUCTURE_TYPE_HEADLESS_SURFACE_CREATE_INFO_EXT:
+      cdt->type = KOPPER_HEADLESS;
+      break;
    default:
       UNREACHABLE("unsupported!");
    }
@@ -119,6 +132,11 @@ kopper_CreateSurface(struct zink_screen *screen, struct kopper_displaytarget *cd
       break;
    }
 #endif
+   case VK_STRUCTURE_TYPE_HEADLESS_SURFACE_CREATE_INFO_EXT: {
+      VkHeadlessSurfaceCreateInfoEXT *headless = (VkHeadlessSurfaceCreateInfoEXT *)&cdt->info.bos;
+      error = VKSCR(CreateHeadlessSurfaceEXT)(screen->instance, headless, NULL, &surface);
+      break;
+   }
    default:
       UNREACHABLE("unsupported!");
    }
@@ -235,6 +253,18 @@ find_dt_entry(struct zink_screen *screen, const struct kopper_displaytarget *cdt
       break;
    }
 #endif
+   case KOPPER_HEADLESS:
+      /* VkHeadlessSurfaceCreateInfoEXT is {sType, pNext, flags} - it carries no
+       * native handle, so two headless create-infos are bit-identical and there
+       * is nothing in ->info to key on. The dt cache exists to let several
+       * drawables that name the SAME window share one surface; with no window
+       * there is nothing to share, so key on the loader's per-drawable
+       * kopper_loader_info pointer, which is unique and stable for the
+       * drawable's lifetime. Consequence: headless drawables never share a
+       * swapchain with each other, by construction.
+       */
+      he = _mesa_hash_table_search(&screen->dts, cdt->loader_private);
+      break;
    default:
       UNREACHABLE("unsupported!");
    }
@@ -331,6 +361,12 @@ kopper_CreateSwapchain(struct zink_screen *screen, struct kopper_displaytarget *
          cswap->scci.imageExtent.height = cdt->caps.currentExtent.height;
       }
       break;
+   case KOPPER_HEADLESS:
+      /* wsi_common_headless.c reports currentExtent as (0xFFFFFFFF, 0xFFFFFFFF)
+       * unconditionally - there is no window whose size could constrain us, so
+       * the swapchain's imageExtent defines the size. Same rule as Wayland, for
+       * a different reason; kept as its own case so the reason stays readable.
+       */
    case KOPPER_WAYLAND:
       /* On Wayland, currentExtent is the special value (0xFFFFFFFF, 0xFFFFFFFF), indicating that the
        * surface size will be determined by the extent of a swapchain targeting the surface. Whatever the
@@ -435,6 +471,9 @@ zink_kopper_displaytarget_create(struct zink_screen *screen, unsigned tex_usage,
       struct kopper_displaytarget k;
       struct hash_entry *he = NULL;
       k.info = *info;
+      /* find_dt_entry() keys KOPPER_HEADLESS on loader_private, so the probe
+       * key must be filled in before the lookup as well as on the real cdt. */
+      k.loader_private = (void*)loader_private;
       init_dt_type(&k);
       simple_mtx_lock(&screen->dt_lock);
       if (unlikely(!screen->dts.table)) {
@@ -444,6 +483,7 @@ zink_kopper_displaytarget_create(struct zink_screen *screen, unsigned tex_usage,
             break;
          case KOPPER_WAYLAND:
          case KOPPER_WIN32:
+         case KOPPER_HEADLESS:
             _mesa_hash_table_init(&screen->dts, screen, _mesa_hash_pointer, _mesa_key_pointer_equal);
             break;
          default:
@@ -516,6 +556,9 @@ zink_kopper_displaytarget_create(struct zink_screen *screen, unsigned tex_usage,
       break;
    }
 #endif
+   case KOPPER_HEADLESS:
+      _mesa_hash_table_insert(&screen->dts, cdt->loader_private, cdt);
+      break;
    default:
       UNREACHABLE("unsupported!");
    }
@@ -755,7 +798,14 @@ kopper_present(void *data, void *gdata, int thread_idx)
    cpi->info.pResults = &error;
 
    simple_mtx_lock(screen->queue_lock);
-   if (screen->driver_workarounds.implicit_sync && cdt->type != KOPPER_WIN32) {
+   /* The implicit-sync dance below exists because dmabuf-backed WSI images carry
+    * implicit fences that a wait semaphore alone does not satisfy, so the wait has
+    * to be flushed through a real queue submit first. A headless swapchain image is
+    * a plain VkImage owned by the WSI backend - no dmabuf, no implicit fence - so
+    * headless needs it no more than WIN32 does.
+    */
+   if (screen->driver_workarounds.implicit_sync && cdt->type != KOPPER_WIN32 &&
+       cdt->type != KOPPER_HEADLESS) {
       if (!screen->fence) {
          VkFenceCreateInfo fci = {0};
          fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
