@@ -832,7 +832,18 @@ radv_physical_device_get_supported_extensions(const struct radv_physical_device 
       .KHR_swapchain_mutable_format = true,
 #endif
       .KHR_synchronization2 = true,
-      .KHR_timeline_semaphore = pdev->info.has_timeline_syncobj,
+      /* ⚠ NOT has_timeline_syncobj, UNLIKE KHR_present_wait ABOVE. The two look like the same
+       * condition and are not. A present wait is a wait the WSI hands to the driver's own timeline,
+       * so it needs a timeline the kernel/provider actually implements; plain KHR_timeline_semaphore
+       * does not, because vk_sync_timeline builds one out of binary syncobjs in software - see the
+       * emulated_timeline_sync_type arm of radv_physical_device_try_create(), which is installed
+       * EXACTLY when has_timeline_syncobj is false. Upstream says `true` here for that reason.
+       *
+       * Tying this one to has_timeline_syncobj too was overshoot when the present-wait fix landed: it
+       * turned off a feature the tree already emulated, and zink hard-requires it
+       * (zink_screen.c:3597), so OpenGL-over-Vulkan could not start on this backend at all.
+       */
+      .KHR_timeline_semaphore = true,
       .KHR_unified_image_layouts = pdev->info.gfx_level >= GFX11,
       .KHR_uniform_buffer_standard_layout = true,
       .KHR_variable_pointers = true,
@@ -1241,7 +1252,7 @@ radv_physical_device_get_features(const struct radv_physical_device *pdev, struc
       .shaderSubgroupExtendedTypes = true,
       .separateDepthStencilLayouts = true,
       .hostQueryReset = true,
-      .timelineSemaphore = pdev->info.has_timeline_syncobj,
+      .timelineSemaphore = true, /* emulated when !has_timeline_syncobj; see KHR_timeline_semaphore above */
       .bufferDeviceAddress = true,
       .bufferDeviceAddressCaptureReplay = true,
       .bufferDeviceAddressMultiDevice = false,
@@ -2719,6 +2730,18 @@ static VkResult
 radv_physical_device_try_create(struct radv_instance *instance, drmDevicePtr drm_device,
                                 struct radv_physical_device **pdev_out)
 {
+#ifdef _WIN32
+   /* ⚠ THE WHOLE BODY IS EXCLUDED ON WINDOWS, as it was upstream, and the shorter version of this that
+    * only special-cased the winsys query below DID NOT COMPILE. Windows has no winsys: the
+    * #ifndef _WIN32 at the top of this file drops radv_amdgpu_winsys_public.h, so
+    * `struct radeon_winsys_info winsys_info;` further down is an incomplete type there -
+    * "storage size of 'winsys_info' isn't known". Refusing the device here is what upstream did and
+    * what the rest of this file still assumes; there is no Windows caller that can reach it, because
+    * the only caller is the DRM-node walk.
+    */
+   assert(drm_device == NULL);
+   return VK_ERROR_INCOMPATIBLE_DRIVER;
+#else
    VkResult result;
    int fd = -1;
    enum radv_drm_device_type drm_device_type = RADV_DRM_DEVICE_AMDGPU;
@@ -3081,6 +3104,7 @@ fail_fd:
    if (fd != -1)
       close(fd);
    return result;
+#endif
 }
 
 #ifdef HAVE_ORBIS_PLATFORM
