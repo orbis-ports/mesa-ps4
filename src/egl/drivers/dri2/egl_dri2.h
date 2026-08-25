@@ -573,6 +573,11 @@ dri2_initialize_android(_EGLDisplay *disp)
 EGLBoolean
 dri2_initialize_surfaceless(_EGLDisplay *disp);
 
+#ifdef HAVE_ORBIS_PLATFORM
+EGLBoolean
+dri2_initialize_orbis(_EGLDisplay *disp);
+#endif
+
 EGLBoolean
 dri2_initialize_device(_EGLDisplay *disp);
 static inline void

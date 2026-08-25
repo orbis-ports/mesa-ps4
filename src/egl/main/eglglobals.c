@@ -94,6 +94,9 @@ struct _egl_global _eglGlobal = {
       " EGL_KHR_platform_gbm"
 #endif
       " EGL_MESA_platform_surfaceless"
+#ifdef HAVE_ORBIS_PLATFORM
+      " EGL_MESA_platform_orbis"
+#endif
       "",
 
    .debugCallback = NULL,

@@ -918,6 +918,11 @@ dri2_initialize(_EGLDisplay *disp)
    case _EGL_PLATFORM_SURFACELESS:
       ret = dri2_initialize_surfaceless(disp);
       break;
+#ifdef HAVE_ORBIS_PLATFORM
+   case _EGL_PLATFORM_ORBIS:
+      ret = dri2_initialize_orbis(disp);
+      break;
+#endif
    case _EGL_PLATFORM_DEVICE:
       ret = dri2_initialize_device(disp);
       break;
@@ -1027,6 +1032,12 @@ dri2_display_destroy(_EGLDisplay *disp)
       break;
    case _EGL_PLATFORM_DEVICE:
       break;
+#ifdef HAVE_ORBIS_PLATFORM
+   case _EGL_PLATFORM_ORBIS:
+      /* Nothing to tear down: no connection, no device node, no native display. The dri screen and
+       * the driver configs are freed by the common code above and below. */
+      break;
+#endif
    default:
       UNREACHABLE("Platform teardown is not properly hooked.");
       break;

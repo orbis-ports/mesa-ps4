@@ -42,6 +42,22 @@ typedef EGLBoolean (EGLAPIENTRYP PFNEGLSWAPBUFFERSREGIONNOK) (EGLDisplay dpy, EG
 #define EGL_NO_CONFIG_MESA			EGL_CAST(EGLConfig,0)
 #endif
 
+#ifndef EGL_MESA_platform_orbis
+#define EGL_MESA_platform_orbis 1
+/* ⚠ NOT A KHRONOS-REGISTERED ENUM. This value is local to this fork.
+ *
+ * There is no registered EGL platform for the PlayStation 4 and there will not be one, so a value had
+ * to be picked. 0x31E0 is the first slot after the block Mesa's own platforms occupy (GBM 0x31D7,
+ * XCB 0x31DC, surfaceless 0x31DD) and is unused by every header in include/EGL. If it ever collides
+ * with something Khronos allocates later, this define is the single place to change: the enum is
+ * consumed once, in _eglGetPlatformDisplayCommon().
+ *
+ * Titles do not normally need it. A homebrew title has nothing to pass to eglGetPlatformDisplay, so
+ * the expected call is eglGetDisplay(EGL_DEFAULT_DISPLAY), which resolves to this platform through the
+ * build-time native platform. */
+#define EGL_PLATFORM_ORBIS_MESA 0x31E0
+#endif /* EGL_MESA_platform_orbis */
+
 #ifndef EGL_MESA_drm_image_formats
 #define EGL_MESA_drm_image_formats 1
 #define EGL_DRM_BUFFER_FORMAT_ARGB2101010_MESA  0x3290

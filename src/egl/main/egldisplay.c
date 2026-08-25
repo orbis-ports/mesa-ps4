@@ -84,6 +84,7 @@ static const struct {
    {_EGL_PLATFORM_SURFACELESS, "surfaceless"},
    {_EGL_PLATFORM_DEVICE, "device"},
    {_EGL_PLATFORM_WINDOWS, "windows"},
+   {_EGL_PLATFORM_ORBIS, "orbis"},
 };
 
 /**
@@ -682,6 +683,31 @@ _eglGetSurfacelessDisplay(void *native_display, const EGLAttrib *attrib_list)
 
    return dpy;
 }
+
+#ifdef HAVE_ORBIS_PLATFORM
+/* The PS4 has one display and no display server, so there is nothing for a title to name.
+ * EGL_DEFAULT_DISPLAY reaches this platform through _EGL_NATIVE_PLATFORM (see meson.build, where
+ * 'orbis' is an undetectable platform and is selected ahead of the surfaceless one that EGL always
+ * appends); eglGetPlatformDisplay(EGL_PLATFORM_ORBIS_MESA, ...) reaches it explicitly. Both must be
+ * given a NULL native display, because there is no other kind. */
+_EGLDisplay *
+_eglGetOrbisDisplay(void *native_display, const EGLAttrib *attrib_list)
+{
+   if (native_display != NULL) {
+      _eglError(EGL_BAD_PARAMETER, "eglGetPlatformDisplay");
+      return NULL;
+   }
+
+   /* This platform recognizes no display attributes. There is no EGL_DEVICE_EXT to select between:
+    * _eglGlobal.DeviceList holds only the software entry, device enumeration being DRM-only. */
+   if (attrib_list != NULL && attrib_list[0] != EGL_NONE) {
+      _eglError(EGL_BAD_ATTRIBUTE, "eglGetPlatformDisplay");
+      return NULL;
+   }
+
+   return _eglFindDisplay(_EGL_PLATFORM_ORBIS, NULL, attrib_list);
+}
+#endif /* HAVE_ORBIS_PLATFORM */
 
 #ifdef HAVE_ANDROID_PLATFORM
 _EGLDisplay *
