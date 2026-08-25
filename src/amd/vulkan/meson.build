@@ -283,18 +283,11 @@ if radv_u_trace
   radv_flags += '-DRADV_U_TRACE=1'
 endif
 
-# Is this build producing a LOADABLE MODULE? Both halves matter and neither alone is right.
-#
-#   with_platform_orbis alone       - the orbis arm is ALSO built as an ordinary host ICD for the
-#                                     development loop (build.sh --host-orbis), and that build wants a
-#                                     .so and a manifest like any other.
-#   default_library alone           - would make RADV the only one of this tree's twelve Vulkan drivers
-#                                     that answers to -Ddefault_library=static, silently turning an
-#                                     existing static build's loadable driver into an archive.
-#
-# Together they name exactly the cross-compiled console build: no ICD loader, driver linked into the
-# title. Every other configuration, on every platform, keeps the shared object it had.
-radv_is_loadable = not (with_platform_orbis and get_option('default_library') == 'static')
+# Is this build producing a LOADABLE MODULE? The predicate is with_loadable_modules, defined once in
+# the top-level meson.build with the reasoning for both of its halves - the GL stack asks the same
+# question of the same build and must get the same answer. Kept under a RADV-local name because the
+# three uses below read as statements about RADV.
+radv_is_loadable = with_loadable_modules
 
 # ⚠ TWO CALLS RATHER THAN ONE, because the shorter spellings are both wrong here.
 #

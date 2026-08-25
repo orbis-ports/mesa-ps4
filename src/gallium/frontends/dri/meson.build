@@ -32,7 +32,14 @@ if with_dri
   files_libdri += files('drisw.c')
 endif
 
-if with_dri2
+# ⚠ with_dri TOO, not just with_dri2. The name is historical: dri2.c holds this frontend's whole
+# image/interop/blob-cache implementation (dri_create_image, dri_interop_*, dri_set_damage_region,
+# dri_set_blob_cache_funcs, dri2_init_drawable...), which dri_util.c, dri_drawable.c, dri_helpers.c,
+# drisw.c, kopper.c and src/egl's egl_dri2.c all call unconditionally. Every configuration that has
+# had with_dri so far also had with_dri2 - with_dri_platform is 'drm', 'apple' or 'pseudo-drm' in all
+# of them - so a with_dri build without dri2.c had never been linked until this one, and it fails
+# with 12 undefined symbols. The DRM-specific parts of the file are guarded inside it by HAVE_LIBDRM.
+if with_dri2 or with_dri
   files_libdri += files('dri2.c')
 endif
 

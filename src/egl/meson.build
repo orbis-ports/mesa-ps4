@@ -90,6 +90,10 @@ if with_dri
     'drivers/dri2/platform_surfaceless.c',
   )
 
+  if with_platform_orbis
+    files_egl += files('drivers/dri2/platform_orbis.c')
+  endif
+
   if with_platform_x11
     files_egl += files('drivers/dri2/platform_x11.c')
     incs_for_egl += inc_loader_x11
@@ -165,7 +169,9 @@ else
   files_egl += files('main/eglglvnd.c', 'main/egldispatchstubs.c')
 endif
 
-if with_ld_version_script
+# with_loadable_modules: a version script describes a dynamic symbol table, and the console build has
+# no dynamic anything - libEGL is an archive linked into the title.
+if with_ld_version_script and with_loadable_modules
   if with_glvnd
     link_args_for_egl += [
       '-Wl,--version-script', join_paths(meson.current_source_dir(), 'egl-glvnd.sym')
@@ -190,25 +196,47 @@ if egl_native_platform != ''
   c_args_for_egl += '-D_EGL_NATIVE_PLATFORM=_EGL_PLATFORM_@0@'.format(egl_native_platform.to_upper())
 endif
 
-libegl = shared_library(
-  egl_lib_name,
-  files_egl,
-  c_args : [
-    c_args_for_egl,
-  ],
-  cpp_args : [cpp_args_for_egl],
-  gnu_symbol_visibility : 'hidden',
-  include_directories : incs_for_egl,
-  link_with : [link_for_egl],
-  link_args : [ld_args_bsymbolic, ld_args_gc_sections, link_args_for_egl],
-  link_depends : [link_deps_for_egl],
-  dependencies : [deps_for_egl, dep_dl, dep_libdrm, dep_clock, dep_thread, idep_mesautil],
-  install : true,
-  version : egl_lib_version,
-  soversion : egl_lib_soversion,
-  name_prefix : host_machine.system() == 'windows' ? 'lib' : [],  # always use lib, but avoid warnings on !windows
-  vs_module_defs : egl_def
-)
+# ⚠ TWO CALLS RATHER THAN ONE, as src/amd/vulkan and src/gallium/targets/dri do: library() would make
+# this the only EGL in the tree that answers to -Ddefault_library, and build_target(target_type:) would
+# raise the project's Meson floor because vs_module_defs is not a build_target kwarg before 1.12.
+# version, soversion, name_prefix, vs_module_defs and link_args all describe a shared object.
+if with_loadable_modules
+  libegl = shared_library(
+    egl_lib_name,
+    files_egl,
+    c_args : [
+      c_args_for_egl,
+    ],
+    cpp_args : [cpp_args_for_egl],
+    gnu_symbol_visibility : 'hidden',
+    include_directories : incs_for_egl,
+    link_with : [link_for_egl],
+    link_args : [ld_args_bsymbolic, ld_args_gc_sections, link_args_for_egl],
+    link_depends : [link_deps_for_egl],
+    dependencies : [deps_for_egl, dep_dl, dep_libdrm, dep_clock, dep_thread, idep_mesautil],
+    install : true,
+    version : egl_lib_version,
+    soversion : egl_lib_soversion,
+    name_prefix : host_machine.system() == 'windows' ? 'lib' : [],  # always use lib, but avoid warnings on !windows
+    vs_module_defs : egl_def
+  )
+else
+  libegl = static_library(
+    egl_lib_name,
+    files_egl,
+    c_args : [
+      c_args_for_egl,
+    ],
+    cpp_args : [cpp_args_for_egl],
+    gnu_symbol_visibility : 'hidden',
+    include_directories : incs_for_egl,
+    link_with : [link_for_egl],
+    dependencies : [deps_for_egl, dep_dl, dep_libdrm, dep_clock, dep_thread, idep_mesautil],
+    # install : true for the flattened-archive effect, not because anyone installs it - see
+    # libvulkan_radeon's note on meson's thin archives.
+    install : true,
+  )
+endif
 
 if with_glvnd
   configure_file(
@@ -238,7 +266,7 @@ else
   )
 endif
 
-if with_symbols_check
+if with_symbols_check and with_loadable_modules
   if with_glvnd
     egl_symbols = files('egl-glvnd-symbols.txt')
   else

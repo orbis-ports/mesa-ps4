@@ -381,7 +381,11 @@ if with_virtio_vk
 endif
 
 with_dri = false
-if with_gallium and (system_has_kms_drm or (with_gallium_zink and (freedreno_kmds.contains('kgsl') or host_machine.system() == 'darwin')))
+# get_option('platforms') rather than with_platform_orbis, for the same reason as the
+# system_has_kms_drm override further up: the platform list is not resolved until line ~510.
+# Orbis joins kgsl and darwin as a zink-without-KMS/DRM case - there is no DRM device to open,
+# the "DRI driver" is an archive linked into the title, and EGL reaches it by direct call.
+if with_gallium and (system_has_kms_drm or (with_gallium_zink and (freedreno_kmds.contains('kgsl') or host_machine.system() == 'darwin' or get_option('platforms').contains('orbis'))))
   _glx = get_option('glx')
   _egl = get_option('egl')
   if _glx == 'dri' or _egl.enabled() or (_glx == 'disabled' and _egl.allowed())
@@ -509,6 +513,22 @@ with_platform_windows = _platforms.contains('windows')
 with_platform_macos = _platforms.contains('macos')
 with_platform_orbis = _platforms.contains('orbis')
 
+# ⚠ IS THIS BUILD PRODUCING LOADABLE MODULES AT ALL? Both halves matter and neither alone is right.
+# This is the predicate src/amd/vulkan/meson.build used to spell out for RADV alone; the GL stack needs
+# exactly the same answer, so it is stated once here.
+#
+#   with_platform_orbis alone       - the orbis arm is ALSO built as an ordinary host driver for the
+#                                     development loop (build.sh --host-orbis), and that build wants
+#                                     shared objects and manifests like any other.
+#   default_library alone           - would make this tree the only one whose drivers answer to
+#                                     -Ddefault_library=static, silently turning an existing static
+#                                     build's loadable driver into an archive.
+#
+# Together they name exactly the cross-compiled console build: no ICD loader, no dlopen, no ld.so at
+# all - every library is linked into the title's eboot, and that link line is an executable's (crt1.o,
+# -pie), so any .so link in the tree fails on an undefined `main`.
+with_loadable_modules = not (with_platform_orbis and get_option('default_library') == 'static')
+
 with_gfxstream_emulated_android = with_gfxstream_vk and with_platform_android and host_machine.system() == 'linux'
 if with_gfxstream_emulated_android
   # When building the android_stub with a non-Bionic sysroot/target, we to have
@@ -596,7 +616,14 @@ if with_egl
   endif
 
   # All the other platforms can be detected and cannot reach the native platform code
-  _undetectable_platforms = ['x11', 'haiku', 'android', 'surfaceless']
+  #
+  # ⚠ 'orbis' IS LISTED FIRST, AND THE ORDER IS THE WHOLE POINT. A PS4 title has nothing to pass to
+  # eglGetDisplay but EGL_DEFAULT_DISPLAY, so the native platform has to be the orbis one. EGL always
+  # appends 'surfaceless' to _platforms above, so without orbis in this list the loop below would find
+  # surfaceless as the only undetectable platform and silently make it the native one - and the title
+  # would get a display that has no window surfaces at all. Order matters because the 'auto' branch
+  # takes _undetectable_platforms_enabled[0], and that list is filled in _platforms order.
+  _undetectable_platforms = ['orbis', 'x11', 'haiku', 'android', 'surfaceless']
 
   # Don't enforce the native platform if none of the undetectable platforms are enabled
   _undetectable_platforms_enabled = []

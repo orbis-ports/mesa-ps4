@@ -24,13 +24,19 @@ endif
 
 dri_sym = configure_file(input : 'dri.sym.in', output : 'dri.sym', configuration : sym_config)
 
-if with_ld_version_script
-  gallium_dri_ld_args += ['-Wl,--version-script', join_paths(meson.current_build_dir(), 'dri.sym')]
-  gallium_dri_link_depends += dri_sym
-endif
-if with_ld_dynamic_list
-  gallium_dri_ld_args += ['-Wl,--dynamic-list', join_paths(meson.current_source_dir(), '../dri.dyn')]
-  gallium_dri_link_depends += files('../dri.dyn')
+# ⚠ BOTH OF THESE DESCRIBE A DYNAMIC SYMBOL TABLE, which an archive does not have. Guarded on
+# with_loadable_modules rather than left to be ignored: ld.lld accepts --version-script on a link that
+# has no dynamic symbols and silently does nothing, and meson would still add dri.sym to link_depends,
+# so the build would carry a rule whose output nothing reads.
+if with_loadable_modules
+  if with_ld_version_script
+    gallium_dri_ld_args += ['-Wl,--version-script', join_paths(meson.current_build_dir(), 'dri.sym')]
+    gallium_dri_link_depends += dri_sym
+  endif
+  if with_ld_dynamic_list
+    gallium_dri_ld_args += ['-Wl,--dynamic-list', join_paths(meson.current_source_dir(), '../dri.dyn')]
+    gallium_dri_link_depends += files('../dri.dyn')
+  endif
 endif
 
 if get_option('unversion-libgallium') or with_platform_android
@@ -39,33 +45,60 @@ else
   libgallium_name = 'gallium-@0@'.format(meson.project_version())
 endif
 
-libgallium_dri = shared_library(
-  libgallium_name,
-  files('dri_target.c'),
-  include_directories : [
-    inc_include, inc_src, inc_mesa, inc_gallium, inc_gallium_aux, inc_util, inc_gallium_drivers,
-    inc_gallium_winsys, include_directories('../../frontends/dri'),
-  ],
-  gnu_symbol_visibility : 'hidden',
-  link_args : [ld_args_build_id, ld_args_gc_sections, gallium_dri_ld_args],
-  link_depends : gallium_dri_link_depends,
-  link_with : [
-    libmesa, libgalliumvl,
-    libgallium, libglapi, libpipe_loader_static, libws_null, libwsw, libswdri,
-    libswkmsdri, gallium_dri_link_with
-  ],
-  link_whole : [libdri, gallium_dri_link_whole],
-  dependencies : [
-    dep_libdrm, dep_llvm, dep_thread, idep_xmlconfig, idep_mesautil,
-    driver_swrast, driver_r300, driver_r600, driver_radeonsi, driver_nouveau,
-    driver_kmsro, driver_v3d, driver_vc4, driver_freedreno, driver_etnaviv,
-    driver_tegra, driver_i915, driver_svga, driver_virgl,
-    driver_panfrost, driver_iris, driver_lima, driver_zink, driver_d3d12,
-    driver_asahi, driver_crocus, driver_rocket, driver_ethosu
-  ],
-  install : true,
-  name_suffix : libname_suffix,
-)
+# ⚠ TWO CALLS RATHER THAN ONE, for the same reasons src/amd/vulkan/meson.build gives: library() would
+# make this the only target in the tree answering to -Ddefault_library, and build_target(target_type:)
+# raises the project's Meson floor. The arguments common to both are hoisted; link_args, link_depends,
+# name_suffix and the megadriver symlinks describe a shared object and nothing else.
+gallium_dri_sources = files('dri_target.c')
+gallium_dri_includes = [
+  inc_include, inc_src, inc_mesa, inc_gallium, inc_gallium_aux, inc_util, inc_gallium_drivers,
+  inc_gallium_winsys, include_directories('../../frontends/dri'),
+]
+gallium_dri_link_with_all = [
+  libmesa, libgalliumvl,
+  libgallium, libglapi, libpipe_loader_static, libws_null, libwsw, libswdri,
+  libswkmsdri, gallium_dri_link_with
+]
+gallium_dri_link_whole_all = [libdri, gallium_dri_link_whole]
+gallium_dri_deps = [
+  dep_libdrm, dep_llvm, dep_thread, idep_xmlconfig, idep_mesautil,
+  driver_swrast, driver_r300, driver_r600, driver_radeonsi, driver_nouveau,
+  driver_kmsro, driver_v3d, driver_vc4, driver_freedreno, driver_etnaviv,
+  driver_tegra, driver_i915, driver_svga, driver_virgl,
+  driver_panfrost, driver_iris, driver_lima, driver_zink, driver_d3d12,
+  driver_asahi, driver_crocus, driver_rocket, driver_ethosu
+]
+
+if with_loadable_modules
+  libgallium_dri = shared_library(
+    libgallium_name,
+    gallium_dri_sources,
+    include_directories : gallium_dri_includes,
+    gnu_symbol_visibility : 'hidden',
+    link_args : [ld_args_build_id, ld_args_gc_sections, gallium_dri_ld_args],
+    link_depends : gallium_dri_link_depends,
+    link_with : gallium_dri_link_with_all,
+    link_whole : gallium_dri_link_whole_all,
+    dependencies : gallium_dri_deps,
+    install : true,
+    name_suffix : libname_suffix,
+  )
+else
+  libgallium_dri = static_library(
+    libgallium_name,
+    gallium_dri_sources,
+    include_directories : gallium_dri_includes,
+    gnu_symbol_visibility : 'hidden',
+    link_with : gallium_dri_link_with_all,
+    link_whole : gallium_dri_link_whole_all,
+    dependencies : gallium_dri_deps,
+    # ⚠ install, and NOT because anyone installs it - the same trick libvulkan_radeon uses. Meson builds
+    # an uninstalled static library as a THIN archive, an index of absolute paths to loose objects that
+    # absorbs nothing from link_with. Marking it installed produces a real archive with the component
+    # static libraries flattened in, which is what "the driver is linked into the title" needs.
+    install : true,
+  )
+endif
 
 shared_glapi_lib = libgallium_dri
 
