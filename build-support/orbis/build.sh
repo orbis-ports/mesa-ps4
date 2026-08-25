@@ -2,7 +2,12 @@
 # Cross-build Mesa's RADV for the PS4 (OpenOrbis).
 #
 #   build-support/orbis/build.sh [--sdk <openorbis>] [--work <dir>] [--host-too] [--host-orbis]
-#                               [--gl] [--regress] [--mingw]
+#                               [--regress] [--mingw]
+#
+# ⚠ ONE BUILD, BOTH APIs. Vulkan and OpenGL come out of the same configure into the same build-orbis.
+# They were two arms behind a --gl flag for exactly one day, while GL did not run; keeping them apart
+# after it did would have meant a driver whose two halves were never compiled together, and RetroArch
+# needs both in one eboot - a Vulkan core and a GL core in the same binary, chosen at runtime.
 #
 # The scaffolding used to be a separate repo (orbis-mesa) beside a driver fork. It is one tree now: this
 # script builds the checkout it lives in, so there is no --mesa argument and no way to point it at the
@@ -19,7 +24,6 @@ SDK="${OO_PS4_TOOLCHAIN:-${HOME}/.local/opt/openorbis}"
 WORK="${HOME}/.cache/orbis-mesa"
 HOST_TOO=no
 HOST_ORBIS=no
-GL=no
 REGRESS=no
 MINGW=no
 
@@ -29,7 +33,6 @@ while [[ $# -gt 0 ]]; do
     --work) WORK="$2"; shift 2 ;;
     --host-too) HOST_TOO=yes; shift ;;
     --host-orbis) HOST_ORBIS=yes; shift ;;
-    --gl) GL=yes; shift ;;
     --regress) REGRESS=yes; shift ;;
     --mingw) MINGW=yes; shift ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
@@ -133,11 +136,19 @@ echo "   uncommitted: ${DIRTY_N} path(s)"
 #
 # default_library=static because the PS4 has no ICD loader: RADV gets linked into the title, and our own
 # link line is an executable's (crt1.o, -pie), so a .so link fails on an undefined `main`.
+# ⚠ THE PRODUCT IS BOTH APIs, AND THIS ARRAY IS WHERE THAT IS DECIDED. RADV and zink/EGL/GLES2 are
+# configured together and land in one build-orbis, because a title links whichever archives it needs out
+# of the same tree and RetroArch links both. Building them apart made two trees that were never compiled
+# against each other; the Vulkan-only consumers pay nothing for this - they link libvulkan_radeon.a and
+# the gallium archives simply go unreferenced.
+#
+# -Dgallium-drivers=zink needs no meson change: the empty orbis default sits inside the 'auto' branch.
+# -Dgles1=disabled because GLESv1 wants the fixed-function state tracker for no benefit here.
 COMMON_OPTS=(
   -Dvulkan-drivers=amd
-  -Dgallium-drivers=
-  -Dglx=disabled -Degl=disabled -Dgbm=disabled
-  -Dopengl=false -Dgles1=disabled -Dgles2=disabled
+  -Dgallium-drivers=zink
+  -Dopengl=true -Dgles1=disabled -Dgles2=enabled
+  -Degl=enabled -Dglx=disabled -Dgbm=disabled -Dglvnd=disabled
   -Dvideo-codecs=
   -Dllvm=disabled
   -Dbuildtype=release
@@ -412,67 +423,28 @@ if [[ "${HOST_ORBIS}" == "yes" ]]; then
   fi
 fi
 
-# ---------------------------------------------------------------- the OpenGL arm, optionally
+# ---------------------------------------------------------------- the GL link probe
 #
-# ⚠ THIS IS A GATE, NOT A PRODUCT. Nothing on the console uses OpenGL yet; what this arm protects is the
-# fact that the SAME meson tree has to answer two very different questions - "Vulkan only, no gallium" and
-# "gallium + EGL + GLES on a platform with no DRM and no dynamic loader" - and the second one exercises
-# code paths the first never reaches. Four of them broke the moment they were first compiled:
+# ⚠ THE SECOND PROBE EXISTS BECAUSE THE SECOND LINK IS A DIFFERENT LINK. linkprobe.sh links one archive;
+# a GL title links four that reference each other in both directions, and it is where the two mistakes
+# below were found - both on binaries an earlier version of this probe had passed:
 #
-#   meson.build             with_dri is gated on KMS/DRM, with kgsl and darwin as the two zink-without-DRM
-#                           exceptions. Orbis is the third. Without it: "EGL requires DRI, Haiku, Windows
-#                           or Android".
-#   frontends/dri           dri2.c was compiled only for with_dri2, which every previous with_dri build
-#                           also had. It holds dri_create_image, dri_interop_*, dri_set_damage_region and
-#                           nine more that the whole frontend calls unconditionally.
-#   the three GL targets    libgallium_dri, libEGL and libGLESv2 were hard shared_library(). There is no
-#                           dlopen on this console and the link line is an executable's, so a .so link
-#                           dies on an undefined `main` - or, here, on 60 duplicate symbols between
-#                           libc.a's C11 threads and Mesa's.
-#   util/futex.h            the SDK's libc++ __config_site does `#undef __FreeBSD__`, so C and C++ in the
-#                           SAME BUILD disagreed about UTIL_FUTEX_SUPPORTED - which changes the size of
-#                           simple_mtx_t and struct util_queue_fence. That one is an ABI split, and it was
-#                           only ever going to be found by a build with enough C++ in it to trip over.
+#   * Mesa's dispatch tables reference their entry points WEAKLY, and a weak undefined reference does not
+#     extract an archive member - it resolves to zero. Without --whole-archive on the ICD the executable
+#     linked with `U vk_common_GetPhysicalDeviceProperties2` still undefined and jumped to address 0 on
+#     the first dispatch.
+#   * .tdata.* is an orphan section under the SDK's own link.x, which cost the RW segment its page
+#     alignment and made the console refuse the file outright. Both probes now use orbis-compat's
+#     corrected script, which is what every title links with.
 #
-# It builds and it LINKS; it does not run. See ps4-mesa-docs for what is still missing at runtime
-# (zink's util_dl_open of libvulkan.so.1, kopper's per-platform surface arms, and an EGL platform that is
-# not 'surfaceless').
-if [[ "${GL}" == "yes" ]]; then
-  echo
-  echo "== configure (orbis, gallium + EGL + GLES2 via zink)"
-  cd "${TREE}"
-  GL_SETUP=()
-  [[ -d build-orbis-gl ]] && GL_SETUP=(--reconfigure)
-  # Deliberately NOT COMMON_OPTS: that array is the Vulkan-only answer, and half of this arm's value is
-  # that the two option sets are written out separately and can be compared.
-  # -Dgallium-drivers=zink needs no meson change - the empty orbis default sits inside the 'auto' branch.
-  # -Dgles1=disabled because GLESv1 wants the fixed-function state tracker for no benefit here.
-  nix develop nixpkgs#mesa --command env PKG_CONFIG_PATH= PKG_CONFIG_LIBDIR="${CROSS}/lib/pkgconfig" \
-    meson setup build-orbis-gl "${GL_SETUP[@]}" --cross-file "${CROSS}/orbis.ini" \
-    -Ddefault_library=static -Dwrap_mode=nodownload \
-    -Dzstd=disabled -Dvalgrind=disabled -Dlmsensors=disabled -Dlibunwind=disabled \
-    -Dvulkan-drivers=amd -Dgallium-drivers=zink \
-    -Dopengl=true -Dgles1=disabled -Dgles2=enabled \
-    -Degl=enabled -Dglx=disabled -Dgbm=disabled -Dglvnd=disabled \
-    -Dllvm=disabled -Dvideo-codecs= -Dbuildtype=release \
-    "${ORBIS_OPTS[@]}"
-
-  echo "== build (orbis, gallium)"
-  GLLOG="${WORK}/build-orbis-gl.log"
-  nix develop nixpkgs#mesa --command ninja -C build-orbis-gl -k 0 2>&1 | tee "${GLLOG}" || true
-  echo
-  echo "== orbis gallium result"
-  echo "   failed targets: $(grep -c '^FAILED:' "${GLLOG}" || true)"
-  echo "   compile errors: $(grep -cE '[.](c|cc|cpp|h|hpp):[0-9]+:[0-9]+: (fatal )?error:' "${GLLOG}" || true)"
-  grep -q '^FAILED:' "${GLLOG}" && die "the gallium arm did not build - see ${GLLOG}"
-
-  # ⚠ THE LINK IS THE POINT. The Vulkan arm learned this the expensive way (21 undefined symbols behind a
-  # configure that reported success); the GL arm has four archives instead of one and so has four times
-  # the surface for the same mistake.
+# So this probe links exactly the way a title links. That is its whole job: to fail when a title would.
+if [[ -f build-orbis/src/egl/libEGL.a ]]; then
   echo
   echo "== GL link probe (a PS4 executable against EGL + GLESv2 + gallium + RADV)"
-  "${ROOT}/tools/gllinkprobe.sh" "${TREE}/build-orbis-gl" "${SDK}" || \
+  "${ROOT}/tools/gllinkprobe.sh" "${TREE}/build-orbis" "${SDK}" || \
     die "GL LINK PROBE FAILED - the archives are not self-contained; read the undefined symbols above"
+else
+  die "no build-orbis/src/egl/libEGL.a - the GL half of the product did not build"
 fi
 
 # ---------------------------------------------------------------- the regression gate
