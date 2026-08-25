@@ -143,11 +143,13 @@ echo "   uncommitted: ${DIRTY_N} path(s)"
 # the gallium archives simply go unreferenced.
 #
 # -Dgallium-drivers=zink needs no meson change: the empty orbis default sits inside the 'auto' branch.
-# -Dgles1=disabled because GLESv1 wants the fixed-function state tracker for no benefit here.
+# -Dgles1=enabled: it costs the fixed-function state tracker and 70 KiB of entry points, and a
+# meaningful number of libretro cores still speak GLES1. Measured before adding it - configures and
+# builds for this target with no meson change at all.
 COMMON_OPTS=(
   -Dvulkan-drivers=amd
   -Dgallium-drivers=zink
-  -Dopengl=true -Dgles1=disabled -Dgles2=enabled
+  -Dopengl=true -Dgles1=enabled -Dgles2=enabled
   -Degl=enabled -Dglx=disabled -Dgbm=disabled -Dglvnd=disabled
   -Dvideo-codecs=
   -Dllvm=disabled

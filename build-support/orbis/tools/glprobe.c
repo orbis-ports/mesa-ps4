@@ -21,6 +21,7 @@
  */
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
+#include <GLES/gl.h>
 #include <stdio.h>
 
 int main(void)
@@ -77,6 +78,21 @@ int main(void)
    eglSwapInterval(dpy, 1);
    if (!eglSwapBuffers(dpy, surf))
       return 7;
+
+   /* ⚠ THE ES1 CALLS ARE HERE TO BE LINKED, NOT TO BE RUN, AND THE ARCHIVE WAS LISTED WITHOUT THEM
+    * FOR ONE BUILD. libGLESv1_CM.a sits inside --start-group, so the linker pulls only the members
+    * something references; with nothing in this file naming an ES1 entry point, the archive was on
+    * the line and never opened, and the probe proved exactly nothing about it. A gate that names a
+    * library it does not exercise is worse than one that does not mention it - it reads as coverage.
+    *
+    * Guarded on the current API so a run of this probe cannot end up calling fixed-function entry
+    * points against an ES2 context; the link is what matters and it happens either way. */
+   if (eglQueryAPI() == EGL_OPENGL_ES_API) {
+      glAlphaFunc(GL_GREATER, 0.0f);
+      glLoadIdentity();
+      glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
+      glOrthof(-1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f);
+   }
 
    eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
    eglDestroyContext(dpy, ctx);

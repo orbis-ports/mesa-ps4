@@ -44,6 +44,7 @@ die() { echo "glrun: $*" >&2; exit 2; }
 
 GALLIUM="$(echo "${BUILD}"/src/gallium/targets/dri/libgallium-*.a)"
 for a in "${BUILD}/src/egl/libEGL.a" "${BUILD}/src/mesa/glapi/es2api/libGLESv2.a" \
+      "${BUILD}/src/mesa/glapi/es1api/libGLESv1_CM.a" \
          "${GALLIUM}" "${BUILD}/src/amd/vulkan/libvulkan_radeon.a"; do
   [[ -f "${a}" ]] || die "no ${a} - run ps4/build.sh --gl first"
 done
@@ -130,6 +131,7 @@ clang --target=x86_64-pc-freebsd12-elf --sysroot="${SDK}" \
       -Wl,--start-group \
       "${BUILD}/src/egl/libEGL.a" \
       "${BUILD}/src/mesa/glapi/es2api/libGLESv2.a" \
+      "${BUILD}/src/mesa/glapi/es1api/libGLESv1_CM.a" \
       "${GALLIUM}" \
       -Wl,--whole-archive "${BUILD}/src/amd/vulkan/libvulkan_radeon.a" -Wl,--no-whole-archive \
       -Wl,--end-group \
