@@ -85,6 +85,17 @@
 #include "glsl_parser_extras.h"
 #include "program/prog_instruction.h"
 #include <math.h>
+/* The OpenOrbis (PS4) SDK's <math.h> defines _isnan() and _isinf() as function-like macros. The
+ * BA1()/FDHF130() families below name every builtin by pasting an underscore onto it - `isnan`
+ * becomes `_isnan` - so those two expand as libc macros and the file stops with "too many
+ * arguments provided to function-like macro invocation". Nothing here wants libc's classifiers;
+ * the leading underscore is this file's own naming convention for its generator functions.
+ *
+ * Unconditional and after <math.h>, because a macro in the implementation's reserved namespace is
+ * the implementation's to define and any libc is free to add these two tomorrow.
+ */
+#undef _isnan
+#undef _isinf
 #include "builtin_functions.h"
 #include "util/hash_table.h"
 

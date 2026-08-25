@@ -38,7 +38,15 @@
 #if DETECT_OS_WINDOWS
 #include <windows.h>
 #endif
-#if DETECT_OS_BSD
+/* HUD_CPU_BSD rather than DETECT_OS_BSD: what this arm needs is not "a BSD kernel" but a BSD
+ * LIBC that declares CPUSTATES/CP_USER and answers the kern.cp_time sysctl. The PS4 sets
+ * DETECT_OS_BSD (its kernel is one) with no flavour macro and has neither, so it takes the
+ * generic arm below - which fails to open /proc/stat and reports no CPU load, the same outcome
+ * as any other system without one.
+ */
+#define HUD_CPU_BSD (DETECT_OS_FREEBSD || DETECT_OS_NETBSD || DETECT_OS_OPENBSD || DETECT_OS_DRAGONFLY)
+
+#if HUD_CPU_BSD
 #include <sys/types.h>
 #include <sys/sysctl.h>
 #if DETECT_OS_NETBSD || DETECT_OS_OPENBSD
@@ -95,7 +103,7 @@ get_cpu_stats(unsigned cpu_index, uint64_t *busy_time, uint64_t *total_time)
    return true;
 }
 
-#elif DETECT_OS_BSD
+#elif HUD_CPU_BSD
 
 static bool
 get_cpu_stats(unsigned cpu_index, uint64_t *busy_time, uint64_t *total_time)
