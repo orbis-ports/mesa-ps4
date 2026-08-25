@@ -2,6 +2,7 @@
 # Cross-build Mesa's RADV for the PS4 (OpenOrbis).
 #
 #   build-support/orbis/build.sh [--sdk <openorbis>] [--work <dir>] [--host-too] [--host-orbis]
+#                               [--gl] [--regress] [--mingw]
 #
 # The scaffolding used to be a separate repo (orbis-mesa) beside a driver fork. It is one tree now: this
 # script builds the checkout it lives in, so there is no --mesa argument and no way to point it at the
@@ -18,6 +19,9 @@ SDK="${OO_PS4_TOOLCHAIN:-${HOME}/.local/opt/openorbis}"
 WORK="${HOME}/.cache/orbis-mesa"
 HOST_TOO=no
 HOST_ORBIS=no
+GL=no
+REGRESS=no
+MINGW=no
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -25,6 +29,9 @@ while [[ $# -gt 0 ]]; do
     --work) WORK="$2"; shift 2 ;;
     --host-too) HOST_TOO=yes; shift ;;
     --host-orbis) HOST_ORBIS=yes; shift ;;
+    --gl) GL=yes; shift ;;
+    --regress) REGRESS=yes; shift ;;
+    --mingw) MINGW=yes; shift ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -70,6 +77,30 @@ mkdir -p "${CROSS}/lib/pkgconfig"
 echo "== meson cross file"
 sed -e "s|@OO_PS4_TOOLCHAIN@|${SDK}|g" -e "s|@ORBIS_CROSS@|${CROSS}|g" -e "s|@ORBIS_COMPAT@|${ORBIS_COMPAT}|g" \
     "${ORBIS_COMPAT}/cmake/orbis.ini.in" > "${CROSS}/orbis.ini"
+
+# ⚠ THE LIBRARY HALF OF orbis-compat IS NOW IN THE TEMPLATE, AND THIS BLOCK ONLY CHECKS THAT IT IS.
+#
+# It used to inject it here with sed, under a comment saying its permanent home was
+# orbis-compat/cmake/orbis.ini.in and that whoever moved it should delete this block. It has been moved;
+# this is the deletion, minus the two assertions, which are worth keeping for the reason below.
+#
+# meson decides HAVE_SYSCONF with cc.has_function('sysconf'), which is a LINK test. orbis-compat's
+# <unistd.h> makes sysconf a macro for orbis_sysconf (so that _SC_NPROCESSORS_ONLN can answer six rather
+# than the one musl reports on this console), and orbis_sysconf lives in liborbis-compat.a. With only the
+# overlay's include path on the line, that test links against a declaration whose definition is nowhere:
+#
+#     ld.lld: error: undefined symbol: orbis_sysconf
+#     Checking for function "sysconf" : NO
+#
+# HAVE_SYSCONF then goes unset, and util/os_misc.c - which every build in this tree compiles - falls
+# through its BSD chain into `#error Unsupported *BSD` and `#error unexpected platform in os_sysinfo.c`.
+# The failure names a *BSD problem and is really a missing -l, three hundred files from the cause. That
+# is why this is checked here rather than left to be discovered: the overlay is a build-time dependency
+# of the CONFIGURE CHECKS, not just of the title, and nothing else in this script would say so.
+[[ -f "${ORBIS_COMPAT}/build/liborbis-compat.a" ]] || die \
+  "no ${ORBIS_COMPAT}/build/liborbis-compat.a - build orbis-compat before Mesa (it is a link-time dependency of the configure checks, not just of the title)"
+grep -q -- "-lorbis-compat" "${CROSS}/orbis.ini" || die \
+  "the generated cross file has no -lorbis-compat - orbis-compat/cmake/orbis.ini.in has lost the library half of the overlay again; see the comment above for what that breaks and how it presents"
 
 # ---------------------------------------------------------------- which driver is this
 #
@@ -172,6 +203,13 @@ nix develop nixpkgs#mesa --command env PKG_CONFIG_PATH= PKG_CONFIG_LIBDIR="${CRO
 
 # Only now, with a configured directory to go with it. set -e means a failed setup never reaches this.
 echo "${CROSS_SHA}" > "${CROSS_STAMP}"
+
+# ⚠ ASKED OF THE LOG, NOT ASSUMED FROM THE EXIT STATUS. meson reports success for a configure in which
+# every link-based probe failed, and the one that matters here is sysconf: see the cross-file note above
+# for why a missing -lorbis-compat turns into "#error Unsupported *BSD" three hundred files later. This
+# is two seconds and it names the cause instead of the symptom.
+grep -q 'Checking for function "sysconf" : YES' "${TREE}/build-orbis/meson-logs/meson-log.txt" || die \
+  "configure did not find sysconf - HAVE_SYSCONF will be unset and util/os_misc.c will fail with '#error Unsupported *BSD'. Check that ${ORBIS_COMPAT}/build/liborbis-compat.a is current."
 
 echo "== build (orbis)"
 # -k 0 rather than stopping at the first error: the whole error list is the work list, and one error at
@@ -341,10 +379,234 @@ if [[ "${HOST_ORBIS}" == "yes" ]]; then
   echo "== one swapchain present, all the way to the flip"
   probe "the present probe" "${WORK}/presentprobe"
 
+  # ⚠ AND THE TWO PATHS A SUCCESSFUL PRESENT NEVER TOUCHES. Both are error handling in
+  # wsi_common_headless.c, both were wrong for the whole life of this port, both were found by reading
+  # and fixed without a test - and the Vulkan CTS marks WSI NotSupported on this target, so nothing else
+  # in the world was ever going to run them.
+  #
+  # --images 3 is not a detail. With four images the WSI registers the swapchain's OWN images with
+  # video-out and a present copies nothing, so a present that reads a freed image reads it with a pointer
+  # nobody dereferences and the run is quiet. Three images puts the copy back, and then the teardown
+  # really does memcpy 8100 KiB out of the image - which is what the destroy used to do AFTER freeing it.
+  echo
+  echo "== a swapchain destroyed with a frame still owed to the display, 8 times"
+  probe "the create/destroy probe" "${WORK}/presentprobe" --create-destroy 8 --images 3
+
+  echo
+  echo "== presents whose flips fail - does vkAcquireNextImageKHR starve?"
+  probe "the starvation probe" env ORBIS_WSI_FAIL_FLIP=1 "${WORK}/presentprobe" --starve 40
+
+  # A poll and an expired wait are different answers, and this WSI gave the same one for both. The layer
+  # about to sit on this acquire (zink/kopper) reads the difference, and reads VK_NOT_READY from a wait
+  # as a swapchain that has stopped working.
+  echo
+  echo "== what an empty swapchain says: VK_NOT_READY to a poll, VK_TIMEOUT to an expired wait"
+  probe "the acquire-timeout probe" "${WORK}/presentprobe" --acquire-timeout
+
+
   echo
   if [[ "${HOSTORBIS_PROBE_FAILED}" == "yes" ]]; then
     echo "== host-orbis result: a probe did NOT exit cleanly - see the !! lines above"
   else
     echo "== host-orbis result: every probe exited cleanly"
   fi
+fi
+
+# ---------------------------------------------------------------- the OpenGL arm, optionally
+#
+# ⚠ THIS IS A GATE, NOT A PRODUCT. Nothing on the console uses OpenGL yet; what this arm protects is the
+# fact that the SAME meson tree has to answer two very different questions - "Vulkan only, no gallium" and
+# "gallium + EGL + GLES on a platform with no DRM and no dynamic loader" - and the second one exercises
+# code paths the first never reaches. Four of them broke the moment they were first compiled:
+#
+#   meson.build             with_dri is gated on KMS/DRM, with kgsl and darwin as the two zink-without-DRM
+#                           exceptions. Orbis is the third. Without it: "EGL requires DRI, Haiku, Windows
+#                           or Android".
+#   frontends/dri           dri2.c was compiled only for with_dri2, which every previous with_dri build
+#                           also had. It holds dri_create_image, dri_interop_*, dri_set_damage_region and
+#                           nine more that the whole frontend calls unconditionally.
+#   the three GL targets    libgallium_dri, libEGL and libGLESv2 were hard shared_library(). There is no
+#                           dlopen on this console and the link line is an executable's, so a .so link
+#                           dies on an undefined `main` - or, here, on 60 duplicate symbols between
+#                           libc.a's C11 threads and Mesa's.
+#   util/futex.h            the SDK's libc++ __config_site does `#undef __FreeBSD__`, so C and C++ in the
+#                           SAME BUILD disagreed about UTIL_FUTEX_SUPPORTED - which changes the size of
+#                           simple_mtx_t and struct util_queue_fence. That one is an ABI split, and it was
+#                           only ever going to be found by a build with enough C++ in it to trip over.
+#
+# It builds and it LINKS; it does not run. See ps4-mesa-docs for what is still missing at runtime
+# (zink's util_dl_open of libvulkan.so.1, kopper's per-platform surface arms, and an EGL platform that is
+# not 'surfaceless').
+if [[ "${GL}" == "yes" ]]; then
+  echo
+  echo "== configure (orbis, gallium + EGL + GLES2 via zink)"
+  cd "${TREE}"
+  GL_SETUP=()
+  [[ -d build-orbis-gl ]] && GL_SETUP=(--reconfigure)
+  # Deliberately NOT COMMON_OPTS: that array is the Vulkan-only answer, and half of this arm's value is
+  # that the two option sets are written out separately and can be compared.
+  # -Dgallium-drivers=zink needs no meson change - the empty orbis default sits inside the 'auto' branch.
+  # -Dgles1=disabled because GLESv1 wants the fixed-function state tracker for no benefit here.
+  nix develop nixpkgs#mesa --command env PKG_CONFIG_PATH= PKG_CONFIG_LIBDIR="${CROSS}/lib/pkgconfig" \
+    meson setup build-orbis-gl "${GL_SETUP[@]}" --cross-file "${CROSS}/orbis.ini" \
+    -Ddefault_library=static -Dwrap_mode=nodownload \
+    -Dzstd=disabled -Dvalgrind=disabled -Dlmsensors=disabled -Dlibunwind=disabled \
+    -Dvulkan-drivers=amd -Dgallium-drivers=zink \
+    -Dopengl=true -Dgles1=disabled -Dgles2=enabled \
+    -Degl=enabled -Dglx=disabled -Dgbm=disabled -Dglvnd=disabled \
+    -Dllvm=disabled -Dvideo-codecs= -Dbuildtype=release \
+    "${ORBIS_OPTS[@]}"
+
+  echo "== build (orbis, gallium)"
+  GLLOG="${WORK}/build-orbis-gl.log"
+  nix develop nixpkgs#mesa --command ninja -C build-orbis-gl -k 0 2>&1 | tee "${GLLOG}" || true
+  echo
+  echo "== orbis gallium result"
+  echo "   failed targets: $(grep -c '^FAILED:' "${GLLOG}" || true)"
+  echo "   compile errors: $(grep -cE '[.](c|cc|cpp|h|hpp):[0-9]+:[0-9]+: (fatal )?error:' "${GLLOG}" || true)"
+  grep -q '^FAILED:' "${GLLOG}" && die "the gallium arm did not build - see ${GLLOG}"
+
+  # ⚠ THE LINK IS THE POINT. The Vulkan arm learned this the expensive way (21 undefined symbols behind a
+  # configure that reported success); the GL arm has four archives instead of one and so has four times
+  # the surface for the same mistake.
+  echo
+  echo "== GL link probe (a PS4 executable against EGL + GLESv2 + gallium + RADV)"
+  "${ROOT}/tools/gllinkprobe.sh" "${TREE}/build-orbis-gl" "${SDK}" || \
+    die "GL LINK PROBE FAILED - the archives are not self-contained; read the undefined symbols above"
+fi
+
+# ---------------------------------------------------------------- the regression gate
+#
+# ⚠ EVERY MESON EDIT FOR THIS PORT TOUCHES A SHARED TREE, AND THREE BUILD BREAKS HAVE ALREADY REACHED
+# review that way: changes made for the console that broke ordinary builds nobody on this project
+# compiles. meson.build, src/egl/meson.build, src/gallium/targets/dri/meson.build and the two glapi
+# entry-point libraries are all read by every Mesa configuration in the world; a with_platform_orbis
+# guard that is subtly wrong is invisible here and obvious to anyone else.
+#
+# Two configurations, because they fail differently:
+#
+#   linux, gallium+zink+EGL   the one that shares code with the console arm. It is built TWICE, with and
+#                             without glvnd, because -Dglvnd=enabled skips src/mesa/glapi/es1api and
+#                             es2api entirely (src/meson.build gates those on `not with_glvnd`) - so the
+#                             glvnd build cannot see a mistake in either of them, and nix's devShell
+#                             detects glvnd by default.
+#   linux, Vulkan only        the existing build-host configuration, which is what --host-too builds and
+#                             what the development loop runs against the drm-shim.
+#
+# Deliberately -Dplatforms= : the point is the shared meson logic, not X11 or wayland, and requiring
+# those makes the gate depend on what the devShell happens to carry.
+if [[ "${REGRESS}" == "yes" ]]; then
+  echo
+  echo "== regression gate: plain Linux, gallium + zink + EGL (glvnd as detected)"
+  cd "${TREE}"
+  REG_SETUP=()
+  [[ -d build-regress-gl ]] && REG_SETUP=(--reconfigure)
+  nix develop nixpkgs#mesa --command meson setup build-regress-gl "${REG_SETUP[@]}" \
+    -Dplatforms= -Dvulkan-drivers=amd -Dgallium-drivers=zink \
+    -Dopengl=true -Dgles1=enabled -Dgles2=enabled -Degl=enabled -Dglx=disabled -Dgbm=disabled \
+    -Dllvm=disabled -Dvideo-codecs= -Dbuildtype=release
+  nix develop nixpkgs#mesa --command ninja -C build-regress-gl \
+    || die "the plain-Linux gallium build is broken - an orbis change reached a shared meson file"
+
+  echo
+  echo "== regression gate: the same, with -Dglvnd=disabled (this is what builds es1api/es2api)"
+  nix develop nixpkgs#mesa --command meson setup build-regress-gl --reconfigure \
+    -Dplatforms= -Dvulkan-drivers=amd -Dgallium-drivers=zink \
+    -Dopengl=true -Dgles1=enabled -Dgles2=enabled -Degl=enabled -Dglx=disabled -Dgbm=disabled \
+    -Dglvnd=disabled -Dllvm=disabled -Dvideo-codecs= -Dbuildtype=release
+  nix develop nixpkgs#mesa --command ninja -C build-regress-gl \
+    || die "the plain-Linux gallium build without glvnd is broken - check src/mesa/glapi/es{1,2}api and src/egl"
+
+  echo
+  echo "== regression gate: plain Linux, Vulkan only (the build-host configuration)"
+  REG_VK_SETUP=()
+  [[ -d build-regress-vk ]] && REG_VK_SETUP=(--reconfigure)
+  nix develop nixpkgs#mesa --command meson setup build-regress-vk "${REG_VK_SETUP[@]}" -Dtools=drm-shim \
+    "${COMMON_OPTS[@]}" "${HOST_OPTS[@]}"
+  nix develop nixpkgs#mesa --command ninja -C build-regress-vk \
+    || die "the plain-Linux Vulkan-only build is broken - this is the configuration --host-too uses"
+
+  echo "   both plain-Linux configurations build."
+fi
+
+# ---------------------------------------------------------------- the Windows arm
+#
+# ⚠ NOTHING IN THIS PROJECT SHIPS FOR WINDOWS, WHICH IS EXACTLY WHY THIS EXISTS. RADV carries #ifdef
+# _WIN32 arms that this port has had to edit - radv_physical_device.c's device-creation path and
+# ac_gpu_info.c's sync-provider probe both grew a Windows case while being changed for Orbis - and a
+# review found a defect in one of them that no build in this repository could have caught. It was
+# "fixed" once already without ever being compiled; the second attempt did not compile either
+# (`struct radeon_winsys_info winsys_info;` is an incomplete type on Windows, because the header that
+# defines it is excluded there). Five minutes of mingw is cheaper than that loop.
+#
+# mingw rather than MSVC because it runs on this machine. Upstream's Windows CI is clang-cl and there are
+# differences - see the -mbmi note below - but the PREPROCESSOR arms are what this gate is about, and
+# those are the same either way.
+if [[ "${MINGW}" == "yes" ]]; then
+  echo
+  echo "== windows arm: mingw-w64 cross build of RADV"
+  # ⚠ grep -v '-man$', AND IT IS NOT COSMETIC. `nix build --print-out-paths` prints EVERY output of the
+  # derivation, one per line and not in a documented order; the gcc wrapper has two, and a plain
+  # `head -1` picked the -man one. meson then reported "Unknown compiler(s)" about a path that exists,
+  # which reads like a broken toolchain and is a broken shell pipeline.
+  MINGW_PREFIX="$(nix build --no-link --print-out-paths 'nixpkgs#pkgsCross.mingwW64.buildPackages.gcc' | grep -v -- '-man$' | head -1)"
+  [[ -x "${MINGW_PREFIX}/bin/x86_64-w64-mingw32-gcc" ]] || die \
+    "no mingw gcc under ${MINGW_PREFIX} - nixpkgs' output layout for pkgsCross.mingwW64 has changed"
+  # ⚠ THREE NIX PATHS, AND ALL THREE ARE NEEDED. Outside its own stdenv the mingw gcc wrapper gets none
+  # of the flags nixpkgs would normally hand it, so:
+  #   mcfgthreads      gcc 15's default threading model here. Without its lib, EVERY link probe meson
+  #                    runs fails on "cannot find -lmcfgthread" and configure dies on -latomic; without
+  #                    its headers, every C++ file fails on <mcfgthread/gthr.h>.
+  #   directx-headers  src/vulkan/wsi/wsi_common_win32.cpp includes directx/d3d12.h.
+  MCF="$(nix build --no-link --print-out-paths 'nixpkgs#pkgsCross.mingwW64.windows.mcfgthreads' | grep -v -- '-dev$' | head -1)"
+  MCF_DEV="$(nix build --no-link --print-out-paths 'nixpkgs#pkgsCross.mingwW64.windows.mcfgthreads.dev' | head -1)"
+  DXH="$(nix build --no-link --print-out-paths 'nixpkgs#pkgsCross.mingwW64.directx-headers' | head -1)"
+  [[ -f "${MCF}/lib/libmcfgthread.a" && -f "${MCF_DEV}/include/mcfgthread/gthr.h" && -f "${DXH}/include/directx/d3d12.h" ]] || die \
+    "mingw support libraries not where expected (mcfgthread lib/headers, directx-headers) - see the paths above"
+
+  MINGW_INI="${WORK}/mingw.ini"
+  mkdir -p "${WORK}"
+  # ⚠ -mbmi/-mbmi2/-mlzcnt IS A GCC-ONLY WORKAROUND AND NOT A MESA BUG. addrlib's addrcommon.h calls
+  # ::_tzcnt_u32 unguarded; clang-cl accepts that, gcc refuses to inline an always_inline intrinsic
+  # whose target feature is off ("target specific option mismatch"). Upstream builds this file with
+  # clang, so the flag belongs to this cross file rather than to the tree.
+  cat > "${MINGW_INI}" <<INI
+[binaries]
+c = '${MINGW_PREFIX}/bin/x86_64-w64-mingw32-gcc'
+cpp = '${MINGW_PREFIX}/bin/x86_64-w64-mingw32-g++'
+ar = '${MINGW_PREFIX}/bin/x86_64-w64-mingw32-ar'
+strip = '${MINGW_PREFIX}/bin/x86_64-w64-mingw32-strip'
+windres = '${MINGW_PREFIX}/bin/x86_64-w64-mingw32-windres'
+pkg-config = 'false'
+cmake = 'false'
+
+[host_machine]
+system = 'windows'
+cpu_family = 'x86_64'
+cpu = 'x86_64'
+endian = 'little'
+
+[built-in options]
+c_args = ['-I${MCF_DEV}/include','-I${DXH}/include']
+cpp_args = ['-mbmi','-mbmi2','-mlzcnt','-I${MCF_DEV}/include','-I${DXH}/include']
+c_link_args = ['-L${MCF}/lib']
+cpp_link_args = ['-L${MCF}/lib']
+
+[properties]
+needs_exe_wrapper = true
+INI
+
+  cd "${TREE}"
+  # No --reconfigure arm: cross-file [built-in options] are read on the FIRST setup only, so a changed
+  # mingw.ini silently does nothing on a reconfigure. This directory is cheap; wipe it.
+  rm -rf build-mingw
+  nix develop nixpkgs#mesa --command env PKG_CONFIG_PATH= PKG_CONFIG_LIBDIR="${CROSS}/lib/pkgconfig" \
+    meson setup build-mingw --cross-file "${MINGW_INI}" \
+    -Dvulkan-drivers=amd -Dgallium-drivers= -Dplatforms=windows \
+    -Dopengl=false -Dgles1=disabled -Dgles2=disabled -Degl=disabled -Dglx=disabled -Dgbm=disabled \
+    -Dllvm=disabled -Dvideo-codecs= -Dzstd=disabled -Dzlib=disabled -Dshader-cache=disabled \
+    -Dwrap_mode=nodownload -Dbuildtype=release
+  nix develop nixpkgs#mesa --command ninja -C build-mingw \
+    || die "the Windows arm does not build - this is the gap that let a never-compiled _WIN32 fix ship twice"
+  echo "   vulkan_radeon.dll: $(stat -c%s build-mingw/src/amd/vulkan/vulkan_radeon.dll) bytes"
 fi

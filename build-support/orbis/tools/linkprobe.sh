@@ -16,6 +16,16 @@ SDK="${2:?usage: linkprobe.sh <build-dir> <sdk> [out]}"
 OUT="${3:-${BUILD}/linkprobe.elf}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+# ⚠ liborbis-compat.a IS PART OF THE LINK LINE NOW, and leaving it out did not merely weaken this probe -
+# it made the probe disagree with the build. orbis-compat's <unistd.h> does `#define sysconf orbis_sysconf`
+# and puts orbis_sysconf in this archive, so util/os_misc.c now emits a call to it; without the archive the
+# probe stops on "undefined symbol: orbis_sysconf" for an object that is perfectly correct. Every title
+# that links this driver links orbis-compat too - the overlay is not optional - so the probe's link line
+# has to look like a title's.
+ORBIS_COMPAT="${ORBIS_COMPAT_DIR:-${HOME}/src-ps4/orbis-compat}"
+[[ -f "${ORBIS_COMPAT}/build/liborbis-compat.a" ]] || {
+  echo "linkprobe: no ${ORBIS_COMPAT}/build/liborbis-compat.a - build orbis-compat first" >&2; exit 2; }
+
 A="${BUILD}/src/amd/vulkan/libvulkan_radeon.a"
 [[ -f "${A}" ]] || { echo "linkprobe: no ${A}" >&2; exit 2; }
 
@@ -38,10 +48,11 @@ clang --target=x86_64-pc-freebsd12-elf --sysroot="${SDK}" -fPIC \
 # of the flags become a separate no-op - which briefly made the archive look like it had lost sceGnm* symbols.
 clang --target=x86_64-pc-freebsd12-elf --sysroot="${SDK}" \
       -nostdlib -fuse-ld=lld -pie -Wl,-m,elf_x86_64 \
-      -Wl,--script="${SDK}/link.x" -Wl,--eh-frame-hdr -Wl,--no-rosegment \
+      -Wl,--script="${ORBIS_COMPAT}/cmake/orbis-tls.ld" -Wl,--eh-frame-hdr -Wl,--no-rosegment \
       -Wl,--error-limit=0 \
       "${BUILD}/linkprobe.o" \
       -Wl,--whole-archive "${A}" -Wl,--no-whole-archive \
+      -L"${ORBIS_COMPAT}/build" -lorbis-compat \
       -L"${SDK}/lib" -lc -lkernel -lc++ -lSceGnmDriver -lSceVideoOut "${SDK}/lib/crt1.o" \
       -o "${OUT}"
 
