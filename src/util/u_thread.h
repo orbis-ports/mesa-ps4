@@ -45,9 +45,25 @@
  * still want to use normal TLS (which involves a function call, but not the
  * expensive pthread_getspecific() or its equivalent).
  */
-#if DETECT_OS_APPLE
+#if DETECT_OS_APPLE || defined(__PS4__) || defined(__ORBIS__)
 /* Apple Clang emits wrappers when using thread_local that break module linkage,
  * but not with __thread
+ *
+ * ⚠ THE PS4 IS HERE FOR THE SAME REASON AND IT COST A CONSOLE ROUND TRIP TO FIND. An `extern
+ * thread_local` forces the C++ compiler to emit a reference to the variable's TLS-init wrapper -
+ * `_ZTH23_mesa_glapi_tls_Context` for the glapi context - because it cannot prove the definition has
+ * no dynamic initialiser. The definition is in C (glapi/shared-glapi/core.c), so no wrapper is ever
+ * emitted, and the reference stays a WEAK UNDEF. Every hosted linker resolves that to zero and the
+ * standard `if (&wrapper) wrapper();` guard skips the call, which is why this is invisible everywhere
+ * else. The PS4's SELF builder is not a hosted linker: create-fself walks the dynamic symbol table and
+ * refuses anything it cannot map to a module, weak or not -
+ *
+ *     Failed to build FSELF: missing library for symbol (_ZTH23_mesa_glapi_tls_Context)
+ *
+ * - and the package it does not build cannot be diagnosed from the console, which reports only
+ * "Cannot start the application". Two C++ files in the GL frontend trip it (main_shader_query.cpp and
+ * main_uniform_query.cpp, both via GET_CURRENT_CONTEXT). `__thread` has no wrapper and no dynamic
+ * initialisation to sequence, so the whole mechanism disappears.
  */
 #define __THREAD_INITIAL_EXEC __thread
 #elif defined(__GLIBC__)

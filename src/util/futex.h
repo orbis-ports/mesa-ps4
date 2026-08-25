@@ -29,7 +29,24 @@
 #else
 #if defined(HAVE_LINUX_FUTEX_H) && defined(__linux__)
 #define UTIL_FUTEX_SUPPORTED 1
-#elif defined(__FreeBSD__)
+/* ⚠ __PS4__/__ORBIS__ IS NOT REDUNDANT BESIDE __FreeBSD__, AND LEAVING IT OUT SPLITS THE ABI.
+ *
+ * The PS4 kernel is FreeBSD and clang defines __FreeBSD__ 12 for its triple, so the C half of this
+ * tree takes the arm below and gets UTIL_FUTEX_SUPPORTED 1. The C++ half does not: the OpenOrbis
+ * SDK's libc++ __config_site does `#undef __FreeBSD__` (it pairs libc++ with a musl libc and does
+ * not want FreeBSD's arms), so any .cpp that reaches a libc++ header before this one - which is
+ * every .cpp in Mesa, <stdint.h> is enough - sees UTIL_FUTEX_SUPPORTED 0.
+ *
+ * That is not a missing optimisation. simple_mtx_t is `{uint32_t}` in the futex build and
+ * `{util_once_flag; mtx_t}` in the other, and struct util_queue_fence changes with it, so every
+ * struct in the tree containing one has two different layouts and two different sizes depending on
+ * which compiler saw it. It surfaced as undefined references to simple_mtx_init,
+ * _simple_mtx_plain_init_once and util_queue_fence_init from zink_draw.cpp; the references are the
+ * lucky half of the symptom.
+ *
+ * __PS4__ and __ORBIS__ come from the cross file's command line, which no header can take away.
+ */
+#elif defined(__FreeBSD__) || defined(__PS4__) || defined(__ORBIS__)
 #define UTIL_FUTEX_SUPPORTED 1
 #elif defined(__OpenBSD__)
 #define UTIL_FUTEX_SUPPORTED 1
