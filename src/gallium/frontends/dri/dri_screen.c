@@ -80,6 +80,28 @@ dri_loader_get_cap(struct dri_screen *screen, enum dri_loader_cap cap)
        image_loader->getCapability)
       return image_loader->getCapability(screen->loaderPrivate, cap);
 
+#ifdef HAVE_ORBIS_PLATFORM
+   /* ⚠ WITHOUT THIS THERE ARE NO RGBA-ORDERED CONFIGS ON THE PS4, AND THE PICTURE COMES OUT WITH RED
+    * AND BLUE EXCHANGED. It cost a while to find, so here is the whole chain.
+    *
+    * dri_fill_in_modes() below skips every R-first 8888 format unless the loader reports
+    * DRI_LOADER_CAP_RGBA_ORDERING, and the ONLY way to report it is a __DRIimageLoaderExtension -
+    * which a kopper loader must not supply, because kopper_allocate_textures() takes the
+    * loader-image path whenever screen->image.loader is set and then never creates the swapchain
+    * images it exists to create. So the kopper platforms (x11 included) get BGRA configs only, which
+    * is right for X11 and wrong here: wsi_orbis registers the scan-out as A8B8G8R8_SRGB with a
+    * hardcoded attribute, presents by raw copy or flip, and has no validation, no fallback and no
+    * error return for a mismatched swapchain format. A B-first EGLConfig would simply look wrong.
+    *
+    * The console cannot answer this any other way - there is one loader, one platform and one
+    * scan-out format - so it is answered at build time rather than through a loader hook nobody else
+    * would have a use for. platform_orbis.c then exposes only the R8G8B8A8 configs this unlocks; the
+    * B-first ones dri_fill_in_modes() still generates never become EGLConfigs.
+    */
+   if (cap == DRI_LOADER_CAP_RGBA_ORDERING)
+      return 1;
+#endif
+
    return 0;
 }
 
