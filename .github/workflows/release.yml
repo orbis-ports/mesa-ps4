@@ -38,14 +38,14 @@ permissions:
   contents: read
 
 env:
-  OPENORBIS_SDK_TAG: v0.5.2
+  # v0.5.4, published 2026-01-04. The tree's own CHANGELOG stops at v0.5.2 (Dec 2021) -
+  # upstream stopped updating it, which is what made this look like a 2021 toolchain.
+  # Verified by content: create-fself and link.x from toolchain-llvm-18.tar.gz are
+  # byte-identical to the development machine's copy, the one this port is known to work
+  # with. Must stay in step with orbis-ports/RetroArch's orbis-toolchain action.
+  OPENORBIS_SDK_TAG: v0.5.4
   OPENORBIS_SDK_REPO: OpenOrbis/OpenOrbis-PS4-Toolchain
-  # TODO(verify): the SDK release asset name is NOT established - see the same note in
-  # orbis-ports/RetroArch .github/actions/orbis-toolchain/action.yml. The toolchain on the
-  # development machine has a CHANGELOG topping out at v0.5.2 (Dec 2021) but binaries dated
-  # 2025-02 and 2026-01, so the working copy is not that release asset and nothing on disk
-  # records where it came from.
-  OPENORBIS_SDK_ASSET: PS4Toolchain.tar.gz
+  OPENORBIS_SDK_ASSET: toolchain-llvm-18.tar.gz
   ORBIS_COMPAT_REF: ${{ github.event.inputs.orbis-compat-ref || '2460acbef8850fab0e525b58a6961d947c86fc3f' }}
 
 jobs:
