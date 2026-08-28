@@ -146,6 +146,23 @@ echo "   uncommitted: ${DIRTY_N} path(s)"
 # -Dgles1=enabled: it costs the fixed-function state tracker and 70 KiB of entry points, and a
 # meaningful number of libretro cores still speak GLES1. Measured before adding it - configures and
 # builds for this target with no meson change at all.
+#
+# ⚠ -Dxmlconfig=disabled BECAUSE THE BUILD MACHINE'S PATH ENDS UP INSIDE THE SHIPPED BINARY.
+# With xmlconfig on, src/util/xmlconfig.c:1375 does parseConfigDir(DATADIR "/drirc.d") - a path
+# baked in at configure time, belonging to whoever built the driver. Reported from a user running
+# this driver 2026-08-28:
+#
+#     open: Opening path /archive/menix/src/ps4-sdk/prefix/share/drirc.d failed, file does not exist
+#
+# and two people in that thread stopped to work out why a PS4 title was opening somebody's home
+# directory. It is HARMLESS - drirc is optional and Mesa carries on - but a stale host path in a
+# released binary is noise that costs other people time, and there is nothing on this console for
+# it to find in the first place.
+#
+# ⚠ AND DISABLING IT LOSES NO TUNING, which is the part worth checking before turning a feature
+# off. meson.options says so itself: "If disabled, the default driconf file is hardcoded into
+# Mesa." So the per-application workarounds still apply; what goes is reading them off a disk that
+# has no such directory, plus expat and the XML parser.
 COMMON_OPTS=(
   -Dvulkan-drivers=amd
   -Dgallium-drivers=zink
@@ -153,6 +170,7 @@ COMMON_OPTS=(
   -Degl=enabled -Dglx=disabled -Dgbm=disabled -Dglvnd=disabled
   -Dvideo-codecs=
   -Dllvm=disabled
+  -Dxmlconfig=disabled
   -Dbuildtype=release
 )
 
