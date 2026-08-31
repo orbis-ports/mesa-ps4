@@ -147,42 +147,6 @@ static int32_t sceGnmSubmitDone(void) { return 0; }
  * must match that patch's enum; 47-50 were verified against it when this was written. */
 void orbis_api_count(unsigned id, uint64_t n);
 void orbis_api_time(unsigned id, uint64_t ns);
-
-/* ⚠ AND THE KERNEL-CALL CENSUS, WHICH THIS FILE WAS MISSING FROM ENTIRELY - the omission that sent a
- * whole round of this investigation at the wrong call.
- *
- * The census in ac_orbis_drm.c counted every memory-touching sceKernel entry point IN THAT FILE, and
- * the report then attributed a 309 B/frame leak to sceGnmSubmitCommandBuffers because it was the only
- * counter that moved. It was the only counter that EXISTED on a per-frame path: presents run 1:1 with
- * submits in every leaking window, and every sceVideoOut call and every sceKernelUsleep in this file
- * was invisible. A per-present cost fits the same measurements just as well - 650 B x presents matched
- * three consecutive windows to 0.02%.
- *
- * So the present path books into the same counters, through the same shared enum, and the next report
- * can tell a per-submit cost from a per-present one instead of assuming. */
-#include "util/orbis_api_probe.h"
-
-#if defined(__PS4__)
-#define sceKernelUsleep(...) (orbis_kc_count(ORBIS_KC_USLEEP), (sceKernelUsleep)(__VA_ARGS__))
-#define sceVideoOutSubmitFlip(...)                                                                    \
-   (orbis_kc_count(ORBIS_KC_VO_SUBMIT_FLIP), (sceVideoOutSubmitFlip)(__VA_ARGS__))
-#define sceVideoOutGetFlipStatus(...)                                                                 \
-   (orbis_kc_count(ORBIS_KC_VO_FLIP_STATUS), (sceVideoOutGetFlipStatus)(__VA_ARGS__))
-#define sceVideoOutRegisterBuffers(...)                                                               \
-   (orbis_kc_count(ORBIS_KC_VO_REGISTER), (sceVideoOutRegisterBuffers)(__VA_ARGS__))
-#define sceVideoOutOpen(...) (orbis_kc_count(ORBIS_KC_VO_OPEN_CLOSE), (sceVideoOutOpen)(__VA_ARGS__))
-#define sceVideoOutClose(...) (orbis_kc_count(ORBIS_KC_VO_OPEN_CLOSE), (sceVideoOutClose)(__VA_ARGS__))
-#define sceGnmSubmitDone(...)                                                                         \
-   (orbis_kc_count(ORBIS_KC_GNM_SUBMIT_DONE), (sceGnmSubmitDone)(__VA_ARGS__))
-#define sceGnmAreSubmitsAllowed(...)                                                                  \
-   (orbis_kc_count(ORBIS_KC_GNM_ALLOWED), (sceGnmAreSubmitsAllowed)(__VA_ARGS__))
-#define sceKernelAllocateDirectMemory(...)                                                            \
-   (orbis_kc_count(ORBIS_KC_DMEM_ALLOC), (sceKernelAllocateDirectMemory)(__VA_ARGS__))
-#define sceKernelMapDirectMemory(...)                                                                 \
-   (orbis_kc_count(ORBIS_KC_DMEM_MAP), (sceKernelMapDirectMemory)(__VA_ARGS__))
-#define sceKernelReleaseDirectMemory(...)                                                             \
-   (orbis_kc_count(ORBIS_KC_DMEM_RELEASE), (sceKernelReleaseDirectMemory)(__VA_ARGS__))
-#endif
 enum { ORBIS_ID_WSI_PRESENT = 47, ORBIS_ID_WSI_GPU_IDLE = 48, ORBIS_ID_WSI_COPY = 49,
        ORBIS_ID_WSI_FLIP_WAIT = 50, ORBIS_ID_AB_A = 51, ORBIS_ID_AB_B = 52 };
 
@@ -386,40 +350,6 @@ wsi_orbis_scanout_create(uint32_t width, uint32_t height, uint32_t count, void *
    if (err < 0)
       mesa_logw("wsi/orbis: sceVideoOutSetFlipRate -> 0x%08x (continuing; the flip rate is not correctness)",
                 (unsigned)err);
-
-#if defined(__PS4__)
-   /* ⚠ THE ONE sce* CALL ON THE FRAME PATH THAT HAS NEVER BEEN WEIGHED IN ISOLATION, and the frame
-    * ledger has just made it a suspect.
-    *
-    * Measured 2026-08-31 over 2400 frames: the SubmitDone..flip_slot segment booked 1567776 bytes -
-    * 653 a frame - and that segment contains exactly three things. Two of them, sceKernelUsleep and
-    * clock_gettime, each measured 0 bytes per call over 2000 calls in orbis-compat's isolation probe.
-    * The third is this call, made 17 times a frame by wsi_orbis_wait_for_flip_slot, and 653/17 is 38.
-    *
-    * ⚠ SO IT IS MEASURED RATHER THAN CONCLUDED. Two meter reads, once, at scan-out setup: 2000 calls
-    * with the answer thrown away. If this prints ~38 bytes each, the 11% term is ours and the fix is
-    * to stop polling the display seventeen times a frame; if it prints 0, the segment's cost is
-    * somewhere the ledger's granularity cannot yet see and that is worth knowing too.
-    *
-    * The probe costs two meter reads for the life of the process, which is the one budget this
-    * instrument still has - see orbis_ledger_mark on why it now samples one frame in four. */
-   {
-      const uint64_t before = orbis_internal_free();
-      if (before != 0) {
-         OrbisVideoOutFlipStatus st;
-         for (int i = 0; i < 2000; i++) {
-            memset(&st, 0, sizeof(st));
-            (void)sceVideoOutGetFlipStatus(so->video, &st);
-         }
-         const uint64_t after = orbis_internal_free();
-         const long long lost = (long long)before - (long long)after;
-         mesa_logi("wsi/orbis: internal memory probe: sceVideoOutGetFlipStatus %lld bytes over 2000 "
-                   "calls = %lld each (%llu free after). The flip-slot wait makes 17 of these a frame "
-                   "and that segment loses 653 bytes a frame; ~38 each would account for all of it.",
-                   lost, lost / 2000, (unsigned long long)after);
-      }
-   }
-#endif
 
    mesa_logi("wsi/orbis: scan-out up - %ux%u pitch %u, %u %s buffer(s), A8B8G8R8_SRGB linear%s", width, height,
              pitch_px != 0 ? pitch_px : width, count, so->owns_buffers ? "GARLIC" : "swapchain",
@@ -666,11 +596,6 @@ wsi_orbis_scanout_present(struct wsi_orbis_scanout *so, uint32_t index, const vo
    if (so == NULL || index >= so->count || src == NULL)
       ORBIS_BOOK_RETURN(ORBIS_ID_WSI_PRESENT, orbis_pr_t0, false);
 
-   /* ⚠ THE FRAME LEDGER'S SEGMENT BOUNDARIES. See enum orbis_ledger_id in util/orbis_api_probe.h:
-    * the leak is now known to be PER FRAME (~10 KB) rather than per poll, and each mark below bounds
-    * exactly one candidate call so that a positive result names one rather than four. */
-   orbis_ledger_mark(ORBIS_LG_PRESENT_ENTER);
-
    /* ⚠ THE GPU FIRST. This copy reads pixels the GPU is writing, and until this line it did not ask whether the
     * writing had finished - which is what put a staircase of tiles over half the menu on every screen change. See
     * ac_orbis_wait_gpu_idle for the photograph and the reasoning; declared here rather than in a header because it
@@ -691,7 +616,6 @@ wsi_orbis_scanout_present(struct wsi_orbis_scanout *so, uint32_t index, const vo
         else
            ac_orbis_wait_gpu_idle(2ull * 1000 * 1000 * 1000);
         const uint64_t d = os_time_get_nano() - t;
-        orbis_ledger_mark(ORBIS_LG_AFTER_GPU_IDLE);
         orbis_api_time(ORBIS_ID_WSI_GPU_IDLE, d);
         orbis_api_count(ORBIS_ID_WSI_GPU_IDLE, 1);
         /* ⚠ AND UNCONDITIONALLY, because the two lines above only store under ORBIS_COUNT_API and
@@ -752,8 +676,6 @@ wsi_orbis_scanout_present(struct wsi_orbis_scanout *so, uint32_t index, const vo
       }
    }
 
-   orbis_ledger_mark(ORBIS_LG_AFTER_SUBMIT_DONE);
-
    /* ⚠ BREADCRUMBS FOR THE FIRST FEW FRAMES, because the run this exists for died with no line at all: the log
     * ended after the frame's submission returned, and "we never got here" and "we died inside the copy" looked
     * identical. Bounded to four frames - at 60 Hz an unbounded line per frame IS the log. */
@@ -764,7 +686,6 @@ wsi_orbis_scanout_present(struct wsi_orbis_scanout *so, uint32_t index, const vo
 
    if (!wsi_orbis_wait_for_flip_slot(so))
       ORBIS_BOOK_RETURN(ORBIS_ID_WSI_PRESENT, orbis_pr_t0, false);
-   orbis_ledger_mark(ORBIS_LG_AFTER_FLIP_SLOT);
 
    /* ⚠ ROW BY ROW WHEN THE PITCHES DIFFER. WSI picks the image's row pitch and it need not be width*4 - RADV
     * aligns a linear image's pitch to the hardware's requirement. One flat memcpy would then shift every row
@@ -969,11 +890,8 @@ wsi_orbis_scanout_present(struct wsi_orbis_scanout *so, uint32_t index, const vo
       mesa_logi("wsi/orbis: present copied %u KiB, flipping index %u",
                 (unsigned)((uint64_t)dst_pitch * so->height / 1024), index);
 
-   /* The copy..SubmitFlip mark is gone: it booked 16 bytes a frame, and a meter read that measures
-      nothing is one this instrument can no longer afford - see orbis_ledger_mark on the perturbation. */
    int32_t err = sceVideoOutSubmitFlip(so->video, (int32_t)index, ORBIS_VIDEO_OUT_FLIP_VSYNC,
                                        (int64_t)++so->flips);
-   orbis_ledger_mark(ORBIS_LG_PRESENT_EXIT);
    /* After the call, not instead of it: the flip really is submitted and the display really does take
     * it, so the state this leaves behind is the state a genuine late failure leaves behind. Only the
     * answer handed back to the WSI is forced. */

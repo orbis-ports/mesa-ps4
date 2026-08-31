@@ -1282,10 +1282,6 @@ vk_common_QueueSubmit2(VkQueue _queue,
                           VkFence _fence)
 {
    ORBIS_API_PROBE(ORBIS_API_SUBMIT);
-   /* The second frame-ledger boundary - see the mark in wsi_AcquireNextImage2KHR. Everything between
-      that one and this one is the application's draw calls, zink's translation and RADV's command
-      recording; everything between this one and the winsys's own submit is RADV's submit path. */
-   orbis_ledger_mark(ORBIS_LG_VK_SUBMIT);
    VK_FROM_HANDLE(vk_queue, queue, _queue);
    VK_FROM_HANDLE(vk_fence, fence, _fence);
    VkResult result;

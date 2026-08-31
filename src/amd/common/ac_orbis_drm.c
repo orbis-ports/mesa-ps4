@@ -61,387 +61,6 @@
 #include <sys/resource.h>
 #include <string.h>
 
-/* ------------------------------------------------ libkernel's internal memory, per frame, per call
- *
- * ⚠ WHAT THIS IS FOR. Four runs of the RetroArch port have ended with the console repeating
- *
- *     [ScePthread/System] Internal Memory is running out.        technote 235
- *
- * thousands of times until nothing worked. The frontend's watchdog now reads the number behind that
- * message with sceKernelInternalMemoryGetAvailableSize, and it is unambiguous: 14013728 bytes free at
- * startup, 96 bytes free at the failure, and in between a drain of up to 3.7 MB per five seconds -
- * about 12 KB per PRESENTED FRAME - that runs while RetroArch's menu is up and slows to noise while a
- * core is drawing a single textured quad.
- *
- * ⚠ AND EVERY PTHREAD EXPLANATION IS ALREADY DEAD. Across the whole of it pthread_mutex_init,
- * pthread_cond_init, pthread_attr_init and scePthreadCreate all kept succeeding; the category in the
- * message is the logger, not the owner of the pool. vkAllocateMemory is ZERO per frame, so it is not
- * application memory either, and the VA arena is flat at 350 MiB with 114 live ranges, so it is not
- * address space.
- *
- * ⚠ SO THE REMAINING SUSPECT IS THIS FILE'S OWN KERNEL TRAFFIC, and the honest way to test that is to
- * count it rather than to reason about it. Every sceKernel entry point here that creates, maps,
- * protects or releases memory is counted, and the budget report divides the window's counts AND the
- * window's loss of internal memory by the same number of presents. Bytes-lost-per-frame beside
- * calls-made-per-frame is an attribution; either alone is a story.
- *
- * ⚠ THE COUNTING IS A MACRO OVER THE CALL, NOT A WRAPPER FUNCTION, so no call site changes and none
- * can be missed. `(name)(args)` inside the macro does not re-expand, because a function-like macro is
- * only expanded when its name is followed directly by a parenthesis. Checked before relying on it:
- * none of these names is ever used as an address or a cast in this file, only as a call.
- *
- * ⚠ AND THE READING IS SIGNATURE-SAFE. sceKernelInternalMemoryGetAvailableSize is exported by
- * libkernel.so (llvm-nm --dynamic) and declared by no SDK header, so the two plausible Sony shapes -
- * `int f(size_t *out)` and `size_t f(void)` - are both satisfied by calling it with a real pointer to
- * a zeroed scratch and reading BOTH the scratch and the return value. It is weak, so a link that
- * cannot resolve it yields zero rather than a driver that will not build.
- */
-#if defined(__PS4__)
-static uint64_t orbis_kc[ORBIS_KC_SLOTS];
-
-static const char *const orbis_kc_names[ORBIS_KC_SLOTS] = {
-   [ORBIS_KC_DMEM_ALLOC] = "AllocateDirectMemory",
-   [ORBIS_KC_DMEM_RELEASE] = "ReleaseDirectMemory",
-   [ORBIS_KC_DMEM_MAP] = "MapDirectMemory",
-   [ORBIS_KC_FMEM_MAP] = "MapFlexibleMemory",
-   [ORBIS_KC_MMAP] = "Mmap",
-   [ORBIS_KC_MUNMAP] = "Munmap",
-   [ORBIS_KC_MPROTECT] = "Mprotect",
-   [ORBIS_KC_SUBMIT] = "SubmitCommandBuffers",
-   [ORBIS_KC_BO_ALLOC] = "bo_alloc",
-   [ORBIS_KC_BO_FREE] = "bo_free",
-   [ORBIS_KC_VA_MAP] = "va_map",
-   [ORBIS_KC_VA_UNMAP] = "va_unmap",
-   [ORBIS_KC_SYNC_TIMEOUT] = "syncobj_timeout",
-   [ORBIS_KC_SYNC_POLL] = "syncobj_poll",
-   [ORBIS_KC_USLEEP] = "Usleep",
-   [ORBIS_KC_GNM_FLUSH_GARLIC] = "FlushGarlic",
-   [ORBIS_KC_GNM_SUBMIT_DONE] = "SubmitDone",
-   [ORBIS_KC_GNM_ALLOWED] = "AreSubmitsAllowed",
-   [ORBIS_KC_VO_SUBMIT_FLIP] = "VideoOutSubmitFlip",
-   [ORBIS_KC_VO_FLIP_STATUS] = "VideoOutGetFlipStatus",
-   [ORBIS_KC_VO_REGISTER] = "VideoOutRegisterBuffers",
-   [ORBIS_KC_VO_OPEN_CLOSE] = "VideoOutOpen/Close",
-};
-
-static inline void
-orbis_kc_hit(unsigned slot)
-{
-   p_atomic_inc(&orbis_kc[slot]);
-}
-
-/* The cross-translation-unit door, so wsi_orbis.c books into the same counters and the same report.
-   Not static, and declared in util/orbis_api_probe.h beside the enum. */
-/* Defined below, next to the weak declaration of the libkernel entry point it wraps. Forward-declared
-   here because the ledger is the meter's first consumer and sits above it in the file. */
-static uint64_t orbis_internal_memory_free(void);
-
-uint64_t
-orbis_internal_free(void)
-{
-   return orbis_internal_memory_free();
-}
-
-void
-orbis_kc_count(unsigned slot)
-{
-   if (slot < ORBIS_KC_SLOTS)
-      orbis_kc_hit(slot);
-}
-
-/* ⚠ AND THE ALLOCATOR'S OWN TRAFFIC TO libkernel, which is the last uncounted route out of the pool.
- * The ledger puts 9073 of 9280 bytes a frame above this driver, where the only libkernel calls made
- * are the ones musl's allocator makes through orbis-compat's mmap when a request cannot be served from
- * a carve-out. Per-frame fall-through counts belong on the same line as the bytes. Weak, as ever. */
-extern void orbis_mmap_counts(unsigned long long *maps, unsigned long long *maps_carved,
-                              unsigned long long *maps_fell, unsigned long long *unmaps,
-                              unsigned long long *unmaps_carved, unsigned long long *unmaps_fell)
-   __attribute__((weak));
-
-/* ------------------------------------------------------------------------- the frame ledger
- *
- * See the enum in util/orbis_api_probe.h for why this exists and why the segments are narrow.
- *
- * Each mark reads libkernel's internal-memory meter once and books the difference since the previous
- * mark against THAT mark's segment - so segment[i] is "what was spent between mark i and the mark
- * after it", and every segment brackets exactly one named call. Accumulated over frames, because the
- * meter's own resolution is coarse (2000 calls of a primitive measured 96 and 64 bytes in isolation)
- * while a frame loses about ten thousand.
- *
- * ⚠ ON BY DEFAULT. Ten meter reads a frame at sixty frames a second is six hundred a second against a
- * process already making ten thousand syncobj polls a second; ORBIS_NO_LEDGER=1 turns it off. Every
- * knob in this investigation that could be missed has been, and each miss cost a console run - that is
- * the more expensive failure. */
-static const char *const orbis_lg_names[ORBIS_LG_IDS] = {
-   [ORBIS_LG_PRESENT_ENTER] = "present:enter..gpu_idle",
-   [ORBIS_LG_AFTER_GPU_IDLE] = "gpu_idle..SubmitDone",
-   [ORBIS_LG_AFTER_SUBMIT_DONE] = "SubmitDone..flip_slot",
-   [ORBIS_LG_AFTER_FLIP_SLOT] = "flip_slot..copy",
-   [ORBIS_LG_AFTER_COPY] = "copy..SubmitFlip",
-   [ORBIS_LG_PRESENT_EXIT] = "present:exit..vkAcquire (frontend between frames)",
-   [ORBIS_LG_ACQUIRE] = "vkAcquire..vkQueueSubmit2 (APP DRAWS + ZINK + RADV RECORDING)",
-   [ORBIS_LG_VK_SUBMIT] = "vkQueueSubmit2..winsys submit (RADV's submit path)",
-   [ORBIS_LG_SUBMIT_ENTER] = "winsys submit:enter..GnmSubmit",
-   [ORBIS_LG_AFTER_GNM_SUBMIT] = "GnmSubmit..submit:exit",
-   [ORBIS_LG_SUBMIT_EXIT] = "submit:exit..next mark",
-};
-
-static int64_t  orbis_lg_seg[ORBIS_LG_IDS];
-static int64_t  orbis_lg_last[ORBIS_LG_IDS];
-static uint64_t orbis_lg_last_frames;
-
-/* ⚠ AND HOW LONG EACH SEGMENT TOOK, WHICH IS THE MEASUREMENT THAT DECIDES WHAT KIND OF LEAK THIS IS.
- *
- * Measured 2026-08-31: between two consecutive reports the total held at 9280 bytes a frame to the
- * byte while the ATTRIBUTION swung - SubmitDone..flip_slot went 8784 -> 152 a frame and
- * present:exit..vkAcquire went 457 -> 7107. Meanwhile every synchronous call in the first of those
- * segments has now been weighed in isolation and costs nothing: sceKernelUsleep 0, clock_gettime 0,
- * and sceVideoOutGetFlipStatus 0 bytes over 2000 calls, measured on hardware this run.
- *
- * A cost that is not in any call, lands in a different segment each time, and sums to the same figure
- * regardless is not spent by the code being bracketed. The obvious remaining shape is that it accrues
- * with TIME - somebody else's thread, or the kernel accounting for queued work - and lands in
- * whichever segment happens to be executing when the meter is next read. That predicts something
- * sharp: bytes per segment should track MICROSECONDS per segment, not the segment's contents. The
- * flip-slot wait is the long one in a vsync-bound frame and the frontend's is the long one in a
- * CPU-bound frame, which is exactly the pair of reports above.
- *
- * Clock reads cost nothing to this measurement - orbis-compat's isolation probe put clock_gettime at
- * 0 bytes over 2000 calls on both families - so this is two numbers per mark instead of one, and it
- * turns "which code" into "which code OR merely which stretch of time". */
-static uint64_t orbis_lg_time[ORBIS_LG_IDS];
-static uint64_t orbis_lg_time_last[ORBIS_LG_IDS];
-static uint64_t orbis_lg_prev_ns;
-static uint64_t orbis_lg_wall_ns;      /* wall time inside sampled frames, for bytes-per-second */
-static uint64_t orbis_lg_wall_last;
-static uint64_t orbis_lg_prev_free;
-static unsigned orbis_lg_prev_id = ORBIS_LG_IDS;
-static uint64_t orbis_lg_frames;       /* frames actually measured */
-static uint64_t orbis_lg_frames_seen;  /* frames offered, measured or not */
-static bool     orbis_lg_sampling;
-
-static bool
-orbis_ledger_enabled(void)
-{
-   static int cached = -1;
-   if (cached < 0) {
-      const char *const e = getenv("ORBIS_NO_LEDGER");
-      cached = (e && *e && *e != '0') ? 0 : 1;
-   }
-   return cached == 1;
-}
-
-void
-orbis_ledger_mark(unsigned id)
-{
-#if defined(__PS4__)
-   if (id >= ORBIS_LG_IDS || !orbis_ledger_enabled())
-      return;
-
-   /* ⚠ ONE FRAME IN FOUR, BECAUSE THE INSTRUMENT WAS MEASURED PERTURBING WHAT IT MEASURES. With a
-    * mark at every boundary of every frame this read the meter about six hundred times a second, and
-    * the maintainer reports the failure changed shape with that build - the title degraded to ~10 fps
-    * and took considerably longer to reach the wall instead of collapsing to 0.01 fps. The proportions
-    * held, so the split stands, but the absolute rate is not this driver's any more.
-    *
-    * Sampling whole frames rather than individual marks is what keeps the segments comparable: every
-    * segment of a sampled frame is measured or none is, so the columns still add up to that frame.
-    * The first mark of a sampled frame only seeds the meter - it books nothing, because the gap behind
-    * it spans three unmeasured frames. */
-   if (id == ORBIS_LG_PRESENT_ENTER) {
-      orbis_lg_sampling = ((++orbis_lg_frames_seen & 3) == 0);
-      if (orbis_lg_sampling) {
-         orbis_lg_prev_id = ORBIS_LG_IDS; /* seed only */
-         ++orbis_lg_frames;
-      }
-   }
-   if (!orbis_lg_sampling)
-      return;
-
-   const uint64_t now = orbis_internal_memory_free();
-   if (now == 0)
-      return; /* the meter did not resolve; nothing here can be measured */
-   const uint64_t now_ns = os_time_get_nano();
-
-   if (orbis_lg_prev_id < ORBIS_LG_IDS) {
-      orbis_lg_seg[orbis_lg_prev_id] += (int64_t)orbis_lg_prev_free - (int64_t)now;
-      orbis_lg_time[orbis_lg_prev_id] += now_ns - orbis_lg_prev_ns;
-      orbis_lg_wall_ns += now_ns - orbis_lg_prev_ns;
-   }
-   orbis_lg_prev_id = id;
-   orbis_lg_prev_free = now;
-   orbis_lg_prev_ns = now_ns;
-
-   /* One report per 120 frames - about two seconds of menu, and enough that a segment carrying ten
-    * thousand bytes a frame cannot be confused with the meter's quantisation. */
-   if (id == ORBIS_LG_PRESENT_ENTER && orbis_lg_frames != 0 && (orbis_lg_frames % 120) == 0) {
-      char line[1024];
-      int n = 0;
-      int64_t total = 0, dtotal = 0;
-      const int64_t dframes = (int64_t)(orbis_lg_frames - orbis_lg_last_frames);
-
-      /* ⚠ THE DELTA, NOT ONLY THE RUNNING TOTAL - and printing only the total hid the sharpest number
-       * this instrument has produced. In the 2400-frame capture of 2026-08-31 the cumulative average
-       * drifted 77 -> 5722 bytes a frame and read like a slow ramp, while the DIFFERENCE between
-       * consecutive reports was 1113600 bytes per 120 frames ten times running - exactly 9280.0 a
-       * frame, to the byte. A cumulative average of a process that changes state is a number about the
-       * past; the delta is a number about now, and the split between segments belongs on it. */
-      for (unsigned i = 0; i < ORBIS_LG_IDS && n < (int)sizeof(line) - 1; i++) {
-         const int64_t d = orbis_lg_seg[i] - orbis_lg_last[i];
-         total += orbis_lg_seg[i];
-         dtotal += d;
-         if (d == 0 && orbis_lg_seg[i] == 0)
-            continue;
-         const uint64_t dt_us = (orbis_lg_time[i] - orbis_lg_time_last[i]) / 1000;
-         n += snprintf(line + n, sizeof(line) - n, "%s%s %lld B/frame in %llu us/frame (%lld B/ms)",
-                       n ? ", " : "", orbis_lg_names[i], (long long)(dframes ? d / dframes : 0),
-                       (unsigned long long)(dframes ? dt_us / (uint64_t)dframes : 0),
-                       (long long)(dt_us ? (d * 1000) / (int64_t)dt_us : 0));
-      }
-      for (unsigned i = 0; i < ORBIS_LG_IDS; i++) {
-         orbis_lg_last[i] = orbis_lg_seg[i];
-         orbis_lg_time_last[i] = orbis_lg_time[i];
-      }
-      orbis_lg_last_frames = orbis_lg_frames;
-
-      /* ⚠ BYTES PER MILLISECOND AS WELL AS PER FRAME, because "per frame" is the fourth quantity this
-       * investigation has divided by and three of the first three were correlates. At a pinned 60 Hz
-       * the two are indistinguishable; the moment the frame rate moves, they separate, and the run
-       * says which one the leak is actually made of. */
-      const uint64_t dwall_us = (orbis_lg_wall_ns - orbis_lg_wall_last) / 1000;
-      orbis_lg_wall_last = orbis_lg_wall_ns;
-
-      unsigned long long mm = 0, mmc = 0, mmf = 0, mu = 0, muc = 0, muf = 0;
-      if (&orbis_mmap_counts != NULL)
-         orbis_mmap_counts(&mm, &mmc, &mmf, &mu, &muc, &muf);
-
-      mesa_logi("orbis-drm: frame ledger over %llu SAMPLED frame(s) of %llu seen: %lld bytes a frame "
-                "SINCE THE LAST REPORT, over %llu us of sampled wall time = %lld bytes/ms "
-                "(%lld bytes total, %lld a frame averaged over the whole run). "
-                "musl mmap traffic since boot: %llu map(s), %llu FELL THROUGH to libkernel; "
-                "%llu unmap(s), %llu FELL THROUGH. Per segment, since the last report: %s",
-                (unsigned long long)orbis_lg_frames, (unsigned long long)orbis_lg_frames_seen,
-                (long long)(dframes ? dtotal / dframes : 0),
-                (unsigned long long)dwall_us,
-                (long long)(dwall_us ? (dtotal * 1000) / (int64_t)dwall_us : 0),
-                (long long)total, (long long)(total / (int64_t)orbis_lg_frames),
-                mm, mmf, mu, muf,
-                n ? line : "every segment zero");
-   }
-#else
-   (void)id;
-#endif
-}
-
-#define sceKernelUsleep(...) (orbis_kc_hit(ORBIS_KC_USLEEP), (sceKernelUsleep)(__VA_ARGS__))
-#define sceGnmFlushGarlic(...)                                                                     \
-   (orbis_kc_hit(ORBIS_KC_GNM_FLUSH_GARLIC), (sceGnmFlushGarlic)(__VA_ARGS__))
-#define sceGnmSubmitDone(...)                                                                      \
-   (orbis_kc_hit(ORBIS_KC_GNM_SUBMIT_DONE), (sceGnmSubmitDone)(__VA_ARGS__))
-#define sceGnmAreSubmitsAllowed(...)                                                               \
-   (orbis_kc_hit(ORBIS_KC_GNM_ALLOWED), (sceGnmAreSubmitsAllowed)(__VA_ARGS__))
-#define sceKernelAllocateDirectMemory(...)                                                         \
-   (orbis_kc_hit(ORBIS_KC_DMEM_ALLOC), (sceKernelAllocateDirectMemory)(__VA_ARGS__))
-#define sceKernelReleaseDirectMemory(...)                                                          \
-   (orbis_kc_hit(ORBIS_KC_DMEM_RELEASE), (sceKernelReleaseDirectMemory)(__VA_ARGS__))
-#define sceKernelMapDirectMemory(...)                                                              \
-   (orbis_kc_hit(ORBIS_KC_DMEM_MAP), (sceKernelMapDirectMemory)(__VA_ARGS__))
-#define sceKernelMapFlexibleMemory(...)                                                            \
-   (orbis_kc_hit(ORBIS_KC_FMEM_MAP), (sceKernelMapFlexibleMemory)(__VA_ARGS__))
-#define sceKernelMmap(...) (orbis_kc_hit(ORBIS_KC_MMAP), (sceKernelMmap)(__VA_ARGS__))
-#define sceKernelMunmap(...) (orbis_kc_hit(ORBIS_KC_MUNMAP), (sceKernelMunmap)(__VA_ARGS__))
-#define sceKernelMprotect(...) (orbis_kc_hit(ORBIS_KC_MPROTECT), (sceKernelMprotect)(__VA_ARGS__))
-#define sceGnmSubmitCommandBuffers(...)                                                            \
-   (orbis_kc_hit(ORBIS_KC_SUBMIT), (sceGnmSubmitCommandBuffers)(__VA_ARGS__))
-
-extern uint64_t sceKernelInternalMemoryGetAvailableSize(void *out, uint64_t out_len, uint64_t zero)
-   __attribute__((weak));
-
-/* ⚠ THE ONE CONSUMER THIS DRIVER CANNOT SEE FROM THE INSIDE. Every counter above is a call this file
- * makes on purpose. simple_mtx is not: its contended path is futex_wait, and on this console
- * futex_wait is orbis-compat's _umtx_op shim, which sleeps on a pthread condition variable with a
- * deadline. A cond wait that TIMES OUT is the last unexamined thing on the failing syncobj path, and
- * it is the right shape - allocated on entry, released on the signalled return, never on the expired
- * one. Weak, so a build without the overlay's counters reports zeroes instead of failing to link. */
-extern void orbis_umtx_stats(unsigned long long *waits, unsigned long long *timedwaits,
-                             unsigned long long *timeouts, unsigned long long *locks)
-   __attribute__((weak));
-
-/* The other half of the same argument: two clock reads happen on every one of those waits, and
-   146/2 = 73 is the size of a small fixed record. Weak for the same reason. */
-extern void orbis_clock_counts(unsigned long long *monotonic, unsigned long long *realtime)
-   __attribute__((weak));
-
-/* ⚠ AND WHO IS DOING THE POLLING, WHICH NO COUNTER CAN SAY. Measured 2026-08-31: 162 syncobj polls a
- * frame against ONE vkWaitForFences a frame, one QueueSubmit2, one AcquireNextImage2 and one
- * QueuePresentKHR - and no AllocateDescriptorSets or GetFenceStatus at all. So the polls do not come
- * through any timed Vulkan entry point: they are driver-internal, from inside Mesa, RADV or the WSI,
- * and nothing in this port knows which. Four backtraces settle it. orbis-compat exports the unwinder
- * (include/execinfo.h) and the port's ps4/symbolise.py resolves the addresses against the ELF; weak,
- * so a build without the overlay simply prints nothing. */
-extern int orbis_unwind_collect(void **buffer, int size, int skip) __attribute__((weak));
-
-/* ------------------------------------------------------- bisecting the 73 bytes, with the meter
- *
- * ⚠ SIX PRIMITIVES CAME BACK CLEAN AND THE LEAK DID NOT MOVE, so the next instrument must not be a
- * seventh guess. Measured 2026-08-31: 73.0 bytes vanish from libkernel's internal memory for every
- * syncobj POLL, 162 a frame, exact to 0.03% over 48739 of them - while control, clock_gettime on both
- * families, pthread_mutex, sceKernelUsleep and an expired cond_timedwait each measured 0 bytes per
- * call over 2000 calls in isolation, and the futex shim reports 0 cond-waits in every window.
- *
- * ⚠ AND "PROPORTIONAL TO POLLS" IS NOT "INSIDE THE POLL". The report divides bytes lost in a window
- * by polls in that window, so anything that happens once per poll fits equally well - including the
- * caller's own loop body between two polls, which is zink's code and not this driver's. That third
- * reading has never been tested and is as consistent with every number as the other two.
- *
- * So this stops counting calls and BISECTS with the meter itself. On a sampled pair of CONSECUTIVE
- * polls it reads the pool four times:
- *
- *     entry(k) .. exit(k)          -> INSIDE  this function
- *     exit(k)  .. entry(k+1)       -> OUTSIDE it, i.e. one iteration of the caller's poll loop
- *
- * Consecutive, so the outside window is exactly one caller iteration and not fifteen skipped polls.
- * Accumulated rather than reported per sample, because the meter's own resolution is coarse - the
- * isolation probe read 96 and 64 bytes over two thousand calls - and 73 bytes is invisible in one
- * sample and unmistakable in three thousand.
- *
- * ⚠ ON BY DEFAULT, AND THAT IS DELIBERATE. Every knob in this investigation that could be missed has
- * been missed at least once - an env file, a package install, a call site - and each cost a console
- * run. One in sixty-four polls is about three hundred meter reads a second against a call this
- * process already makes ten thousand times a second; that is cheaper than another wasted round.
- * ORBIS_NO_BISECT=1 turns it off if it ever proves otherwise. */
-static uint64_t orbis_bis_n;         /* polls seen, for the 1-in-64 sampling */
-static uint64_t orbis_bis_pairs;     /* completed inside+outside pairs */
-static int64_t  orbis_bis_inside;    /* bytes lost between entry and exit of this function */
-static int64_t  orbis_bis_outside;   /* bytes lost between our exit and the caller's next entry */
-static uint64_t orbis_bis_exit_free; /* the meter at the last sampled exit, 0 when not armed */
-
-static bool
-orbis_bisect_enabled(void)
-{
-   static int cached = -1;
-   if (cached < 0) {
-      const char *const e = getenv("ORBIS_NO_BISECT");
-      cached = (e && *e && *e != '0') ? 0 : 1;
-   }
-   return cached == 1;
-}
-
-static uint64_t
-orbis_internal_memory_free(void)
-{
-   uint64_t scratch[8];
-   uint64_t ret;
-
-   if (&sceKernelInternalMemoryGetAvailableSize == NULL)
-      return 0;
-
-   memset(scratch, 0, sizeof(scratch));
-   ret = sceKernelInternalMemoryGetAvailableSize(scratch, sizeof(scratch), 0);
-   return scratch[0] != 0 ? scratch[0] : ret;
-}
-#endif /* __PS4__ */
-
 /* Once per call site, not once per call: RADV asks these questions at initialisation rates, and a
  * per-call log is thousands of lines nobody reads. The shape mirrors gnmLogOnceFor in the Tempest fork.
  *
@@ -6094,57 +5713,6 @@ orbis_sync_wait(struct util_sync_provider *p, uint32_t *handles, unsigned num_ha
    struct orbis_wait_watch watch;
    orbis_wait_begin(&watch, (uint64_t)timeout_nsec, "syncobj");
 
-   /* ⚠ A DEADLINE THAT WAS ALREADY BEHIND US WHEN WE WERE CALLED IS A POLL, NOT A WAIT, AND THIS
-    * DRIVER HAS BEEN CALLING IT A GPU FAILURE.
-    *
-    * Measured on hardware 2026-08-31: 81 of these a frame, and the caller's deadline was 1344 ns and
-    * 5374 ns in the past on entry - microseconds, not the decades a wrong clock base would give. So
-    * zink is asking "is it done yet" and expressing it as an absolute deadline of the present
-    * instant, which is exactly what timeout_nsec == 0 means and is already handled quietly three
-    * screens down. Same label repeatedly, which is what a poll loop looks like.
-    *
-    * ⚠ AND THIS CHANGES THE ANSWER, NOT THE WORK - said plainly because it would be easy to read as
-    * a performance fix and it is not one. A wait whose deadline has passed already returns after a
-    * single pass of the loop below; there is no sleep to remove and no call to avoid. What this
-    * removes is a wrong diagnosis - "the GPU did not finish" about a caller that never asked it to -
-    * and it splits the counter, so the next run can say whether the ~146 bytes this driver loses per
-    * expiring wait follows the POLLS or the genuine timeouts. Those are different bugs if they
-    * separate. */
-   const bool expired_on_entry = (int64_t)os_time_get_nano() >= watch.caller_deadline;
-
-#if defined(__PS4__)
-   /* ⚠ TWO PHASES OF ONE PAIR. Phase 0 opens a sample and measures INSIDE; phase 1 is the very next
-    * poll, whose entry closes the OUTSIDE window opened by phase 0's exit. Anything else that ran in
-    * between is, by construction, the caller's loop body - which is exactly what is being weighed. */
-   const uint64_t bis_i = orbis_bisect_enabled() ? p_atomic_inc_return(&orbis_bis_n) : 0;
-   const bool bis_open = bis_i != 0 && (bis_i & 63) == 0;
-   const bool bis_close = bis_i != 0 && (bis_i & 63) == 1 && orbis_bis_exit_free != 0;
-   uint64_t bis_entry_free = 0;
-
-   if (bis_open) {
-      bis_entry_free = orbis_internal_memory_free();
-   } else if (bis_close) {
-      const uint64_t now_free = orbis_internal_memory_free();
-      orbis_bis_outside += (int64_t)orbis_bis_exit_free - (int64_t)now_free;
-      orbis_bis_exit_free = 0;
-      ++orbis_bis_pairs;
-
-      /* One line per 256 pairs. It was 2048 and printed NOTHING in a whole run: one sample in
-       * sixty-four of eighteen thousand polls a window is 286 pairs, so 2048 needed seven windows and
-       * the leaking phase was about that long. A threshold that needs the whole run to fire is not a
-       * threshold. */
-      if ((orbis_bis_pairs % 256) == 0) {
-         mesa_logi("orbis-drm: poll bisection over %llu pair(s): %lld bytes lost INSIDE "
-                   "orbis_sync_wait (%.1f/poll), %lld bytes lost OUTSIDE it in the caller's loop "
-                   "(%.1f/poll). The 73 belongs to whichever of these carries it; if neither does, "
-                   "it is spent somewhere neither window covers.",
-                   (unsigned long long)orbis_bis_pairs,
-                   (long long)orbis_bis_inside, (double)orbis_bis_inside / (double)orbis_bis_pairs,
-                   (long long)orbis_bis_outside, (double)orbis_bis_outside / (double)orbis_bis_pairs);
-      }
-   }
-#endif
-
    /* ⚠ THE MEASUREMENT THE FENCE POOL NEEDS. A title exhausted its 32-fence pool and threw "device is
     * lost" while this arm reported the GPU label advancing normally - which means the disagreement is
     * between what a fence WAS given and what this wait is comparing it against. Print both, per handle,
@@ -6212,77 +5780,16 @@ orbis_sync_wait(struct util_sync_provider *p, uint32_t *handles, unsigned num_ha
           * The DIAGNOSIS this used to shout is still correct for a real timeout: on this platform nothing signals
           * from an interrupt, so a deadline that expires means the GPU did not reach the end of a submission. */
          errno = ETIME;
-         if (timeout_nsec == 0 || expired_on_entry) {
-#if defined(__PS4__)
-            orbis_kc_hit(ORBIS_KC_SYNC_POLL);
-            if (bis_open) {
-               const uint64_t x = orbis_internal_memory_free();
-               orbis_bis_inside += (int64_t)bis_entry_free - (int64_t)x;
-               orbis_bis_exit_free = x; /* arms the OUTSIDE window for the next poll */
-            }
-#endif
+         if (timeout_nsec == 0) {
             static unsigned polls;
             if (orbis_budget(&polls, 4)) {
-               char callers[10 * 20 + 1];
-               size_t at = 0;
-               callers[0] = '\0';
-#if defined(__PS4__)
-               /* The unwinder is orbis-compat's, so it exists only on the console arm. The host build
-                  keeps the line and prints "(no unwinder)", which is the truth there. */
-               if (&orbis_unwind_collect != NULL) {
-                  void *frames[10];
-                  const int nf = orbis_unwind_collect(frames, 10, 1);
-                  for (int i = 0; i < nf; i++) {
-                     const int n2 = snprintf(callers + at, sizeof(callers) - at, "%s%p",
-                                             i ? " " : "", frames[i]);
-                     if (n2 < 0 || (size_t)n2 >= sizeof(callers) - at)
-                        break;
-                     at += (size_t)n2;
-                  }
-               }
-#endif
-               mesa_logi("orbis-drm: syncobj POLL says not yet, label %u - a deadline of now or "
-                         "earlier is a question, not a failure. Asked by, innermost first: %s",
-                         *orbis_fence_label, at ? callers : "(no unwinder)");
+               mesa_logi("orbis-drm: syncobj POLL says not yet, label %u - a zero timeout is a question, not a "
+                         "failure", *orbis_fence_label);
             }
          } else {
-#if defined(__PS4__)
-            orbis_kc_hit(ORBIS_KC_SYNC_TIMEOUT);
-#endif
-            /* ⚠ LOUD ONCE, NOT EIGHTY-TWO THOUSAND TIMES - AND THE MISSING BUDGET HERE IS ITSELF A
-             * FINDING. The poll arm three lines up is bounded with orbis_budget(&polls, 4) and this
-             * one never was, on the reasoning that a real expired deadline is worth shouting about.
-             * It is, once: measured 2026-08-31, a single glcore session emitted 81974 copies of this
-             * line - 99.5% of the whole log - which buries every other line in the file and makes the
-             * one channel this console has useless for anything else.
-             *
-             * ⚠ AND BOUNDING IT IS ALSO THE EXPERIMENT. The same session drained libkernel's internal
-             * memory from 14013728 bytes to 96 and killed the process, and this event is the only
-             * thing in the run whose rate tracks the drain - BO allocation does not, the arena does
-             * not, vkAllocateMemory is zero. Two possibilities remain and they are told apart by this
-             * one line: if the cost is in the LOG SINK, bounding it stops the drain; if the cost is in
-             * the WAIT, the drain continues while the counter above still reports the true rate.
-             * Either answer is worth a run, and the log is worth bounding regardless. */
-            static unsigned said_timeout;
-            if (orbis_budget(&said_timeout, 8)) {
-               /* ⚠ AND WHY IT EXPIRED, NOT ONLY THAT IT DID - the question the counter cannot answer.
-                * 81 of these a frame while Usleep runs at 15 a frame means most of them never slept
-                * ONCE: orbis_wait_continue found the caller's deadline already behind it on the first
-                * pass. That is either a caller asking for no time at all, or a deadline made on a
-                * different clock base from the one compared against here - the second is the exact
-                * defect orbis-compat's umtx.h was written to fix on the futex path, and nothing has
-                * ever checked for it here. The three numbers below tell those apart: a deadline that
-                * is microseconds in the past is a caller with no patience, one that is decades in the
-                * past is the clock. */
-               const int64_t now_ns = (int64_t)os_time_get_nano();
-               mesa_logw("orbis-drm: syncobj wait timed out - the GPU did not finish; label %u. "
-                         "Caller's deadline %" PRId64 " ns, now %" PRId64 " ns, so it was %" PRId64
-                         " ns %s when the wait began (this line is bounded; the true count is the "
-                         "BUDGET line's syncobj_timeout counter)",
-                         *orbis_fence_label, (int64_t)timeout_nsec, now_ns,
-                         now_ns - (int64_t)timeout_nsec,
-                         now_ns >= (int64_t)timeout_nsec ? "ALREADY PAST" : "in the future");
-            }
+            /* Loud, because a real expired deadline means the GPU did not reach the end of a submission. */
+            mesa_logw("orbis-drm: syncobj wait timed out - the GPU did not finish; label %u",
+                      *orbis_fence_label);
          }
          return -ETIME;
       }
@@ -8126,9 +7633,6 @@ orbis_backing_unmap_locked(uint64_t addr, uint64_t size, struct orbis_bo *bo)
 int
 ac_drm_bo_alloc(ac_drm_device *dev, struct amdgpu_bo_alloc_request *alloc_buffer, ac_drm_bo *bo)
 {
-#if defined(__PS4__)
-   orbis_kc_hit(ORBIS_KC_BO_ALLOC);
-#endif
    struct orbis_bo *obo = calloc(1, sizeof(*obo));
    if (!obo)
       return -ENOMEM;
@@ -8160,9 +7664,6 @@ ac_drm_bo_alloc(ac_drm_device *dev, struct amdgpu_bo_alloc_request *alloc_buffer
 int
 ac_drm_bo_free(ac_drm_device *dev, ac_drm_bo bo)
 {
-#if defined(__PS4__)
-   orbis_kc_hit(ORBIS_KC_BO_FREE);
-#endif
    struct orbis_bo *obo = bo.abo;
    if (!obo)
       return -EINVAL;
@@ -8404,9 +7905,6 @@ orbis_bo_va_op(uint32_t bo_handle, uint64_t offset, uint64_t size, uint64_t addr
    switch (ops) {
    case AMDGPU_VA_OP_MAP: {
       struct orbis_bo *obo = orbis_bo_from_handle(bo_handle);
-#if defined(__PS4__)
-      orbis_kc_hit(ORBIS_KC_VA_MAP);
-#endif
 
       /* Give the rights back before anything can touch the range. Wider than the revoke on purpose: a page
        * this buffer shares with a neighbour may have been revoked when that neighbour died. */
@@ -8625,9 +8123,6 @@ orbis_bo_va_op(uint32_t bo_handle, uint64_t offset, uint64_t size, uint64_t addr
       return 0;
    }
    case AMDGPU_VA_OP_UNMAP: {
-#if defined(__PS4__)
-      orbis_kc_hit(ORBIS_KC_VA_UNMAP);
-#endif
       /* Forget it here, so a later mapping of the same range is not reported as an overlap. An UNMAP this arm
        * treats as a no-op for the BACKING is still a real event for the bookkeeping. */
       simple_mtx_lock(&orbis_map_lock);
@@ -8790,173 +8285,6 @@ orbis_align_up(uint64_t v, uint64_t a)
    return a > 1 ? (v + a - 1) & ~(a - 1) : v;
 }
 
-/* ---------------------------------------------------------------- WHAT THE ARENA ACTUALLY LOOKS LIKE
- *
- * ⚠ "out of device VA" USED TO SAY ONLY THAT IT HAPPENED, AND THAT IS NOT ENOUGH TO ACT ON. Three
- * different faults produce the identical line and they need three different fixes:
- *
- *   a LEAK          - live bytes climb monotonically and never come back down
- *   FRAGMENTATION   - live bytes are flat, but the largest free gap shrinks below the request while
- *                     plenty of free space remains spread across many gaps
- *   CAPACITY        - live bytes are flat, the free space is genuinely nearly zero, and the title
- *                     simply wants more than the window holds
- *
- * The three are told apart by four numbers - live bytes, free bytes, the largest gap, and the number
- * of gaps - so they are printed on the failure AND every five seconds, because a single sample at the
- * moment of death cannot show a trend and the trend is the whole answer.
- *
- * ⚠ THE WINDOW IS NOT 16 GB. ORBIS_VA_BASE_DEFAULT/ORBIS_VA_END_DEFAULT at the top of this file are
- * overwritten during arena setup: the window is the direct-memory arena minus this arm's private
- * slice, which the ladder makes 1024 MiB at best and the log reports as "RADV's window ... (991 MiB)".
- * The report prints the window size with every sample so no reader has to remember which is in force.
- *
- * A parked range - retired by RADV, still held here until the GPU passes the last submission handed
- * out - is counted separately, because "the retire queue is not draining" and "the title is holding
- * memory" are different faults and both show as live bytes.
- *
- * COST: one walk of a list of a few hundred entries, five times a minute plus once per failure. */
-struct orbis_va_stats {
-   uint64_t ranges;        /* entries in the sorted list */
-   uint64_t retired;       /* of those, freed by RADV and parked until the GPU passes them */
-   uint64_t retired_bytes;
-   uint64_t used;          /* bytes the list covers, each range's own trailing gap included */
-   uint64_t largest_range;
-   uint64_t gaps;          /* separate runs of free address space */
-   uint64_t free_bytes;
-   uint64_t largest_gap;
-   /* Live ranges by size class, so a leak names the size that is leaking. The classes are powers of
-    * four from 64 KiB, which is coarse enough to stay one line and fine enough to separate a
-    * descriptor pool from a render target. */
-   uint64_t bucket_n[7];
-   uint64_t bucket_bytes[7];
-};
-
-static uint64_t orbis_va_allocs, orbis_va_frees;
-
-static void
-orbis_va_snapshot(struct orbis_va_stats *s)
-{
-   memset(s, 0, sizeof(*s));
-
-   simple_mtx_lock(&orbis_va_lock);
-   uint64_t cursor = orbis_va_base;
-   for (const struct amdgpu_va *va = orbis_va_list; va; va = va->next) {
-      s->ranges++;
-      s->used += va->size;
-      if (va->size > s->largest_range)
-         s->largest_range = va->size;
-      if (va->retired) {
-         s->retired++;
-         s->retired_bytes += va->size;
-      }
-      if (va->base > cursor) {
-         const uint64_t gap = va->base - cursor;
-         s->gaps++;
-         s->free_bytes += gap;
-         if (gap > s->largest_gap)
-            s->largest_gap = gap;
-      }
-      if (va->base + va->size > cursor)
-         cursor = va->base + va->size;
-
-      unsigned b = 0;
-      for (uint64_t edge = 64ull * 1024; b < 6 && va->size > edge; edge *= 4)
-         b++;
-      s->bucket_n[b]++;
-      s->bucket_bytes[b] += va->size;
-   }
-   simple_mtx_unlock(&orbis_va_lock);
-
-   /* The tail of the window is a gap like any other, and it is the one first-fit reaches last. */
-   if (orbis_va_end > cursor) {
-      const uint64_t gap = orbis_va_end - cursor;
-      s->gaps++;
-      s->free_bytes += gap;
-      if (gap > s->largest_gap)
-         s->largest_gap = gap;
-   }
-}
-
-static void
-orbis_va_report(const char *why)
-{
-   struct orbis_va_stats s;
-   orbis_va_snapshot(&s);
-
-   const uint64_t window = orbis_va_end > orbis_va_base ? orbis_va_end - orbis_va_base : 0;
-
-   mesa_logi("orbis-drm: ARENA %s: %" PRIu64 " live range(s) holding %" PRIu64 " KiB of a %" PRIu64
-             " KiB window; free %" PRIu64 " KiB in %" PRIu64 " gap(s), LARGEST GAP %" PRIu64
-             " KiB; largest live range %" PRIu64 " KiB; %" PRIu64 " range(s) (%" PRIu64
-             " KiB) are parked for the GPU and %u entr(ies) sit on the retire queue; %" PRIu64
-             " alloc(s) and %" PRIu64 " free(s) since start, so %" PRIu64 " are outstanding",
-             why, s.ranges, s.used / 1024, window / 1024, s.free_bytes / 1024, s.gaps,
-             s.largest_gap / 1024, s.largest_range / 1024, s.retired, s.retired_bytes / 1024,
-             orbis_retire_count, orbis_va_allocs, orbis_va_frees,
-             orbis_va_allocs - orbis_va_frees);
-
-   mesa_logi("orbis-drm: ARENA %s by size: <=64K %" PRIu64 " (%" PRIu64 " KiB), <=256K %" PRIu64
-             " (%" PRIu64 " KiB), <=1M %" PRIu64 " (%" PRIu64 " KiB), <=4M %" PRIu64 " (%" PRIu64
-             " KiB), <=16M %" PRIu64 " (%" PRIu64 " KiB), <=64M %" PRIu64 " (%" PRIu64
-             " KiB), >64M %" PRIu64 " (%" PRIu64 " KiB)",
-             why, s.bucket_n[0], s.bucket_bytes[0] / 1024, s.bucket_n[1], s.bucket_bytes[1] / 1024,
-             s.bucket_n[2], s.bucket_bytes[2] / 1024, s.bucket_n[3], s.bucket_bytes[3] / 1024,
-             s.bucket_n[4], s.bucket_bytes[4] / 1024, s.bucket_n[5], s.bucket_bytes[5] / 1024,
-             s.bucket_n[6], s.bucket_bytes[6] / 1024);
-
-   /* ⚠ AND WHO. A size class is not a culprit; a REPEATED EXACT SIZE is, because RADV asks for a VA
-    * range of exactly align64(bo_size, page) + pad, so one allocation site produces one number. The
-    * failing request in the swanstation run was 2113536 bytes - a 2 MiB buffer plus RADV's pad page -
-    * and if four hundred ranges of exactly 2113536 bytes are live, the leak is named without any
-    * further instrument. Sixty-four distinct sizes are tracked and the six largest totals printed;
-    * anything past that is lumped, which is honest rather than silent. */
-   {
-      struct { uint64_t size, n; } tally[64];
-      unsigned distinct = 0;
-      uint64_t spilled_n = 0;
-
-      simple_mtx_lock(&orbis_va_lock);
-      for (const struct amdgpu_va *va = orbis_va_list; va; va = va->next) {
-         unsigned i = 0;
-         while (i < distinct && tally[i].size != va->size)
-            i++;
-         if (i < distinct) {
-            tally[i].n++;
-         } else if (distinct < ARRAY_SIZE(tally)) {
-            tally[distinct].size = va->size;
-            tally[distinct].n = 1;
-            distinct++;
-         } else {
-            spilled_n++;
-         }
-      }
-      simple_mtx_unlock(&orbis_va_lock);
-
-      char line[512];
-      int n = 0;
-      for (unsigned shown = 0; shown < 6 && n < (int)sizeof(line) - 1; shown++) {
-         unsigned best = distinct;
-         uint64_t best_bytes = 0;
-         for (unsigned i = 0; i < distinct; i++) {
-            if (tally[i].n == 0)
-               continue;
-            if (tally[i].size * tally[i].n > best_bytes) {
-               best_bytes = tally[i].size * tally[i].n;
-               best = i;
-            }
-         }
-         if (best == distinct)
-            break;
-         n += snprintf(line + n, sizeof(line) - n, "%s%" PRIu64 " B x%" PRIu64 " = %" PRIu64 " KiB",
-                       n ? ", " : "", tally[best].size, tally[best].n, best_bytes / 1024);
-         tally[best].n = 0;
-      }
-
-      mesa_logi("orbis-drm: ARENA %s biggest holders by exact size: %s%s", why, n ? line : "(none)",
-                spilled_n ? " (and more than 64 distinct sizes, so the tail is not shown)" : "");
-   }
-}
-
 int
 ac_drm_va_range_alloc(ac_drm_device *dev, enum amdgpu_gpu_va_range va_range_type, uint64_t size,
                       uint64_t va_base_alignment, uint64_t va_base_required,
@@ -9073,16 +8401,6 @@ ac_drm_va_range_alloc(ac_drm_device *dev, enum amdgpu_gpu_va_range va_range_type
                 no_reuse ? " - with ORBIS_VA_NO_REUSE set, so this is the window being consumed rather than "
                            "fragmented, and everything measured before this line still stands"
                          : "");
-      /* ⚠ AND WHY. The error alone repeated 183 times in the swanstation run and said nothing that the
-       * first line had not: the state of the arena is what separates a leak from fragmentation from a
-       * window that is simply too small, and it has to be printed HERE because after the failure the
-       * title tears down and the evidence goes with it. Budgeted, because the title retries this
-       * allocation every frame and eight samples are as good as two hundred. */
-      {
-         static unsigned said;
-         if (orbis_budget(&said, 8))
-            orbis_va_report("AT THE FAILURE");
-      }
       return -ENOMEM;
    }
 
@@ -9136,7 +8454,6 @@ ac_drm_va_range_alloc(ac_drm_device *dev, enum amdgpu_gpu_va_range va_range_type
    va->base = candidate;
    va->next = *link;
    *link = va;
-   orbis_va_allocs++; /* under the VA lock, so it needs no atomic of its own */
    simple_mtx_unlock(&orbis_va_lock);
 
    *va_base_allocated = va->base;
@@ -9149,11 +8466,6 @@ ac_drm_va_range_free(amdgpu_va_handle va_range_handle)
 {
    if (!va_range_handle)
       return 0; /* RADV's error paths free unconditionally; libdrm tolerates NULL the same way. */
-
-   /* Counted at the DOOR rather than at the release, because the two differ by exactly the ranges this
-    * arm is still holding for the GPU - and that difference is the number that says whether the retire
-    * queue is draining. */
-   p_atomic_inc(&orbis_va_frees);
 
    /* ⚠ POISON AND QUARANTINE, AND THIS IS WHERE THIS PORT DIFFERS FROM EVERY LINUX ONE.
     *
@@ -11024,14 +10336,10 @@ ac_drm_cs_submit_raw2(ac_drm_device *dev, uint32_t ctx_id, uint32_t bo_list_hand
       }
    }
 
-   /* FlushGarlic's own mark is gone: its segment booked 32 bytes across 2400 frames, and a meter read
-      that measures nothing is a meter read this instrument can no longer afford. */
-   orbis_ledger_mark(ORBIS_LG_SUBMIT_ENTER);
    sceGnmFlushGarlic();
 
    const uint64_t t0 = os_time_get_nano();
    const int32_t err = sceGnmSubmitCommandBuffers(n_dcb, dcb, dcb_bytes, NULL, NULL);
-   orbis_ledger_mark(ORBIS_LG_AFTER_GNM_SUBMIT);
    const uint64_t t1 = os_time_get_nano();
    if (getenv("ORBIS_WATCH_STRICT") != NULL && err == 0) {
       /* Bounded, like every wait in this file: if the GPU does not get there, the check is skipped rather than the
@@ -11186,11 +10494,6 @@ ac_drm_cs_submit_raw2(ac_drm_device *dev, uint32_t ctx_id, uint32_t bo_list_hand
       static uint64_t win_passes, win_px, win_disp, win_groups, win_sub_ns;
       static uint64_t win_rec_ns, win_draws, win_dbinds, win_spans;
       static uint64_t win_api_ns[ORBIS_API_SLOTS], win_api_calls[ORBIS_API_SLOTS];
-#if defined(__PS4__)
-      static uint64_t win_kc[ORBIS_KC_SLOTS];
-      static uint64_t win_ifree;
-      static unsigned long long win_fw, win_ftw, win_fto, win_flk, win_cm, win_cr;
-#endif
 
       const uint64_t now = os_time_get_nano();
 
@@ -11291,84 +10594,8 @@ ac_drm_cs_submit_raw2(ac_drm_device *dev, uint32_t ctx_id, uint32_t bo_list_hand
                             " us a frame in all of them, against a frame of %" PRIu64 " us",
                             line, np ? total_us / np : 0, np ? wall_us / np : 0);
                }
-
-               /* ⚠ AND THE ARENA, EVERY WINDOW, BECAUSE ONE SAMPLE AT THE MOMENT OF DEATH IS NOT A
-                * DIAGNOSIS. swanstation ran for three and a half minutes and then failed to allocate
-                * 2 MiB; whether the live bytes had been climbing the whole time (a leak), or had been
-                * flat while the largest gap collapsed (fragmentation), or had been flat and high from
-                * the start (a window that is simply too small) cannot be read off the failure alone.
-                * A line every five seconds turns the whole run into the trend that answers it, at the
-                * cost of one walk of a few hundred list entries. */
-               orbis_va_report("now");
-
-#if defined(__PS4__)
-               /* ⚠ THE ATTRIBUTION LINE. Bytes of libkernel internal memory lost this window,
-                * divided by the same present count everything else on these lines is divided by,
-                * beside the number of each kernel call that could have consumed them. A leak that
-                * divides evenly by one of these counts names its own call site; one that divides by
-                * none of them says the consumer is inside libkernel or inside a facility this file
-                * does not make, and the next step is the frontend's gated
-                * sceKernelInternalHeapPrintBacktraceWithModuleInfo rather than more counting here. */
-               {
-                  const uint64_t ifree = orbis_internal_memory_free();
-                  char kline[512];
-                  int kn = 0;
-
-                  for (unsigned i = 0; i < ORBIS_KC_SLOTS && kn < (int)sizeof(kline) - 1; i++) {
-                     const uint64_t calls = orbis_kc[i] - win_kc[i];
-                     if (calls == 0)
-                        continue;
-                     kn += snprintf(kline + kn, sizeof(kline) - kn, "%s%s %" PRIu64 " (%" PRIu64
-                                    "/frame)", kn ? ", " : "", orbis_kc_names[i], calls,
-                                    np ? calls / np : 0);
-                  }
-
-                  unsigned long long fw = 0, ftw = 0, fto = 0, flk = 0;
-                  unsigned long long cm = 0, cr = 0;
-                  if (&orbis_umtx_stats != NULL)
-                     orbis_umtx_stats(&fw, &ftw, &fto, &flk);
-                  if (&orbis_clock_counts != NULL)
-                     orbis_clock_counts(&cm, &cr);
-
-                  if (ifree == 0) {
-                     mesa_logw("orbis-drm: libkernel internal memory is UNREADABLE - "
-                               "sceKernelInternalMemoryGetAvailableSize did not resolve, so the "
-                               "attribution below has no left-hand side. Kernel calls this window: %s",
-                               kn ? kline : "none");
-                  } else {
-                     const int64_t lost = (int64_t)win_ifree - (int64_t)ifree;
-                     mesa_logi("orbis-drm: libkernel internal memory %" PRIu64 " bytes free, %" PRId64
-                               " lost this window = %" PRId64 " bytes a frame, against kernel calls: %s"
-                               "; futex shim this window: %llu wait(s), %llu cond-timedwait(s), "
-                               "%llu TIMED OUT, %llu bucket lock(s); clock_gettime this window: "
-                               "%llu monotonic, %llu realtime",
-                               ifree, win_ifree ? lost : 0,
-                               (win_ifree && np) ? lost / (int64_t)np : 0, kn ? kline : "none",
-                               fw - win_fw, ftw - win_ftw, fto - win_fto, flk - win_flk,
-                               cm - win_cm, cr - win_cr);
-                  }
-                  win_ifree = ifree;
-                  win_fw = fw; win_ftw = ftw; win_fto = fto; win_flk = flk;
-                  win_cm = cm; win_cr = cr;
-                  for (unsigned i = 0; i < ORBIS_KC_SLOTS; i++)
-                     win_kc[i] = orbis_kc[i];
-               }
-#endif
             }
 
-#if defined(__PS4__)
-            /* Seeded on the FIRST window, which prints nothing, so the first line that does print
-             * carries a real difference rather than the whole of startup. */
-            if (win_ifree == 0) {
-               win_ifree = orbis_internal_memory_free();
-               if (&orbis_umtx_stats != NULL)
-                  orbis_umtx_stats(&win_fw, &win_ftw, &win_fto, &win_flk);
-               if (&orbis_clock_counts != NULL)
-                  orbis_clock_counts(&win_cm, &win_cr);
-               for (unsigned i = 0; i < ORBIS_KC_SLOTS; i++)
-                  win_kc[i] = orbis_kc[i];
-            }
-#endif
             win_ns = now;
             win_cpu_us = cpu_us;
             win_seq = seq;
@@ -11415,14 +10642,6 @@ ac_drm_cs_submit_raw2(ac_drm_device *dev, uint32_t ctx_id, uint32_t bo_list_hand
    }
 
    ORBIS_SUBMIT_STAGE("out-syncobjs attached, returning");
-
-   /* ⚠ THE MARK THAT WAS MISSING, AND ITS ABSENCE MISLABELLED A COLUMN. Without it the segment named
-    * "GnmSubmit..submit:exit" ran from the Gnm call all the way to the NEXT frame's present, so it
-    * swallowed the rest of this function - including the five-second BUDGET report and its arena walk,
-    * which read the meter themselves - and the return path through RADV and zink. Its 176 bytes a
-    * frame were therefore attributed to nothing in particular, and part of them were this
-    * instrument measuring itself. Closed here, so the segment is what its name says. */
-   orbis_ledger_mark(ORBIS_LG_SUBMIT_EXIT);
    *seq_no = seq;
    { return orbis_submit_return(0, orbis_submit_t0); }
 #undef ORBIS_SUBMIT_STAGE
