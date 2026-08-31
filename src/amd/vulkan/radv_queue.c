@@ -2486,6 +2486,45 @@ fail:
    return result;
 }
 
+/* ⚠ BY BLOCK, NOT BY BYTE, AND THE BYTE LOOP THIS REPLACES FROZE EVERY RETROARCH SESSION FOR 1.5 s.
+ *
+ * The scan answers "what is the highest byte the hardware disturbed", which needs the whole buffer
+ * walked backwards until something is not the poison value. Written as a byte loop that is 8649728
+ * iterations whenever the answer is zero - which is the healthy case and therefore the common one -
+ * and it runs on the submit path.
+ *
+ * Measured 2026-09-01: with ORBIS_TESS_RING_WATERMARK=256 left in /data/tempest-env.txt, which
+ * RetroArch reads first on every run, the run loop froze for 1.47-1.53 s every 768 iterations, in the
+ * menu, with no core loaded. The instrument was costing more than the thing it measured.
+ *
+ * Same answer, by memcmp against a poison block: an untouched buffer costs one comparison per block
+ * instead of one load per byte, and only the first block that differs is walked a byte at a time. */
+static uint64_t
+orbis_tess_watermark_scan(const uint8_t *map, uint64_t size)
+{
+   enum { BLOCK = 4096 };
+   static uint8_t poison_block[BLOCK];
+   static bool poison_ready;
+   uint64_t at = size;
+
+   if (!poison_ready) {
+      memset(poison_block, ORBIS_TESS_RING_POISON, sizeof(poison_block));
+      poison_ready = true;
+   }
+
+   while (at >= BLOCK) {
+      if (memcmp(map + at - BLOCK, poison_block, BLOCK) != 0)
+         break;
+      at -= BLOCK;
+   }
+
+   /* Either the tail below a whole block, or the one block that differs: at most BLOCK bytes. */
+   while (at > 0 && map[at - 1] == ORBIS_TESS_RING_POISON)
+      --at;
+
+   return at;
+}
+
 static VkResult
 radv_queue_submit(struct vk_queue *vqueue, struct vk_queue_submit *submission)
 {
@@ -2510,17 +2549,13 @@ radv_queue_submit(struct vk_queue *vqueue, struct vk_queue_submit *submission)
          uint64_t i = orbis_tess_ring_size;
          uint64_t j = 0;
 
-         while (i > 0 && orbis_tess_ring_map[i - 1] == ORBIS_TESS_RING_POISON)
-            --i;
+         i = orbis_tess_watermark_scan(orbis_tess_ring_map, orbis_tess_ring_size);
 
          /* The same read on Sony's ring, and it answers the sharper question: the scan above measures how
           * much of an allocation was used, this one measures whether the hardware went PAST the size it was
-          * given. Backwards from the end, so an undisturbed tail costs one page. */
-         if (orbis_sony_tf_tail != NULL) {
-            j = orbis_sony_tf_tail_size;
-            while (j > 0 && orbis_sony_tf_tail[j - 1] == ORBIS_TESS_RING_POISON)
-               --j;
-         }
+          * given. Backwards from the end, so an undisturbed tail costs one block. */
+         if (orbis_sony_tf_tail != NULL)
+            j = orbis_tess_watermark_scan(orbis_sony_tf_tail, orbis_sony_tf_tail_size);
 
          mesa_logi("radv/orbis: tess watermark @ submission %" PRIu64 " - BO %" PRIu64 " B of %" PRIu64
                    " disturbed (ac_gpu_info sizes the rings at %u); Sony's ring %s",
