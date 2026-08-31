@@ -162,6 +162,16 @@ orbis_kc_count(unsigned slot)
 extern uint64_t sceKernelInternalMemoryGetAvailableSize(void *out, uint64_t out_len, uint64_t zero)
    __attribute__((weak));
 
+/* ⚠ THE ONE CONSUMER THIS DRIVER CANNOT SEE FROM THE INSIDE. Every counter above is a call this file
+ * makes on purpose. simple_mtx is not: its contended path is futex_wait, and on this console
+ * futex_wait is orbis-compat's _umtx_op shim, which sleeps on a pthread condition variable with a
+ * deadline. A cond wait that TIMES OUT is the last unexamined thing on the failing syncobj path, and
+ * it is the right shape - allocated on entry, released on the signalled return, never on the expired
+ * one. Weak, so a build without the overlay's counters reports zeroes instead of failing to link. */
+extern void orbis_umtx_stats(unsigned long long *waits, unsigned long long *timedwaits,
+                             unsigned long long *timeouts, unsigned long long *locks)
+   __attribute__((weak));
+
 static uint64_t
 orbis_internal_memory_free(void)
 {
@@ -5769,10 +5779,23 @@ orbis_sync_wait(struct util_sync_provider *p, uint32_t *handles, unsigned num_ha
              * Either answer is worth a run, and the log is worth bounding regardless. */
             static unsigned said_timeout;
             if (orbis_budget(&said_timeout, 8)) {
-               mesa_logw("orbis-drm: syncobj wait timed out - the GPU did not finish; label %u "
-                         "(this line is bounded; the true count is on the BUDGET line's "
-                         "syncobj_timeout counter)",
-                         *orbis_fence_label);
+               /* ⚠ AND WHY IT EXPIRED, NOT ONLY THAT IT DID - the question the counter cannot answer.
+                * 81 of these a frame while Usleep runs at 15 a frame means most of them never slept
+                * ONCE: orbis_wait_continue found the caller's deadline already behind it on the first
+                * pass. That is either a caller asking for no time at all, or a deadline made on a
+                * different clock base from the one compared against here - the second is the exact
+                * defect orbis-compat's umtx.h was written to fix on the futex path, and nothing has
+                * ever checked for it here. The three numbers below tell those apart: a deadline that
+                * is microseconds in the past is a caller with no patience, one that is decades in the
+                * past is the clock. */
+               const int64_t now_ns = (int64_t)os_time_get_nano();
+               mesa_logw("orbis-drm: syncobj wait timed out - the GPU did not finish; label %u. "
+                         "Caller's deadline %" PRId64 " ns, now %" PRId64 " ns, so it was %" PRId64
+                         " ns %s when the wait began (this line is bounded; the true count is the "
+                         "BUDGET line's syncobj_timeout counter)",
+                         *orbis_fence_label, (int64_t)timeout_nsec, now_ns,
+                         now_ns - (int64_t)timeout_nsec,
+                         now_ns >= (int64_t)timeout_nsec ? "ALREADY PAST" : "in the future");
             }
          }
          return -ETIME;
@@ -10676,6 +10699,7 @@ ac_drm_cs_submit_raw2(ac_drm_device *dev, uint32_t ctx_id, uint32_t bo_list_hand
 #if defined(__PS4__)
       static uint64_t win_kc[ORBIS_KC_SLOTS];
       static uint64_t win_ifree;
+      static unsigned long long win_fw, win_ftw, win_fto, win_flk;
 #endif
 
       const uint64_t now = os_time_get_nano();
@@ -10809,6 +10833,10 @@ ac_drm_cs_submit_raw2(ac_drm_device *dev, uint32_t ctx_id, uint32_t bo_list_hand
                                     np ? calls / np : 0);
                   }
 
+                  unsigned long long fw = 0, ftw = 0, fto = 0, flk = 0;
+                  if (&orbis_umtx_stats != NULL)
+                     orbis_umtx_stats(&fw, &ftw, &fto, &flk);
+
                   if (ifree == 0) {
                      mesa_logw("orbis-drm: libkernel internal memory is UNREADABLE - "
                                "sceKernelInternalMemoryGetAvailableSize did not resolve, so the "
@@ -10817,11 +10845,15 @@ ac_drm_cs_submit_raw2(ac_drm_device *dev, uint32_t ctx_id, uint32_t bo_list_hand
                   } else {
                      const int64_t lost = (int64_t)win_ifree - (int64_t)ifree;
                      mesa_logi("orbis-drm: libkernel internal memory %" PRIu64 " bytes free, %" PRId64
-                               " lost this window = %" PRId64 " bytes a frame, against kernel calls: %s",
+                               " lost this window = %" PRId64 " bytes a frame, against kernel calls: %s"
+                               "; futex shim this window: %llu wait(s), %llu cond-timedwait(s), "
+                               "%llu TIMED OUT, %llu bucket lock(s)",
                                ifree, win_ifree ? lost : 0,
-                               (win_ifree && np) ? lost / (int64_t)np : 0, kn ? kline : "none");
+                               (win_ifree && np) ? lost / (int64_t)np : 0, kn ? kline : "none",
+                               fw - win_fw, ftw - win_ftw, fto - win_fto, flk - win_flk);
                   }
                   win_ifree = ifree;
+                  win_fw = fw; win_ftw = ftw; win_fto = fto; win_flk = flk;
                   for (unsigned i = 0; i < ORBIS_KC_SLOTS; i++)
                      win_kc[i] = orbis_kc[i];
                }
@@ -10833,6 +10865,8 @@ ac_drm_cs_submit_raw2(ac_drm_device *dev, uint32_t ctx_id, uint32_t bo_list_hand
              * carries a real difference rather than the whole of startup. */
             if (win_ifree == 0) {
                win_ifree = orbis_internal_memory_free();
+               if (&orbis_umtx_stats != NULL)
+                  orbis_umtx_stats(&win_fw, &win_ftw, &win_fto, &win_flk);
                for (unsigned i = 0; i < ORBIS_KC_SLOTS; i++)
                   win_kc[i] = orbis_kc[i];
             }
