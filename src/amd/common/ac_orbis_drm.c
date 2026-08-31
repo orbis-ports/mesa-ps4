@@ -113,6 +113,7 @@ static const char *const orbis_kc_names[ORBIS_KC_SLOTS] = {
    [ORBIS_KC_VA_MAP] = "va_map",
    [ORBIS_KC_VA_UNMAP] = "va_unmap",
    [ORBIS_KC_SYNC_TIMEOUT] = "syncobj_timeout",
+   [ORBIS_KC_SYNC_POLL] = "syncobj_poll",
    [ORBIS_KC_USLEEP] = "Usleep",
    [ORBIS_KC_GNM_FLUSH_GARLIC] = "FlushGarlic",
    [ORBIS_KC_GNM_SUBMIT_DONE] = "SubmitDone",
@@ -170,6 +171,11 @@ extern uint64_t sceKernelInternalMemoryGetAvailableSize(void *out, uint64_t out_
  * one. Weak, so a build without the overlay's counters reports zeroes instead of failing to link. */
 extern void orbis_umtx_stats(unsigned long long *waits, unsigned long long *timedwaits,
                              unsigned long long *timeouts, unsigned long long *locks)
+   __attribute__((weak));
+
+/* The other half of the same argument: two clock reads happen on every one of those waits, and
+   146/2 = 73 is the size of a small fixed record. Weak for the same reason. */
+extern void orbis_clock_counts(unsigned long long *monotonic, unsigned long long *realtime)
    __attribute__((weak));
 
 static uint64_t
@@ -5686,6 +5692,24 @@ orbis_sync_wait(struct util_sync_provider *p, uint32_t *handles, unsigned num_ha
    struct orbis_wait_watch watch;
    orbis_wait_begin(&watch, (uint64_t)timeout_nsec, "syncobj");
 
+   /* ⚠ A DEADLINE THAT WAS ALREADY BEHIND US WHEN WE WERE CALLED IS A POLL, NOT A WAIT, AND THIS
+    * DRIVER HAS BEEN CALLING IT A GPU FAILURE.
+    *
+    * Measured on hardware 2026-08-31: 81 of these a frame, and the caller's deadline was 1344 ns and
+    * 5374 ns in the past on entry - microseconds, not the decades a wrong clock base would give. So
+    * zink is asking "is it done yet" and expressing it as an absolute deadline of the present
+    * instant, which is exactly what timeout_nsec == 0 means and is already handled quietly three
+    * screens down. Same label repeatedly, which is what a poll loop looks like.
+    *
+    * ⚠ AND THIS CHANGES THE ANSWER, NOT THE WORK - said plainly because it would be easy to read as
+    * a performance fix and it is not one. A wait whose deadline has passed already returns after a
+    * single pass of the loop below; there is no sleep to remove and no call to avoid. What this
+    * removes is a wrong diagnosis - "the GPU did not finish" about a caller that never asked it to -
+    * and it splits the counter, so the next run can say whether the ~146 bytes this driver loses per
+    * expiring wait follows the POLLS or the genuine timeouts. Those are different bugs if they
+    * separate. */
+   const bool expired_on_entry = (int64_t)os_time_get_nano() >= watch.caller_deadline;
+
    /* ⚠ THE MEASUREMENT THE FENCE POOL NEEDS. A title exhausted its 32-fence pool and threw "device is
     * lost" while this arm reported the GPU label advancing normally - which means the disagreement is
     * between what a fence WAS given and what this wait is comparing it against. Print both, per handle,
@@ -5753,11 +5777,14 @@ orbis_sync_wait(struct util_sync_provider *p, uint32_t *handles, unsigned num_ha
           * The DIAGNOSIS this used to shout is still correct for a real timeout: on this platform nothing signals
           * from an interrupt, so a deadline that expires means the GPU did not reach the end of a submission. */
          errno = ETIME;
-         if (timeout_nsec == 0) {
+         if (timeout_nsec == 0 || expired_on_entry) {
+#if defined(__PS4__)
+            orbis_kc_hit(ORBIS_KC_SYNC_POLL);
+#endif
             static unsigned polls;
             if (orbis_budget(&polls, 4)) {
-               mesa_logi("orbis-drm: syncobj POLL says not yet, label %u - a zero timeout is a question, not a "
-                         "failure", *orbis_fence_label);
+               mesa_logi("orbis-drm: syncobj POLL says not yet, label %u - a deadline of now or "
+                         "earlier is a question, not a failure", *orbis_fence_label);
             }
          } else {
 #if defined(__PS4__)
@@ -10699,7 +10726,7 @@ ac_drm_cs_submit_raw2(ac_drm_device *dev, uint32_t ctx_id, uint32_t bo_list_hand
 #if defined(__PS4__)
       static uint64_t win_kc[ORBIS_KC_SLOTS];
       static uint64_t win_ifree;
-      static unsigned long long win_fw, win_ftw, win_fto, win_flk;
+      static unsigned long long win_fw, win_ftw, win_fto, win_flk, win_cm, win_cr;
 #endif
 
       const uint64_t now = os_time_get_nano();
@@ -10834,8 +10861,11 @@ ac_drm_cs_submit_raw2(ac_drm_device *dev, uint32_t ctx_id, uint32_t bo_list_hand
                   }
 
                   unsigned long long fw = 0, ftw = 0, fto = 0, flk = 0;
+                  unsigned long long cm = 0, cr = 0;
                   if (&orbis_umtx_stats != NULL)
                      orbis_umtx_stats(&fw, &ftw, &fto, &flk);
+                  if (&orbis_clock_counts != NULL)
+                     orbis_clock_counts(&cm, &cr);
 
                   if (ifree == 0) {
                      mesa_logw("orbis-drm: libkernel internal memory is UNREADABLE - "
@@ -10847,13 +10877,16 @@ ac_drm_cs_submit_raw2(ac_drm_device *dev, uint32_t ctx_id, uint32_t bo_list_hand
                      mesa_logi("orbis-drm: libkernel internal memory %" PRIu64 " bytes free, %" PRId64
                                " lost this window = %" PRId64 " bytes a frame, against kernel calls: %s"
                                "; futex shim this window: %llu wait(s), %llu cond-timedwait(s), "
-                               "%llu TIMED OUT, %llu bucket lock(s)",
+                               "%llu TIMED OUT, %llu bucket lock(s); clock_gettime this window: "
+                               "%llu monotonic, %llu realtime",
                                ifree, win_ifree ? lost : 0,
                                (win_ifree && np) ? lost / (int64_t)np : 0, kn ? kline : "none",
-                               fw - win_fw, ftw - win_ftw, fto - win_fto, flk - win_flk);
+                               fw - win_fw, ftw - win_ftw, fto - win_fto, flk - win_flk,
+                               cm - win_cm, cr - win_cr);
                   }
                   win_ifree = ifree;
                   win_fw = fw; win_ftw = ftw; win_fto = fto; win_flk = flk;
+                  win_cm = cm; win_cr = cr;
                   for (unsigned i = 0; i < ORBIS_KC_SLOTS; i++)
                      win_kc[i] = orbis_kc[i];
                }
@@ -10867,6 +10900,8 @@ ac_drm_cs_submit_raw2(ac_drm_device *dev, uint32_t ctx_id, uint32_t bo_list_hand
                win_ifree = orbis_internal_memory_free();
                if (&orbis_umtx_stats != NULL)
                   orbis_umtx_stats(&win_fw, &win_ftw, &win_fto, &win_flk);
+               if (&orbis_clock_counts != NULL)
+                  orbis_clock_counts(&win_cm, &win_cr);
                for (unsigned i = 0; i < ORBIS_KC_SLOTS; i++)
                   win_kc[i] = orbis_kc[i];
             }
