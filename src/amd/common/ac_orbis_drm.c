@@ -61,6 +61,119 @@
 #include <sys/resource.h>
 #include <string.h>
 
+/* ------------------------------------------------ libkernel's internal memory, per frame, per call
+ *
+ * ⚠ WHAT THIS IS FOR. Four runs of the RetroArch port have ended with the console repeating
+ *
+ *     [ScePthread/System] Internal Memory is running out.        technote 235
+ *
+ * thousands of times until nothing worked. The frontend's watchdog now reads the number behind that
+ * message with sceKernelInternalMemoryGetAvailableSize, and it is unambiguous: 14013728 bytes free at
+ * startup, 96 bytes free at the failure, and in between a drain of up to 3.7 MB per five seconds -
+ * about 12 KB per PRESENTED FRAME - that runs while RetroArch's menu is up and slows to noise while a
+ * core is drawing a single textured quad.
+ *
+ * ⚠ AND EVERY PTHREAD EXPLANATION IS ALREADY DEAD. Across the whole of it pthread_mutex_init,
+ * pthread_cond_init, pthread_attr_init and scePthreadCreate all kept succeeding; the category in the
+ * message is the logger, not the owner of the pool. vkAllocateMemory is ZERO per frame, so it is not
+ * application memory either, and the VA arena is flat at 350 MiB with 114 live ranges, so it is not
+ * address space.
+ *
+ * ⚠ SO THE REMAINING SUSPECT IS THIS FILE'S OWN KERNEL TRAFFIC, and the honest way to test that is to
+ * count it rather than to reason about it. Every sceKernel entry point here that creates, maps,
+ * protects or releases memory is counted, and the budget report divides the window's counts AND the
+ * window's loss of internal memory by the same number of presents. Bytes-lost-per-frame beside
+ * calls-made-per-frame is an attribution; either alone is a story.
+ *
+ * ⚠ THE COUNTING IS A MACRO OVER THE CALL, NOT A WRAPPER FUNCTION, so no call site changes and none
+ * can be missed. `(name)(args)` inside the macro does not re-expand, because a function-like macro is
+ * only expanded when its name is followed directly by a parenthesis. Checked before relying on it:
+ * none of these names is ever used as an address or a cast in this file, only as a call.
+ *
+ * ⚠ AND THE READING IS SIGNATURE-SAFE. sceKernelInternalMemoryGetAvailableSize is exported by
+ * libkernel.so (llvm-nm --dynamic) and declared by no SDK header, so the two plausible Sony shapes -
+ * `int f(size_t *out)` and `size_t f(void)` - are both satisfied by calling it with a real pointer to
+ * a zeroed scratch and reading BOTH the scratch and the return value. It is weak, so a link that
+ * cannot resolve it yields zero rather than a driver that will not build.
+ */
+#if defined(__PS4__)
+enum {
+   ORBIS_KC_DMEM_ALLOC = 0,
+   ORBIS_KC_DMEM_RELEASE,
+   ORBIS_KC_DMEM_MAP,
+   ORBIS_KC_FMEM_MAP,
+   ORBIS_KC_MMAP,
+   ORBIS_KC_MUNMAP,
+   ORBIS_KC_MPROTECT,
+   ORBIS_KC_SUBMIT,
+   /* ⚠ THE MIDDLE TERM, AND WITHOUT IT THE OTHER COUNTS CANNOT BE READ. vkAllocateMemory is measured
+    * at ZERO per frame, which rules out application allocations and nothing else: RADV's own buffers -
+    * command-stream IBs, upload buffers, descriptor and query pools - never pass through it. zink
+    * churns exactly those, once per batch or once per draw, and on this platform each one becomes a
+    * BO here and a mapping below. Counting the BO and the VA operation separately from the syscall is
+    * what distinguishes "zink asks for more" from "we make each ask expensive". */
+   ORBIS_KC_BO_ALLOC,
+   ORBIS_KC_BO_FREE,
+   ORBIS_KC_VA_MAP,
+   ORBIS_KC_VA_UNMAP,
+   ORBIS_KC_SLOTS,
+};
+
+static uint64_t orbis_kc[ORBIS_KC_SLOTS];
+
+static const char *const orbis_kc_names[ORBIS_KC_SLOTS] = {
+   [ORBIS_KC_DMEM_ALLOC] = "AllocateDirectMemory",
+   [ORBIS_KC_DMEM_RELEASE] = "ReleaseDirectMemory",
+   [ORBIS_KC_DMEM_MAP] = "MapDirectMemory",
+   [ORBIS_KC_FMEM_MAP] = "MapFlexibleMemory",
+   [ORBIS_KC_MMAP] = "Mmap",
+   [ORBIS_KC_MUNMAP] = "Munmap",
+   [ORBIS_KC_MPROTECT] = "Mprotect",
+   [ORBIS_KC_SUBMIT] = "SubmitCommandBuffers",
+   [ORBIS_KC_BO_ALLOC] = "bo_alloc",
+   [ORBIS_KC_BO_FREE] = "bo_free",
+   [ORBIS_KC_VA_MAP] = "va_map",
+   [ORBIS_KC_VA_UNMAP] = "va_unmap",
+};
+
+static inline void
+orbis_kc_hit(unsigned slot)
+{
+   p_atomic_inc(&orbis_kc[slot]);
+}
+
+#define sceKernelAllocateDirectMemory(...)                                                         \
+   (orbis_kc_hit(ORBIS_KC_DMEM_ALLOC), (sceKernelAllocateDirectMemory)(__VA_ARGS__))
+#define sceKernelReleaseDirectMemory(...)                                                          \
+   (orbis_kc_hit(ORBIS_KC_DMEM_RELEASE), (sceKernelReleaseDirectMemory)(__VA_ARGS__))
+#define sceKernelMapDirectMemory(...)                                                              \
+   (orbis_kc_hit(ORBIS_KC_DMEM_MAP), (sceKernelMapDirectMemory)(__VA_ARGS__))
+#define sceKernelMapFlexibleMemory(...)                                                            \
+   (orbis_kc_hit(ORBIS_KC_FMEM_MAP), (sceKernelMapFlexibleMemory)(__VA_ARGS__))
+#define sceKernelMmap(...) (orbis_kc_hit(ORBIS_KC_MMAP), (sceKernelMmap)(__VA_ARGS__))
+#define sceKernelMunmap(...) (orbis_kc_hit(ORBIS_KC_MUNMAP), (sceKernelMunmap)(__VA_ARGS__))
+#define sceKernelMprotect(...) (orbis_kc_hit(ORBIS_KC_MPROTECT), (sceKernelMprotect)(__VA_ARGS__))
+#define sceGnmSubmitCommandBuffers(...)                                                            \
+   (orbis_kc_hit(ORBIS_KC_SUBMIT), (sceGnmSubmitCommandBuffers)(__VA_ARGS__))
+
+extern uint64_t sceKernelInternalMemoryGetAvailableSize(void *out, uint64_t out_len, uint64_t zero)
+   __attribute__((weak));
+
+static uint64_t
+orbis_internal_memory_free(void)
+{
+   uint64_t scratch[8];
+   uint64_t ret;
+
+   if (&sceKernelInternalMemoryGetAvailableSize == NULL)
+      return 0;
+
+   memset(scratch, 0, sizeof(scratch));
+   ret = sceKernelInternalMemoryGetAvailableSize(scratch, sizeof(scratch), 0);
+   return scratch[0] != 0 ? scratch[0] : ret;
+}
+#endif /* __PS4__ */
+
 /* Once per call site, not once per call: RADV asks these questions at initialisation rates, and a
  * per-call log is thousands of lines nobody reads. The shape mirrors gnmLogOnceFor in the Tempest fork.
  *
@@ -7480,6 +7593,9 @@ orbis_backing_unmap_locked(uint64_t addr, uint64_t size, struct orbis_bo *bo)
 int
 ac_drm_bo_alloc(ac_drm_device *dev, struct amdgpu_bo_alloc_request *alloc_buffer, ac_drm_bo *bo)
 {
+#if defined(__PS4__)
+   orbis_kc_hit(ORBIS_KC_BO_ALLOC);
+#endif
    struct orbis_bo *obo = calloc(1, sizeof(*obo));
    if (!obo)
       return -ENOMEM;
@@ -7511,6 +7627,9 @@ ac_drm_bo_alloc(ac_drm_device *dev, struct amdgpu_bo_alloc_request *alloc_buffer
 int
 ac_drm_bo_free(ac_drm_device *dev, ac_drm_bo bo)
 {
+#if defined(__PS4__)
+   orbis_kc_hit(ORBIS_KC_BO_FREE);
+#endif
    struct orbis_bo *obo = bo.abo;
    if (!obo)
       return -EINVAL;
@@ -7752,6 +7871,9 @@ orbis_bo_va_op(uint32_t bo_handle, uint64_t offset, uint64_t size, uint64_t addr
    switch (ops) {
    case AMDGPU_VA_OP_MAP: {
       struct orbis_bo *obo = orbis_bo_from_handle(bo_handle);
+#if defined(__PS4__)
+      orbis_kc_hit(ORBIS_KC_VA_MAP);
+#endif
 
       /* Give the rights back before anything can touch the range. Wider than the revoke on purpose: a page
        * this buffer shares with a neighbour may have been revoked when that neighbour died. */
@@ -7970,6 +8092,9 @@ orbis_bo_va_op(uint32_t bo_handle, uint64_t offset, uint64_t size, uint64_t addr
       return 0;
    }
    case AMDGPU_VA_OP_UNMAP: {
+#if defined(__PS4__)
+      orbis_kc_hit(ORBIS_KC_VA_UNMAP);
+#endif
       /* Forget it here, so a later mapping of the same range is not reported as an overlap. An UNMAP this arm
        * treats as a no-op for the BACKING is still a real event for the bookkeeping. */
       simple_mtx_lock(&orbis_map_lock);
@@ -10524,6 +10649,10 @@ ac_drm_cs_submit_raw2(ac_drm_device *dev, uint32_t ctx_id, uint32_t bo_list_hand
       static uint64_t win_passes, win_px, win_disp, win_groups, win_sub_ns;
       static uint64_t win_rec_ns, win_draws, win_dbinds, win_spans;
       static uint64_t win_api_ns[ORBIS_API_SLOTS], win_api_calls[ORBIS_API_SLOTS];
+#if defined(__PS4__)
+      static uint64_t win_kc[ORBIS_KC_SLOTS];
+      static uint64_t win_ifree;
+#endif
 
       const uint64_t now = os_time_get_nano();
 
@@ -10633,8 +10762,57 @@ ac_drm_cs_submit_raw2(ac_drm_device *dev, uint32_t ctx_id, uint32_t bo_list_hand
                 * A line every five seconds turns the whole run into the trend that answers it, at the
                 * cost of one walk of a few hundred list entries. */
                orbis_va_report("now");
+
+#if defined(__PS4__)
+               /* ⚠ THE ATTRIBUTION LINE. Bytes of libkernel internal memory lost this window,
+                * divided by the same present count everything else on these lines is divided by,
+                * beside the number of each kernel call that could have consumed them. A leak that
+                * divides evenly by one of these counts names its own call site; one that divides by
+                * none of them says the consumer is inside libkernel or inside a facility this file
+                * does not make, and the next step is the frontend's gated
+                * sceKernelInternalHeapPrintBacktraceWithModuleInfo rather than more counting here. */
+               {
+                  const uint64_t ifree = orbis_internal_memory_free();
+                  char kline[512];
+                  int kn = 0;
+
+                  for (unsigned i = 0; i < ORBIS_KC_SLOTS && kn < (int)sizeof(kline) - 1; i++) {
+                     const uint64_t calls = orbis_kc[i] - win_kc[i];
+                     if (calls == 0)
+                        continue;
+                     kn += snprintf(kline + kn, sizeof(kline) - kn, "%s%s %" PRIu64 " (%" PRIu64
+                                    "/frame)", kn ? ", " : "", orbis_kc_names[i], calls,
+                                    np ? calls / np : 0);
+                  }
+
+                  if (ifree == 0) {
+                     mesa_logw("orbis-drm: libkernel internal memory is UNREADABLE - "
+                               "sceKernelInternalMemoryGetAvailableSize did not resolve, so the "
+                               "attribution below has no left-hand side. Kernel calls this window: %s",
+                               kn ? kline : "none");
+                  } else {
+                     const int64_t lost = (int64_t)win_ifree - (int64_t)ifree;
+                     mesa_logi("orbis-drm: libkernel internal memory %" PRIu64 " bytes free, %" PRId64
+                               " lost this window = %" PRId64 " bytes a frame, against kernel calls: %s",
+                               ifree, win_ifree ? lost : 0,
+                               (win_ifree && np) ? lost / (int64_t)np : 0, kn ? kline : "none");
+                  }
+                  win_ifree = ifree;
+                  for (unsigned i = 0; i < ORBIS_KC_SLOTS; i++)
+                     win_kc[i] = orbis_kc[i];
+               }
+#endif
             }
 
+#if defined(__PS4__)
+            /* Seeded on the FIRST window, which prints nothing, so the first line that does print
+             * carries a real difference rather than the whole of startup. */
+            if (win_ifree == 0) {
+               win_ifree = orbis_internal_memory_free();
+               for (unsigned i = 0; i < ORBIS_KC_SLOTS; i++)
+                  win_kc[i] = orbis_kc[i];
+            }
+#endif
             win_ns = now;
             win_cpu_us = cpu_us;
             win_seq = seq;
