@@ -180,6 +180,31 @@ static const char *const orbis_lg_names[ORBIS_LG_IDS] = {
 static int64_t  orbis_lg_seg[ORBIS_LG_IDS];
 static int64_t  orbis_lg_last[ORBIS_LG_IDS];
 static uint64_t orbis_lg_last_frames;
+
+/* ⚠ AND HOW LONG EACH SEGMENT TOOK, WHICH IS THE MEASUREMENT THAT DECIDES WHAT KIND OF LEAK THIS IS.
+ *
+ * Measured 2026-08-31: between two consecutive reports the total held at 9280 bytes a frame to the
+ * byte while the ATTRIBUTION swung - SubmitDone..flip_slot went 8784 -> 152 a frame and
+ * present:exit..vkAcquire went 457 -> 7107. Meanwhile every synchronous call in the first of those
+ * segments has now been weighed in isolation and costs nothing: sceKernelUsleep 0, clock_gettime 0,
+ * and sceVideoOutGetFlipStatus 0 bytes over 2000 calls, measured on hardware this run.
+ *
+ * A cost that is not in any call, lands in a different segment each time, and sums to the same figure
+ * regardless is not spent by the code being bracketed. The obvious remaining shape is that it accrues
+ * with TIME - somebody else's thread, or the kernel accounting for queued work - and lands in
+ * whichever segment happens to be executing when the meter is next read. That predicts something
+ * sharp: bytes per segment should track MICROSECONDS per segment, not the segment's contents. The
+ * flip-slot wait is the long one in a vsync-bound frame and the frontend's is the long one in a
+ * CPU-bound frame, which is exactly the pair of reports above.
+ *
+ * Clock reads cost nothing to this measurement - orbis-compat's isolation probe put clock_gettime at
+ * 0 bytes over 2000 calls on both families - so this is two numbers per mark instead of one, and it
+ * turns "which code" into "which code OR merely which stretch of time". */
+static uint64_t orbis_lg_time[ORBIS_LG_IDS];
+static uint64_t orbis_lg_time_last[ORBIS_LG_IDS];
+static uint64_t orbis_lg_prev_ns;
+static uint64_t orbis_lg_wall_ns;      /* wall time inside sampled frames, for bytes-per-second */
+static uint64_t orbis_lg_wall_last;
 static uint64_t orbis_lg_prev_free;
 static unsigned orbis_lg_prev_id = ORBIS_LG_IDS;
 static uint64_t orbis_lg_frames;       /* frames actually measured */
@@ -227,16 +252,21 @@ orbis_ledger_mark(unsigned id)
    const uint64_t now = orbis_internal_memory_free();
    if (now == 0)
       return; /* the meter did not resolve; nothing here can be measured */
+   const uint64_t now_ns = os_time_get_nano();
 
-   if (orbis_lg_prev_id < ORBIS_LG_IDS)
+   if (orbis_lg_prev_id < ORBIS_LG_IDS) {
       orbis_lg_seg[orbis_lg_prev_id] += (int64_t)orbis_lg_prev_free - (int64_t)now;
+      orbis_lg_time[orbis_lg_prev_id] += now_ns - orbis_lg_prev_ns;
+      orbis_lg_wall_ns += now_ns - orbis_lg_prev_ns;
+   }
    orbis_lg_prev_id = id;
    orbis_lg_prev_free = now;
+   orbis_lg_prev_ns = now_ns;
 
    /* One report per 120 frames - about two seconds of menu, and enough that a segment carrying ten
     * thousand bytes a frame cannot be confused with the meter's quantisation. */
    if (id == ORBIS_LG_PRESENT_ENTER && orbis_lg_frames != 0 && (orbis_lg_frames % 120) == 0) {
-      char line[768];
+      char line[1024];
       int n = 0;
       int64_t total = 0, dtotal = 0;
       const int64_t dframes = (int64_t)(orbis_lg_frames - orbis_lg_last_frames);
@@ -253,20 +283,34 @@ orbis_ledger_mark(unsigned id)
          dtotal += d;
          if (d == 0 && orbis_lg_seg[i] == 0)
             continue;
-         n += snprintf(line + n, sizeof(line) - n, "%s%s %lld/frame (total %lld)", n ? ", " : "",
-                       orbis_lg_names[i], (long long)(dframes ? d / dframes : 0),
-                       (long long)orbis_lg_seg[i]);
+         const uint64_t dt_us = (orbis_lg_time[i] - orbis_lg_time_last[i]) / 1000;
+         n += snprintf(line + n, sizeof(line) - n, "%s%s %lld B/frame in %llu us/frame (%lld B/ms)",
+                       n ? ", " : "", orbis_lg_names[i], (long long)(dframes ? d / dframes : 0),
+                       (unsigned long long)(dframes ? dt_us / (uint64_t)dframes : 0),
+                       (long long)(dt_us ? (d * 1000) / (int64_t)dt_us : 0));
       }
-      for (unsigned i = 0; i < ORBIS_LG_IDS; i++)
+      for (unsigned i = 0; i < ORBIS_LG_IDS; i++) {
          orbis_lg_last[i] = orbis_lg_seg[i];
+         orbis_lg_time_last[i] = orbis_lg_time[i];
+      }
       orbis_lg_last_frames = orbis_lg_frames;
 
+      /* ⚠ BYTES PER MILLISECOND AS WELL AS PER FRAME, because "per frame" is the fourth quantity this
+       * investigation has divided by and three of the first three were correlates. At a pinned 60 Hz
+       * the two are indistinguishable; the moment the frame rate moves, they separate, and the run
+       * says which one the leak is actually made of. */
+      const uint64_t dwall_us = (orbis_lg_wall_ns - orbis_lg_wall_last) / 1000;
+      orbis_lg_wall_last = orbis_lg_wall_ns;
+
       mesa_logi("orbis-drm: frame ledger over %llu SAMPLED frame(s) of %llu seen: %lld bytes a frame "
-                "SINCE THE LAST REPORT (%lld bytes total, %lld a frame averaged over the whole run). "
+                "SINCE THE LAST REPORT, over %llu us of sampled wall time = %lld bytes/ms "
+                "(%lld bytes total, %lld a frame averaged over the whole run). "
                 "Per segment, since the last report: %s",
                 (unsigned long long)orbis_lg_frames, (unsigned long long)orbis_lg_frames_seen,
-                (long long)(dframes ? dtotal / dframes : 0), (long long)total,
-                (long long)(total / (int64_t)orbis_lg_frames),
+                (long long)(dframes ? dtotal / dframes : 0),
+                (unsigned long long)dwall_us,
+                (long long)(dwall_us ? (dtotal * 1000) / (int64_t)dwall_us : 0),
+                (long long)total, (long long)(total / (int64_t)orbis_lg_frames),
                 n ? line : "every segment zero");
    }
 #else
