@@ -139,6 +139,94 @@ orbis_kc_count(unsigned slot)
       orbis_kc_hit(slot);
 }
 
+/* Defined below, next to the weak declaration of the libkernel entry point it wraps. Forward-declared
+   here because the ledger is the meter's first consumer and sits above it in the file. */
+static uint64_t orbis_internal_memory_free(void);
+
+/* ------------------------------------------------------------------------- the frame ledger
+ *
+ * See the enum in util/orbis_api_probe.h for why this exists and why the segments are narrow.
+ *
+ * Each mark reads libkernel's internal-memory meter once and books the difference since the previous
+ * mark against THAT mark's segment - so segment[i] is "what was spent between mark i and the mark
+ * after it", and every segment brackets exactly one named call. Accumulated over frames, because the
+ * meter's own resolution is coarse (2000 calls of a primitive measured 96 and 64 bytes in isolation)
+ * while a frame loses about ten thousand.
+ *
+ * ⚠ ON BY DEFAULT. Ten meter reads a frame at sixty frames a second is six hundred a second against a
+ * process already making ten thousand syncobj polls a second; ORBIS_NO_LEDGER=1 turns it off. Every
+ * knob in this investigation that could be missed has been, and each miss cost a console run - that is
+ * the more expensive failure. */
+static const char *const orbis_lg_names[ORBIS_LG_IDS] = {
+   [ORBIS_LG_PRESENT_ENTER] = "present:enter..gpu_idle",
+   [ORBIS_LG_AFTER_GPU_IDLE] = "gpu_idle..SubmitDone",
+   [ORBIS_LG_AFTER_SUBMIT_DONE] = "SubmitDone..flip_slot",
+   [ORBIS_LG_AFTER_FLIP_SLOT] = "flip_slot..copy",
+   [ORBIS_LG_AFTER_COPY] = "copy..SubmitFlip",
+   [ORBIS_LG_PRESENT_EXIT] = "present:exit..next submit (ABOVE THIS DRIVER)",
+   [ORBIS_LG_SUBMIT_ENTER] = "submit:enter..FlushGarlic",
+   [ORBIS_LG_AFTER_FLUSH_GARLIC] = "FlushGarlic..GnmSubmit",
+   [ORBIS_LG_AFTER_GNM_SUBMIT] = "GnmSubmit..submit:exit",
+   [ORBIS_LG_SUBMIT_EXIT] = "submit:exit..next mark",
+};
+
+static int64_t  orbis_lg_seg[ORBIS_LG_IDS];
+static uint64_t orbis_lg_prev_free;
+static unsigned orbis_lg_prev_id = ORBIS_LG_IDS;
+static uint64_t orbis_lg_frames;
+
+static bool
+orbis_ledger_enabled(void)
+{
+   static int cached = -1;
+   if (cached < 0) {
+      const char *const e = getenv("ORBIS_NO_LEDGER");
+      cached = (e && *e && *e != '0') ? 0 : 1;
+   }
+   return cached == 1;
+}
+
+void
+orbis_ledger_mark(unsigned id)
+{
+#if defined(__PS4__)
+   if (id >= ORBIS_LG_IDS || !orbis_ledger_enabled())
+      return;
+
+   const uint64_t now = orbis_internal_memory_free();
+   if (now == 0)
+      return; /* the meter did not resolve; nothing here can be measured */
+
+   if (orbis_lg_prev_id < ORBIS_LG_IDS)
+      orbis_lg_seg[orbis_lg_prev_id] += (int64_t)orbis_lg_prev_free - (int64_t)now;
+   orbis_lg_prev_id = id;
+   orbis_lg_prev_free = now;
+
+   /* One report per 120 frames - about two seconds of menu, and enough that a segment carrying ten
+    * thousand bytes a frame cannot be confused with the meter's quantisation. */
+   if (id == ORBIS_LG_PRESENT_ENTER && (++orbis_lg_frames % 120) == 0) {
+      char line[640];
+      int n = 0;
+      int64_t total = 0;
+
+      for (unsigned i = 0; i < ORBIS_LG_IDS && n < (int)sizeof(line) - 1; i++) {
+         total += orbis_lg_seg[i];
+         if (orbis_lg_seg[i] == 0)
+            continue;
+         n += snprintf(line + n, sizeof(line) - n, "%s%s %lld (%lld/frame)", n ? ", " : "",
+                       orbis_lg_names[i], (long long)orbis_lg_seg[i],
+                       (long long)(orbis_lg_seg[i] / (int64_t)orbis_lg_frames));
+      }
+
+      mesa_logi("orbis-drm: frame ledger over %llu frame(s), %lld bytes total = %lld a frame: %s",
+                (unsigned long long)orbis_lg_frames, (long long)total,
+                (long long)(total / (int64_t)orbis_lg_frames), n ? line : "every segment zero");
+   }
+#else
+   (void)id;
+#endif
+}
+
 #define sceKernelUsleep(...) (orbis_kc_hit(ORBIS_KC_USLEEP), (sceKernelUsleep)(__VA_ARGS__))
 #define sceGnmFlushGarlic(...)                                                                     \
    (orbis_kc_hit(ORBIS_KC_GNM_FLUSH_GARLIC), (sceGnmFlushGarlic)(__VA_ARGS__))
@@ -5782,9 +5870,11 @@ orbis_sync_wait(struct util_sync_provider *p, uint32_t *handles, unsigned num_ha
       orbis_bis_exit_free = 0;
       ++orbis_bis_pairs;
 
-      /* One line per two thousand pairs - about every ten seconds of menu, and enough samples that
-       * 73 bytes is a number rather than a rounding error. */
-      if ((orbis_bis_pairs % 2048) == 0) {
+      /* One line per 256 pairs. It was 2048 and printed NOTHING in a whole run: one sample in
+       * sixty-four of eighteen thousand polls a window is 286 pairs, so 2048 needed seven windows and
+       * the leaking phase was about that long. A threshold that needs the whole run to fire is not a
+       * threshold. */
+      if ((orbis_bis_pairs % 256) == 0) {
          mesa_logi("orbis-drm: poll bisection over %llu pair(s): %lld bytes lost INSIDE "
                    "orbis_sync_wait (%.1f/poll), %lld bytes lost OUTSIDE it in the caller's loop "
                    "(%.1f/poll). The 73 belongs to whichever of these carries it; if neither does, "
@@ -5877,6 +5967,9 @@ orbis_sync_wait(struct util_sync_provider *p, uint32_t *handles, unsigned num_ha
                char callers[10 * 20 + 1];
                size_t at = 0;
                callers[0] = '\0';
+#if defined(__PS4__)
+               /* The unwinder is orbis-compat's, so it exists only on the console arm. The host build
+                  keeps the line and prints "(no unwinder)", which is the truth there. */
                if (&orbis_unwind_collect != NULL) {
                   void *frames[10];
                   const int nf = orbis_unwind_collect(frames, 10, 1);
@@ -5888,6 +5981,7 @@ orbis_sync_wait(struct util_sync_provider *p, uint32_t *handles, unsigned num_ha
                      at += (size_t)n2;
                   }
                }
+#endif
                mesa_logi("orbis-drm: syncobj POLL says not yet, label %u - a deadline of now or "
                          "earlier is a question, not a failure. Asked by, innermost first: %s",
                          *orbis_fence_label, at ? callers : "(no unwinder)");
@@ -10671,10 +10765,13 @@ ac_drm_cs_submit_raw2(ac_drm_device *dev, uint32_t ctx_id, uint32_t bo_list_hand
       }
    }
 
+   orbis_ledger_mark(ORBIS_LG_SUBMIT_ENTER);
    sceGnmFlushGarlic();
+   orbis_ledger_mark(ORBIS_LG_AFTER_FLUSH_GARLIC);
 
    const uint64_t t0 = os_time_get_nano();
    const int32_t err = sceGnmSubmitCommandBuffers(n_dcb, dcb, dcb_bytes, NULL, NULL);
+   orbis_ledger_mark(ORBIS_LG_AFTER_GNM_SUBMIT);
    const uint64_t t1 = os_time_get_nano();
    if (getenv("ORBIS_WATCH_STRICT") != NULL && err == 0) {
       /* Bounded, like every wait in this file: if the GPU does not get there, the check is skipped rather than the

@@ -632,6 +632,11 @@ wsi_orbis_scanout_present(struct wsi_orbis_scanout *so, uint32_t index, const vo
    if (so == NULL || index >= so->count || src == NULL)
       ORBIS_BOOK_RETURN(ORBIS_ID_WSI_PRESENT, orbis_pr_t0, false);
 
+   /* ⚠ THE FRAME LEDGER'S SEGMENT BOUNDARIES. See enum orbis_ledger_id in util/orbis_api_probe.h:
+    * the leak is now known to be PER FRAME (~10 KB) rather than per poll, and each mark below bounds
+    * exactly one candidate call so that a positive result names one rather than four. */
+   orbis_ledger_mark(ORBIS_LG_PRESENT_ENTER);
+
    /* ⚠ THE GPU FIRST. This copy reads pixels the GPU is writing, and until this line it did not ask whether the
     * writing had finished - which is what put a staircase of tiles over half the menu on every screen change. See
     * ac_orbis_wait_gpu_idle for the photograph and the reasoning; declared here rather than in a header because it
@@ -652,6 +657,7 @@ wsi_orbis_scanout_present(struct wsi_orbis_scanout *so, uint32_t index, const vo
         else
            ac_orbis_wait_gpu_idle(2ull * 1000 * 1000 * 1000);
         const uint64_t d = os_time_get_nano() - t;
+        orbis_ledger_mark(ORBIS_LG_AFTER_GPU_IDLE);
         orbis_api_time(ORBIS_ID_WSI_GPU_IDLE, d);
         orbis_api_count(ORBIS_ID_WSI_GPU_IDLE, 1);
         /* ⚠ AND UNCONDITIONALLY, because the two lines above only store under ORBIS_COUNT_API and
@@ -712,6 +718,8 @@ wsi_orbis_scanout_present(struct wsi_orbis_scanout *so, uint32_t index, const vo
       }
    }
 
+   orbis_ledger_mark(ORBIS_LG_AFTER_SUBMIT_DONE);
+
    /* ⚠ BREADCRUMBS FOR THE FIRST FEW FRAMES, because the run this exists for died with no line at all: the log
     * ended after the frame's submission returned, and "we never got here" and "we died inside the copy" looked
     * identical. Bounded to four frames - at 60 Hz an unbounded line per frame IS the log. */
@@ -722,6 +730,7 @@ wsi_orbis_scanout_present(struct wsi_orbis_scanout *so, uint32_t index, const vo
 
    if (!wsi_orbis_wait_for_flip_slot(so))
       ORBIS_BOOK_RETURN(ORBIS_ID_WSI_PRESENT, orbis_pr_t0, false);
+   orbis_ledger_mark(ORBIS_LG_AFTER_FLIP_SLOT);
 
    /* ⚠ ROW BY ROW WHEN THE PITCHES DIFFER. WSI picks the image's row pitch and it need not be width*4 - RADV
     * aligns a linear image's pitch to the hardware's requirement. One flat memcpy would then shift every row
@@ -926,8 +935,10 @@ wsi_orbis_scanout_present(struct wsi_orbis_scanout *so, uint32_t index, const vo
       mesa_logi("wsi/orbis: present copied %u KiB, flipping index %u",
                 (unsigned)((uint64_t)dst_pitch * so->height / 1024), index);
 
+   orbis_ledger_mark(ORBIS_LG_AFTER_COPY);
    int32_t err = sceVideoOutSubmitFlip(so->video, (int32_t)index, ORBIS_VIDEO_OUT_FLIP_VSYNC,
                                        (int64_t)++so->flips);
+   orbis_ledger_mark(ORBIS_LG_PRESENT_EXIT);
    /* After the call, not instead of it: the flip really is submitted and the display really does take
     * it, so the state this leaves behind is the state a genuine late failure leaves behind. Only the
     * answer handed back to the WSI is forced. */

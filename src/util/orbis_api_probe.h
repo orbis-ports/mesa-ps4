@@ -109,6 +109,35 @@ enum orbis_kc_slot {
 /* Defined in ac_orbis_drm.c, which owns the counters and the report that divides them by presents. */
 void orbis_kc_count(unsigned slot);
 
+/* ⚠ THE FRAME LEDGER, AND IT REPLACES A MEASUREMENT AIMED AT THE WRONG AXIS.
+ *
+ * A bisection that sampled around POLLS was built on a coefficient - 73.0 bytes per syncobj poll,
+ * exact to 0.03% - that turned out to be a coincidence of a stable poll rate. Measured 2026-08-31:
+ * the poll rate fell 2.7x between two runs (162 -> 60 a frame) and the loss barely moved
+ * (11863 -> 10224 bytes A FRAME). Fitting both points gives ~9260 bytes per frame plus ~16 per poll,
+ * which is two unknowns from two measurements and therefore a description rather than a result - but
+ * the axis is settled: the big term is PER FRAME.
+ *
+ * So the meter is read at named points around the frame instead, and each segment is bounded by ONE
+ * call, because a segment containing four candidates names none of them. The segment between the
+ * present's exit and the next submission's entry is the frontend, zink and RADV's recording - the
+ * "outside our code entirely" case, which no instrument in this port has ever weighed. */
+enum orbis_ledger_id {
+   ORBIS_LG_PRESENT_ENTER = 0,   /* .. to after the GPU-idle wait */
+   ORBIS_LG_AFTER_GPU_IDLE,      /* .. to after sceGnmSubmitDone */
+   ORBIS_LG_AFTER_SUBMIT_DONE,   /* .. to after the flip-slot wait */
+   ORBIS_LG_AFTER_FLIP_SLOT,     /* .. to after the scan-out copy */
+   ORBIS_LG_AFTER_COPY,          /* .. to after sceVideoOutSubmitFlip */
+   ORBIS_LG_PRESENT_EXIT,        /* .. to the next submission: everything above this driver */
+   ORBIS_LG_SUBMIT_ENTER,        /* .. to after sceGnmFlushGarlic */
+   ORBIS_LG_AFTER_FLUSH_GARLIC,  /* .. to after sceGnmSubmitCommandBuffers */
+   ORBIS_LG_AFTER_GNM_SUBMIT,    /* .. to the submission's return */
+   ORBIS_LG_SUBMIT_EXIT,         /* .. to whatever comes next */
+   ORBIS_LG_IDS,
+};
+
+void orbis_ledger_mark(unsigned id);
+
 #ifdef HAVE_ORBIS_PLATFORM
 
 #include <stdint.h>
