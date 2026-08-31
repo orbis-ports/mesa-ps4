@@ -387,6 +387,40 @@ wsi_orbis_scanout_create(uint32_t width, uint32_t height, uint32_t count, void *
       mesa_logw("wsi/orbis: sceVideoOutSetFlipRate -> 0x%08x (continuing; the flip rate is not correctness)",
                 (unsigned)err);
 
+#if defined(__PS4__)
+   /* ⚠ THE ONE sce* CALL ON THE FRAME PATH THAT HAS NEVER BEEN WEIGHED IN ISOLATION, and the frame
+    * ledger has just made it a suspect.
+    *
+    * Measured 2026-08-31 over 2400 frames: the SubmitDone..flip_slot segment booked 1567776 bytes -
+    * 653 a frame - and that segment contains exactly three things. Two of them, sceKernelUsleep and
+    * clock_gettime, each measured 0 bytes per call over 2000 calls in orbis-compat's isolation probe.
+    * The third is this call, made 17 times a frame by wsi_orbis_wait_for_flip_slot, and 653/17 is 38.
+    *
+    * ⚠ SO IT IS MEASURED RATHER THAN CONCLUDED. Two meter reads, once, at scan-out setup: 2000 calls
+    * with the answer thrown away. If this prints ~38 bytes each, the 11% term is ours and the fix is
+    * to stop polling the display seventeen times a frame; if it prints 0, the segment's cost is
+    * somewhere the ledger's granularity cannot yet see and that is worth knowing too.
+    *
+    * The probe costs two meter reads for the life of the process, which is the one budget this
+    * instrument still has - see orbis_ledger_mark on why it now samples one frame in four. */
+   {
+      const uint64_t before = orbis_internal_free();
+      if (before != 0) {
+         OrbisVideoOutFlipStatus st;
+         for (int i = 0; i < 2000; i++) {
+            memset(&st, 0, sizeof(st));
+            (void)sceVideoOutGetFlipStatus(so->video, &st);
+         }
+         const uint64_t after = orbis_internal_free();
+         const long long lost = (long long)before - (long long)after;
+         mesa_logi("wsi/orbis: internal memory probe: sceVideoOutGetFlipStatus %lld bytes over 2000 "
+                   "calls = %lld each (%llu free after). The flip-slot wait makes 17 of these a frame "
+                   "and that segment loses 653 bytes a frame; ~38 each would account for all of it.",
+                   lost, lost / 2000, (unsigned long long)after);
+      }
+   }
+#endif
+
    mesa_logi("wsi/orbis: scan-out up - %ux%u pitch %u, %u %s buffer(s), A8B8G8R8_SRGB linear%s", width, height,
              pitch_px != 0 ? pitch_px : width, count, so->owns_buffers ? "GARLIC" : "swapchain",
              so->owns_buffers ? " - one full-screen copy per frame" : " - ZERO COPY, the flip shows what "
@@ -935,7 +969,8 @@ wsi_orbis_scanout_present(struct wsi_orbis_scanout *so, uint32_t index, const vo
       mesa_logi("wsi/orbis: present copied %u KiB, flipping index %u",
                 (unsigned)((uint64_t)dst_pitch * so->height / 1024), index);
 
-   orbis_ledger_mark(ORBIS_LG_AFTER_COPY);
+   /* The copy..SubmitFlip mark is gone: it booked 16 bytes a frame, and a meter read that measures
+      nothing is one this instrument can no longer afford - see orbis_ledger_mark on the perturbation. */
    int32_t err = sceVideoOutSubmitFlip(so->video, (int32_t)index, ORBIS_VIDEO_OUT_FLIP_VSYNC,
                                        (int64_t)++so->flips);
    orbis_ledger_mark(ORBIS_LG_PRESENT_EXIT);

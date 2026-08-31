@@ -132,16 +132,22 @@ orbis_kc_hit(unsigned slot)
 
 /* The cross-translation-unit door, so wsi_orbis.c books into the same counters and the same report.
    Not static, and declared in util/orbis_api_probe.h beside the enum. */
+/* Defined below, next to the weak declaration of the libkernel entry point it wraps. Forward-declared
+   here because the ledger is the meter's first consumer and sits above it in the file. */
+static uint64_t orbis_internal_memory_free(void);
+
+uint64_t
+orbis_internal_free(void)
+{
+   return orbis_internal_memory_free();
+}
+
 void
 orbis_kc_count(unsigned slot)
 {
    if (slot < ORBIS_KC_SLOTS)
       orbis_kc_hit(slot);
 }
-
-/* Defined below, next to the weak declaration of the libkernel entry point it wraps. Forward-declared
-   here because the ledger is the meter's first consumer and sits above it in the file. */
-static uint64_t orbis_internal_memory_free(void);
 
 /* ------------------------------------------------------------------------- the frame ledger
  *
@@ -163,17 +169,22 @@ static const char *const orbis_lg_names[ORBIS_LG_IDS] = {
    [ORBIS_LG_AFTER_SUBMIT_DONE] = "SubmitDone..flip_slot",
    [ORBIS_LG_AFTER_FLIP_SLOT] = "flip_slot..copy",
    [ORBIS_LG_AFTER_COPY] = "copy..SubmitFlip",
-   [ORBIS_LG_PRESENT_EXIT] = "present:exit..next submit (ABOVE THIS DRIVER)",
-   [ORBIS_LG_SUBMIT_ENTER] = "submit:enter..FlushGarlic",
-   [ORBIS_LG_AFTER_FLUSH_GARLIC] = "FlushGarlic..GnmSubmit",
+   [ORBIS_LG_PRESENT_EXIT] = "present:exit..vkAcquire (frontend between frames)",
+   [ORBIS_LG_ACQUIRE] = "vkAcquire..vkQueueSubmit2 (APP DRAWS + ZINK + RADV RECORDING)",
+   [ORBIS_LG_VK_SUBMIT] = "vkQueueSubmit2..winsys submit (RADV's submit path)",
+   [ORBIS_LG_SUBMIT_ENTER] = "winsys submit:enter..GnmSubmit",
    [ORBIS_LG_AFTER_GNM_SUBMIT] = "GnmSubmit..submit:exit",
    [ORBIS_LG_SUBMIT_EXIT] = "submit:exit..next mark",
 };
 
 static int64_t  orbis_lg_seg[ORBIS_LG_IDS];
+static int64_t  orbis_lg_last[ORBIS_LG_IDS];
+static uint64_t orbis_lg_last_frames;
 static uint64_t orbis_lg_prev_free;
 static unsigned orbis_lg_prev_id = ORBIS_LG_IDS;
-static uint64_t orbis_lg_frames;
+static uint64_t orbis_lg_frames;       /* frames actually measured */
+static uint64_t orbis_lg_frames_seen;  /* frames offered, measured or not */
+static bool     orbis_lg_sampling;
 
 static bool
 orbis_ledger_enabled(void)
@@ -193,6 +204,26 @@ orbis_ledger_mark(unsigned id)
    if (id >= ORBIS_LG_IDS || !orbis_ledger_enabled())
       return;
 
+   /* ⚠ ONE FRAME IN FOUR, BECAUSE THE INSTRUMENT WAS MEASURED PERTURBING WHAT IT MEASURES. With a
+    * mark at every boundary of every frame this read the meter about six hundred times a second, and
+    * the maintainer reports the failure changed shape with that build - the title degraded to ~10 fps
+    * and took considerably longer to reach the wall instead of collapsing to 0.01 fps. The proportions
+    * held, so the split stands, but the absolute rate is not this driver's any more.
+    *
+    * Sampling whole frames rather than individual marks is what keeps the segments comparable: every
+    * segment of a sampled frame is measured or none is, so the columns still add up to that frame.
+    * The first mark of a sampled frame only seeds the meter - it books nothing, because the gap behind
+    * it spans three unmeasured frames. */
+   if (id == ORBIS_LG_PRESENT_ENTER) {
+      orbis_lg_sampling = ((++orbis_lg_frames_seen & 3) == 0);
+      if (orbis_lg_sampling) {
+         orbis_lg_prev_id = ORBIS_LG_IDS; /* seed only */
+         ++orbis_lg_frames;
+      }
+   }
+   if (!orbis_lg_sampling)
+      return;
+
    const uint64_t now = orbis_internal_memory_free();
    if (now == 0)
       return; /* the meter did not resolve; nothing here can be measured */
@@ -204,23 +235,39 @@ orbis_ledger_mark(unsigned id)
 
    /* One report per 120 frames - about two seconds of menu, and enough that a segment carrying ten
     * thousand bytes a frame cannot be confused with the meter's quantisation. */
-   if (id == ORBIS_LG_PRESENT_ENTER && (++orbis_lg_frames % 120) == 0) {
-      char line[640];
+   if (id == ORBIS_LG_PRESENT_ENTER && orbis_lg_frames != 0 && (orbis_lg_frames % 120) == 0) {
+      char line[768];
       int n = 0;
-      int64_t total = 0;
+      int64_t total = 0, dtotal = 0;
+      const int64_t dframes = (int64_t)(orbis_lg_frames - orbis_lg_last_frames);
 
+      /* ⚠ THE DELTA, NOT ONLY THE RUNNING TOTAL - and printing only the total hid the sharpest number
+       * this instrument has produced. In the 2400-frame capture of 2026-08-31 the cumulative average
+       * drifted 77 -> 5722 bytes a frame and read like a slow ramp, while the DIFFERENCE between
+       * consecutive reports was 1113600 bytes per 120 frames ten times running - exactly 9280.0 a
+       * frame, to the byte. A cumulative average of a process that changes state is a number about the
+       * past; the delta is a number about now, and the split between segments belongs on it. */
       for (unsigned i = 0; i < ORBIS_LG_IDS && n < (int)sizeof(line) - 1; i++) {
+         const int64_t d = orbis_lg_seg[i] - orbis_lg_last[i];
          total += orbis_lg_seg[i];
-         if (orbis_lg_seg[i] == 0)
+         dtotal += d;
+         if (d == 0 && orbis_lg_seg[i] == 0)
             continue;
-         n += snprintf(line + n, sizeof(line) - n, "%s%s %lld (%lld/frame)", n ? ", " : "",
-                       orbis_lg_names[i], (long long)orbis_lg_seg[i],
-                       (long long)(orbis_lg_seg[i] / (int64_t)orbis_lg_frames));
+         n += snprintf(line + n, sizeof(line) - n, "%s%s %lld/frame (total %lld)", n ? ", " : "",
+                       orbis_lg_names[i], (long long)(dframes ? d / dframes : 0),
+                       (long long)orbis_lg_seg[i]);
       }
+      for (unsigned i = 0; i < ORBIS_LG_IDS; i++)
+         orbis_lg_last[i] = orbis_lg_seg[i];
+      orbis_lg_last_frames = orbis_lg_frames;
 
-      mesa_logi("orbis-drm: frame ledger over %llu frame(s), %lld bytes total = %lld a frame: %s",
-                (unsigned long long)orbis_lg_frames, (long long)total,
-                (long long)(total / (int64_t)orbis_lg_frames), n ? line : "every segment zero");
+      mesa_logi("orbis-drm: frame ledger over %llu SAMPLED frame(s) of %llu seen: %lld bytes a frame "
+                "SINCE THE LAST REPORT (%lld bytes total, %lld a frame averaged over the whole run). "
+                "Per segment, since the last report: %s",
+                (unsigned long long)orbis_lg_frames, (unsigned long long)orbis_lg_frames_seen,
+                (long long)(dframes ? dtotal / dframes : 0), (long long)total,
+                (long long)(total / (int64_t)orbis_lg_frames),
+                n ? line : "every segment zero");
    }
 #else
    (void)id;
@@ -10765,9 +10812,10 @@ ac_drm_cs_submit_raw2(ac_drm_device *dev, uint32_t ctx_id, uint32_t bo_list_hand
       }
    }
 
+   /* FlushGarlic's own mark is gone: its segment booked 32 bytes across 2400 frames, and a meter read
+      that measures nothing is a meter read this instrument can no longer afford. */
    orbis_ledger_mark(ORBIS_LG_SUBMIT_ENTER);
    sceGnmFlushGarlic();
-   orbis_ledger_mark(ORBIS_LG_AFTER_FLUSH_GARLIC);
 
    const uint64_t t0 = os_time_get_nano();
    const int32_t err = sceGnmSubmitCommandBuffers(n_dcb, dcb, dcb_bytes, NULL, NULL);
@@ -11155,6 +11203,14 @@ ac_drm_cs_submit_raw2(ac_drm_device *dev, uint32_t ctx_id, uint32_t bo_list_hand
    }
 
    ORBIS_SUBMIT_STAGE("out-syncobjs attached, returning");
+
+   /* ⚠ THE MARK THAT WAS MISSING, AND ITS ABSENCE MISLABELLED A COLUMN. Without it the segment named
+    * "GnmSubmit..submit:exit" ran from the Gnm call all the way to the NEXT frame's present, so it
+    * swallowed the rest of this function - including the five-second BUDGET report and its arena walk,
+    * which read the meter themselves - and the return path through RADV and zink. Its 176 bytes a
+    * frame were therefore attributed to nothing in particular, and part of them were this
+    * instrument measuring itself. Closed here, so the segment is what its name says. */
+   orbis_ledger_mark(ORBIS_LG_SUBMIT_EXIT);
    *seq_no = seq;
    { return orbis_submit_return(0, orbis_submit_t0); }
 #undef ORBIS_SUBMIT_STAGE

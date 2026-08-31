@@ -127,16 +127,35 @@ enum orbis_ledger_id {
    ORBIS_LG_AFTER_GPU_IDLE,      /* .. to after sceGnmSubmitDone */
    ORBIS_LG_AFTER_SUBMIT_DONE,   /* .. to after the flip-slot wait */
    ORBIS_LG_AFTER_FLIP_SLOT,     /* .. to after the scan-out copy */
-   ORBIS_LG_AFTER_COPY,          /* .. to after sceVideoOutSubmitFlip */
-   ORBIS_LG_PRESENT_EXIT,        /* .. to the next submission: everything above this driver */
-   ORBIS_LG_SUBMIT_ENTER,        /* .. to after sceGnmFlushGarlic */
-   ORBIS_LG_AFTER_FLUSH_GARLIC,  /* .. to after sceGnmSubmitCommandBuffers */
+   ORBIS_LG_AFTER_COPY,          /* .. to after sceVideoOutSubmitFlip (unused: measured 16/frame) */
+   /* ⚠ SUBDIVIDED, BECAUSE 84% OF THE LEAK LANDED IN ONE SEGMENT. Measured 2026-08-31 over 2400
+    * frames: present:exit..next submit carried 11525824 of 13734080 bytes - 4802 a frame - while
+    * every segment inside this driver's own present and submit paths carried a few hundred at most.
+    * That window is the frontend's glcore path, zink's translation and RADV's command recording, and
+    * naming which of the three needs boundaries inside it rather than a better coefficient.
+    *
+    * The two below are placed at entry points that already exist and already carry an ORBIS_API_PROBE,
+    * so nothing new has to be threaded anywhere: vkAcquireNextImage2KHR (wsi_common.c) and
+    * vk_common_QueueSubmit2 (vk_queue.c). They split the window into
+    *
+    *     present:exit .. acquire        the frontend between two frames
+    *     acquire .. QueueSubmit2        THE APP'S DRAWS, ZINK'S TRANSLATION, RADV'S RECORDING
+    *     QueueSubmit2 .. submit:enter   RADV's submit path above this winsys
+    */
+   ORBIS_LG_PRESENT_EXIT,        /* .. to vkAcquireNextImage2KHR */
+   ORBIS_LG_ACQUIRE,             /* .. to vk_common_QueueSubmit2 */
+   ORBIS_LG_VK_SUBMIT,           /* .. to this winsys's own submit */
+   ORBIS_LG_SUBMIT_ENTER,        /* .. to after sceGnmSubmitCommandBuffers */
    ORBIS_LG_AFTER_GNM_SUBMIT,    /* .. to the submission's return */
    ORBIS_LG_SUBMIT_EXIT,         /* .. to whatever comes next */
    ORBIS_LG_IDS,
 };
 
 void orbis_ledger_mark(unsigned id);
+
+/* libkernel's internal-memory meter, for a caller outside ac_orbis_drm.c that wants to weigh one call
+   in isolation rather than a segment of the frame. Returns 0 when the entry point did not resolve. */
+uint64_t orbis_internal_free(void);
 
 #ifdef HAVE_ORBIS_PLATFORM
 

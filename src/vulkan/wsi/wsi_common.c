@@ -2326,6 +2326,10 @@ wsi_AcquireNextImage2KHR(VkDevice _device,
                          uint32_t *pImageIndex)
 {
    ORBIS_API_PROBE(ORBIS_API_ACQUIRE);
+   /* A frame-ledger boundary. See enum orbis_ledger_id: 84% of a leak measured on the PlayStation 4
+      port lands between this driver's present and its next submission, and this is the first of two
+      marks that split that window into the frontend's part and the recording part. */
+   orbis_ledger_mark(ORBIS_LG_ACQUIRE);
    MESA_TRACE_FUNC();
    VK_FROM_HANDLE(vk_device, device, _device);
 
