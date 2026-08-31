@@ -8132,6 +8132,173 @@ orbis_align_up(uint64_t v, uint64_t a)
    return a > 1 ? (v + a - 1) & ~(a - 1) : v;
 }
 
+/* ---------------------------------------------------------------- WHAT THE ARENA ACTUALLY LOOKS LIKE
+ *
+ * ⚠ "out of device VA" USED TO SAY ONLY THAT IT HAPPENED, AND THAT IS NOT ENOUGH TO ACT ON. Three
+ * different faults produce the identical line and they need three different fixes:
+ *
+ *   a LEAK          - live bytes climb monotonically and never come back down
+ *   FRAGMENTATION   - live bytes are flat, but the largest free gap shrinks below the request while
+ *                     plenty of free space remains spread across many gaps
+ *   CAPACITY        - live bytes are flat, the free space is genuinely nearly zero, and the title
+ *                     simply wants more than the window holds
+ *
+ * The three are told apart by four numbers - live bytes, free bytes, the largest gap, and the number
+ * of gaps - so they are printed on the failure AND every five seconds, because a single sample at the
+ * moment of death cannot show a trend and the trend is the whole answer.
+ *
+ * ⚠ THE WINDOW IS NOT 16 GB. ORBIS_VA_BASE_DEFAULT/ORBIS_VA_END_DEFAULT at the top of this file are
+ * overwritten during arena setup: the window is the direct-memory arena minus this arm's private
+ * slice, which the ladder makes 1024 MiB at best and the log reports as "RADV's window ... (991 MiB)".
+ * The report prints the window size with every sample so no reader has to remember which is in force.
+ *
+ * A parked range - retired by RADV, still held here until the GPU passes the last submission handed
+ * out - is counted separately, because "the retire queue is not draining" and "the title is holding
+ * memory" are different faults and both show as live bytes.
+ *
+ * COST: one walk of a list of a few hundred entries, five times a minute plus once per failure. */
+struct orbis_va_stats {
+   uint64_t ranges;        /* entries in the sorted list */
+   uint64_t retired;       /* of those, freed by RADV and parked until the GPU passes them */
+   uint64_t retired_bytes;
+   uint64_t used;          /* bytes the list covers, each range's own trailing gap included */
+   uint64_t largest_range;
+   uint64_t gaps;          /* separate runs of free address space */
+   uint64_t free_bytes;
+   uint64_t largest_gap;
+   /* Live ranges by size class, so a leak names the size that is leaking. The classes are powers of
+    * four from 64 KiB, which is coarse enough to stay one line and fine enough to separate a
+    * descriptor pool from a render target. */
+   uint64_t bucket_n[7];
+   uint64_t bucket_bytes[7];
+};
+
+static uint64_t orbis_va_allocs, orbis_va_frees;
+
+static void
+orbis_va_snapshot(struct orbis_va_stats *s)
+{
+   memset(s, 0, sizeof(*s));
+
+   simple_mtx_lock(&orbis_va_lock);
+   uint64_t cursor = orbis_va_base;
+   for (const struct amdgpu_va *va = orbis_va_list; va; va = va->next) {
+      s->ranges++;
+      s->used += va->size;
+      if (va->size > s->largest_range)
+         s->largest_range = va->size;
+      if (va->retired) {
+         s->retired++;
+         s->retired_bytes += va->size;
+      }
+      if (va->base > cursor) {
+         const uint64_t gap = va->base - cursor;
+         s->gaps++;
+         s->free_bytes += gap;
+         if (gap > s->largest_gap)
+            s->largest_gap = gap;
+      }
+      if (va->base + va->size > cursor)
+         cursor = va->base + va->size;
+
+      unsigned b = 0;
+      for (uint64_t edge = 64ull * 1024; b < 6 && va->size > edge; edge *= 4)
+         b++;
+      s->bucket_n[b]++;
+      s->bucket_bytes[b] += va->size;
+   }
+   simple_mtx_unlock(&orbis_va_lock);
+
+   /* The tail of the window is a gap like any other, and it is the one first-fit reaches last. */
+   if (orbis_va_end > cursor) {
+      const uint64_t gap = orbis_va_end - cursor;
+      s->gaps++;
+      s->free_bytes += gap;
+      if (gap > s->largest_gap)
+         s->largest_gap = gap;
+   }
+}
+
+static void
+orbis_va_report(const char *why)
+{
+   struct orbis_va_stats s;
+   orbis_va_snapshot(&s);
+
+   const uint64_t window = orbis_va_end > orbis_va_base ? orbis_va_end - orbis_va_base : 0;
+
+   mesa_logi("orbis-drm: ARENA %s: %" PRIu64 " live range(s) holding %" PRIu64 " KiB of a %" PRIu64
+             " KiB window; free %" PRIu64 " KiB in %" PRIu64 " gap(s), LARGEST GAP %" PRIu64
+             " KiB; largest live range %" PRIu64 " KiB; %" PRIu64 " range(s) (%" PRIu64
+             " KiB) are parked for the GPU and %u entr(ies) sit on the retire queue; %" PRIu64
+             " alloc(s) and %" PRIu64 " free(s) since start, so %" PRIu64 " are outstanding",
+             why, s.ranges, s.used / 1024, window / 1024, s.free_bytes / 1024, s.gaps,
+             s.largest_gap / 1024, s.largest_range / 1024, s.retired, s.retired_bytes / 1024,
+             orbis_retire_count, orbis_va_allocs, orbis_va_frees,
+             orbis_va_allocs - orbis_va_frees);
+
+   mesa_logi("orbis-drm: ARENA %s by size: <=64K %" PRIu64 " (%" PRIu64 " KiB), <=256K %" PRIu64
+             " (%" PRIu64 " KiB), <=1M %" PRIu64 " (%" PRIu64 " KiB), <=4M %" PRIu64 " (%" PRIu64
+             " KiB), <=16M %" PRIu64 " (%" PRIu64 " KiB), <=64M %" PRIu64 " (%" PRIu64
+             " KiB), >64M %" PRIu64 " (%" PRIu64 " KiB)",
+             why, s.bucket_n[0], s.bucket_bytes[0] / 1024, s.bucket_n[1], s.bucket_bytes[1] / 1024,
+             s.bucket_n[2], s.bucket_bytes[2] / 1024, s.bucket_n[3], s.bucket_bytes[3] / 1024,
+             s.bucket_n[4], s.bucket_bytes[4] / 1024, s.bucket_n[5], s.bucket_bytes[5] / 1024,
+             s.bucket_n[6], s.bucket_bytes[6] / 1024);
+
+   /* ⚠ AND WHO. A size class is not a culprit; a REPEATED EXACT SIZE is, because RADV asks for a VA
+    * range of exactly align64(bo_size, page) + pad, so one allocation site produces one number. The
+    * failing request in the swanstation run was 2113536 bytes - a 2 MiB buffer plus RADV's pad page -
+    * and if four hundred ranges of exactly 2113536 bytes are live, the leak is named without any
+    * further instrument. Sixty-four distinct sizes are tracked and the six largest totals printed;
+    * anything past that is lumped, which is honest rather than silent. */
+   {
+      struct { uint64_t size, n; } tally[64];
+      unsigned distinct = 0;
+      uint64_t spilled_n = 0;
+
+      simple_mtx_lock(&orbis_va_lock);
+      for (const struct amdgpu_va *va = orbis_va_list; va; va = va->next) {
+         unsigned i = 0;
+         while (i < distinct && tally[i].size != va->size)
+            i++;
+         if (i < distinct) {
+            tally[i].n++;
+         } else if (distinct < ARRAY_SIZE(tally)) {
+            tally[distinct].size = va->size;
+            tally[distinct].n = 1;
+            distinct++;
+         } else {
+            spilled_n++;
+         }
+      }
+      simple_mtx_unlock(&orbis_va_lock);
+
+      char line[512];
+      int n = 0;
+      for (unsigned shown = 0; shown < 6 && n < (int)sizeof(line) - 1; shown++) {
+         unsigned best = distinct;
+         uint64_t best_bytes = 0;
+         for (unsigned i = 0; i < distinct; i++) {
+            if (tally[i].n == 0)
+               continue;
+            if (tally[i].size * tally[i].n > best_bytes) {
+               best_bytes = tally[i].size * tally[i].n;
+               best = i;
+            }
+         }
+         if (best == distinct)
+            break;
+         n += snprintf(line + n, sizeof(line) - n, "%s%" PRIu64 " B x%" PRIu64 " = %" PRIu64 " KiB",
+                       n ? ", " : "", tally[best].size, tally[best].n, best_bytes / 1024);
+         tally[best].n = 0;
+      }
+
+      mesa_logi("orbis-drm: ARENA %s biggest holders by exact size: %s%s", why, n ? line : "(none)",
+                spilled_n ? " (and more than 64 distinct sizes, so the tail is not shown)" : "");
+   }
+}
+
 int
 ac_drm_va_range_alloc(ac_drm_device *dev, enum amdgpu_gpu_va_range va_range_type, uint64_t size,
                       uint64_t va_base_alignment, uint64_t va_base_required,
@@ -8248,6 +8415,16 @@ ac_drm_va_range_alloc(ac_drm_device *dev, enum amdgpu_gpu_va_range va_range_type
                 no_reuse ? " - with ORBIS_VA_NO_REUSE set, so this is the window being consumed rather than "
                            "fragmented, and everything measured before this line still stands"
                          : "");
+      /* ⚠ AND WHY. The error alone repeated 183 times in the swanstation run and said nothing that the
+       * first line had not: the state of the arena is what separates a leak from fragmentation from a
+       * window that is simply too small, and it has to be printed HERE because after the failure the
+       * title tears down and the evidence goes with it. Budgeted, because the title retries this
+       * allocation every frame and eight samples are as good as two hundred. */
+      {
+         static unsigned said;
+         if (orbis_budget(&said, 8))
+            orbis_va_report("AT THE FAILURE");
+      }
       return -ENOMEM;
    }
 
@@ -8301,6 +8478,7 @@ ac_drm_va_range_alloc(ac_drm_device *dev, enum amdgpu_gpu_va_range va_range_type
    va->base = candidate;
    va->next = *link;
    *link = va;
+   orbis_va_allocs++; /* under the VA lock, so it needs no atomic of its own */
    simple_mtx_unlock(&orbis_va_lock);
 
    *va_base_allocated = va->base;
@@ -8313,6 +8491,11 @@ ac_drm_va_range_free(amdgpu_va_handle va_range_handle)
 {
    if (!va_range_handle)
       return 0; /* RADV's error paths free unconditionally; libdrm tolerates NULL the same way. */
+
+   /* Counted at the DOOR rather than at the release, because the two differ by exactly the ranges this
+    * arm is still holding for the GPU - and that difference is the number that says whether the retire
+    * queue is draining. */
+   p_atomic_inc(&orbis_va_frees);
 
    /* ⚠ POISON AND QUARANTINE, AND THIS IS WHERE THIS PORT DIFFERS FROM EVERY LINUX ONE.
     *
@@ -10441,6 +10624,15 @@ ac_drm_cs_submit_raw2(ac_drm_device *dev, uint32_t ctx_id, uint32_t bo_list_hand
                             " us a frame in all of them, against a frame of %" PRIu64 " us",
                             line, np ? total_us / np : 0, np ? wall_us / np : 0);
                }
+
+               /* ⚠ AND THE ARENA, EVERY WINDOW, BECAUSE ONE SAMPLE AT THE MOMENT OF DEATH IS NOT A
+                * DIAGNOSIS. swanstation ran for three and a half minutes and then failed to allocate
+                * 2 MiB; whether the live bytes had been climbing the whole time (a leak), or had been
+                * flat while the largest gap collapsed (fragmentation), or had been flat and high from
+                * the start (a window that is simply too small) cannot be read off the failure alone.
+                * A line every five seconds turns the whole run into the trend that answers it, at the
+                * cost of one walk of a few hundred list entries. */
+               orbis_va_report("now");
             }
 
             win_ns = now;
