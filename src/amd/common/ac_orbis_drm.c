@@ -116,6 +116,12 @@ enum {
    ORBIS_KC_BO_FREE,
    ORBIS_KC_VA_MAP,
    ORBIS_KC_VA_UNMAP,
+   /* ⚠ THE EVENT THAT ACTUALLY DOMINATES A FAILING RUN, AND NOTHING WAS COUNTING IT. In the glcore
+    * capture of 2026-08-31, 81974 of the log's 82407 lines - 99.5% of the file - are the syncobj
+    * timeout warning below, across 1231 distinct fence-label values, while BO allocations over the
+    * WHOLE session numbered 661. Whatever is draining libkernel's internal memory tracks this event
+    * and not the allocator, so it belongs on the attribution line beside the bytes. */
+   ORBIS_KC_SYNC_TIMEOUT,
    ORBIS_KC_SLOTS,
 };
 
@@ -134,6 +140,7 @@ static const char *const orbis_kc_names[ORBIS_KC_SLOTS] = {
    [ORBIS_KC_BO_FREE] = "bo_free",
    [ORBIS_KC_VA_MAP] = "va_map",
    [ORBIS_KC_VA_UNMAP] = "va_unmap",
+   [ORBIS_KC_SYNC_TIMEOUT] = "syncobj_timeout",
 };
 
 static inline void
@@ -5747,9 +5754,30 @@ orbis_sync_wait(struct util_sync_provider *p, uint32_t *handles, unsigned num_ha
                          "failure", *orbis_fence_label);
             }
          } else {
-            /* Loud, because a real expired deadline means the GPU did not reach the end of a submission. */
-            mesa_logw("orbis-drm: syncobj wait timed out - the GPU did not finish; label %u",
-                      *orbis_fence_label);
+#if defined(__PS4__)
+            orbis_kc_hit(ORBIS_KC_SYNC_TIMEOUT);
+#endif
+            /* ⚠ LOUD ONCE, NOT EIGHTY-TWO THOUSAND TIMES - AND THE MISSING BUDGET HERE IS ITSELF A
+             * FINDING. The poll arm three lines up is bounded with orbis_budget(&polls, 4) and this
+             * one never was, on the reasoning that a real expired deadline is worth shouting about.
+             * It is, once: measured 2026-08-31, a single glcore session emitted 81974 copies of this
+             * line - 99.5% of the whole log - which buries every other line in the file and makes the
+             * one channel this console has useless for anything else.
+             *
+             * ⚠ AND BOUNDING IT IS ALSO THE EXPERIMENT. The same session drained libkernel's internal
+             * memory from 14013728 bytes to 96 and killed the process, and this event is the only
+             * thing in the run whose rate tracks the drain - BO allocation does not, the arena does
+             * not, vkAllocateMemory is zero. Two possibilities remain and they are told apart by this
+             * one line: if the cost is in the LOG SINK, bounding it stops the drain; if the cost is in
+             * the WAIT, the drain continues while the counter above still reports the true rate.
+             * Either answer is worth a run, and the log is worth bounding regardless. */
+            static unsigned said_timeout;
+            if (orbis_budget(&said_timeout, 8)) {
+               mesa_logw("orbis-drm: syncobj wait timed out - the GPU did not finish; label %u "
+                         "(this line is bounded; the true count is on the BUDGET line's "
+                         "syncobj_timeout counter)",
+                         *orbis_fence_label);
+            }
          }
          return -ETIME;
       }
