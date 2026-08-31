@@ -223,6 +223,23 @@ zink_destroy_resource_object(struct zink_screen *screen, struct zink_resource_ob
    if (!obj->dt)
       zink_destroy_resource_surface_cache(screen, &obj->surface_cache, obj->is_buffer);
    simple_mtx_destroy(&obj->surface_mtx);
+   /* ⚠ resource_object_create() calls u_rwlock_init on this and nothing has ever destroyed it.
+    *
+    * On glibc that costs nothing visible: the rwlock's storage is inside obj and goes away with the
+    * FREE below. On the PlayStation 4 it is not free. Measured on hardware 2026-08-31, in isolation
+    * at startup: an unbalanced pthread_rwlock_init takes 64 bytes of libkernel's ScePthread internal
+    * pool and only pthread_rwlock_destroy returns them - a balanced pair costs exactly zero.
+    *
+    * That pool is 14 MB and does not grow. A --wrap census of the whole link measured 146 rwlocks
+    * created per frame and none destroyed, all from this one call site, while the frame ledger
+    * measured 8701 bytes a frame leaving the pool: 146 x 64 = 9344, and the ledger is known to
+    * under-count because it does not book the gap between sampled frames. When the pool runs out the
+    * title dies with "[ScePthread/System] Internal Memory is running out" and the console is close
+    * to needing a cold reboot.
+    *
+    * Mutexes and conds were flat at 368 and 348 outstanding through the same run, which is what a
+    * correctly balanced primitive looks like here. */
+   u_rwlock_destroy(&obj->copy_lock);
    if (!obj->dt && zink_debug & ZINK_DEBUG_MEM)
       zink_debug_mem_del(screen, obj->bo);
    for (unsigned i = 0; i < ARRAY_SIZE(obj->copies); i++)
