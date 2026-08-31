@@ -178,6 +178,61 @@ extern void orbis_umtx_stats(unsigned long long *waits, unsigned long long *time
 extern void orbis_clock_counts(unsigned long long *monotonic, unsigned long long *realtime)
    __attribute__((weak));
 
+/* ⚠ AND WHO IS DOING THE POLLING, WHICH NO COUNTER CAN SAY. Measured 2026-08-31: 162 syncobj polls a
+ * frame against ONE vkWaitForFences a frame, one QueueSubmit2, one AcquireNextImage2 and one
+ * QueuePresentKHR - and no AllocateDescriptorSets or GetFenceStatus at all. So the polls do not come
+ * through any timed Vulkan entry point: they are driver-internal, from inside Mesa, RADV or the WSI,
+ * and nothing in this port knows which. Four backtraces settle it. orbis-compat exports the unwinder
+ * (include/execinfo.h) and the port's ps4/symbolise.py resolves the addresses against the ELF; weak,
+ * so a build without the overlay simply prints nothing. */
+extern int orbis_unwind_collect(void **buffer, int size, int skip) __attribute__((weak));
+
+/* ------------------------------------------------------- bisecting the 73 bytes, with the meter
+ *
+ * ⚠ SIX PRIMITIVES CAME BACK CLEAN AND THE LEAK DID NOT MOVE, so the next instrument must not be a
+ * seventh guess. Measured 2026-08-31: 73.0 bytes vanish from libkernel's internal memory for every
+ * syncobj POLL, 162 a frame, exact to 0.03% over 48739 of them - while control, clock_gettime on both
+ * families, pthread_mutex, sceKernelUsleep and an expired cond_timedwait each measured 0 bytes per
+ * call over 2000 calls in isolation, and the futex shim reports 0 cond-waits in every window.
+ *
+ * ⚠ AND "PROPORTIONAL TO POLLS" IS NOT "INSIDE THE POLL". The report divides bytes lost in a window
+ * by polls in that window, so anything that happens once per poll fits equally well - including the
+ * caller's own loop body between two polls, which is zink's code and not this driver's. That third
+ * reading has never been tested and is as consistent with every number as the other two.
+ *
+ * So this stops counting calls and BISECTS with the meter itself. On a sampled pair of CONSECUTIVE
+ * polls it reads the pool four times:
+ *
+ *     entry(k) .. exit(k)          -> INSIDE  this function
+ *     exit(k)  .. entry(k+1)       -> OUTSIDE it, i.e. one iteration of the caller's poll loop
+ *
+ * Consecutive, so the outside window is exactly one caller iteration and not fifteen skipped polls.
+ * Accumulated rather than reported per sample, because the meter's own resolution is coarse - the
+ * isolation probe read 96 and 64 bytes over two thousand calls - and 73 bytes is invisible in one
+ * sample and unmistakable in three thousand.
+ *
+ * ⚠ ON BY DEFAULT, AND THAT IS DELIBERATE. Every knob in this investigation that could be missed has
+ * been missed at least once - an env file, a package install, a call site - and each cost a console
+ * run. One in sixty-four polls is about three hundred meter reads a second against a call this
+ * process already makes ten thousand times a second; that is cheaper than another wasted round.
+ * ORBIS_NO_BISECT=1 turns it off if it ever proves otherwise. */
+static uint64_t orbis_bis_n;         /* polls seen, for the 1-in-64 sampling */
+static uint64_t orbis_bis_pairs;     /* completed inside+outside pairs */
+static int64_t  orbis_bis_inside;    /* bytes lost between entry and exit of this function */
+static int64_t  orbis_bis_outside;   /* bytes lost between our exit and the caller's next entry */
+static uint64_t orbis_bis_exit_free; /* the meter at the last sampled exit, 0 when not armed */
+
+static bool
+orbis_bisect_enabled(void)
+{
+   static int cached = -1;
+   if (cached < 0) {
+      const char *const e = getenv("ORBIS_NO_BISECT");
+      cached = (e && *e && *e != '0') ? 0 : 1;
+   }
+   return cached == 1;
+}
+
 static uint64_t
 orbis_internal_memory_free(void)
 {
@@ -5710,6 +5765,37 @@ orbis_sync_wait(struct util_sync_provider *p, uint32_t *handles, unsigned num_ha
     * separate. */
    const bool expired_on_entry = (int64_t)os_time_get_nano() >= watch.caller_deadline;
 
+#if defined(__PS4__)
+   /* ⚠ TWO PHASES OF ONE PAIR. Phase 0 opens a sample and measures INSIDE; phase 1 is the very next
+    * poll, whose entry closes the OUTSIDE window opened by phase 0's exit. Anything else that ran in
+    * between is, by construction, the caller's loop body - which is exactly what is being weighed. */
+   const uint64_t bis_i = orbis_bisect_enabled() ? p_atomic_inc_return(&orbis_bis_n) : 0;
+   const bool bis_open = bis_i != 0 && (bis_i & 63) == 0;
+   const bool bis_close = bis_i != 0 && (bis_i & 63) == 1 && orbis_bis_exit_free != 0;
+   uint64_t bis_entry_free = 0;
+
+   if (bis_open) {
+      bis_entry_free = orbis_internal_memory_free();
+   } else if (bis_close) {
+      const uint64_t now_free = orbis_internal_memory_free();
+      orbis_bis_outside += (int64_t)orbis_bis_exit_free - (int64_t)now_free;
+      orbis_bis_exit_free = 0;
+      ++orbis_bis_pairs;
+
+      /* One line per two thousand pairs - about every ten seconds of menu, and enough samples that
+       * 73 bytes is a number rather than a rounding error. */
+      if ((orbis_bis_pairs % 2048) == 0) {
+         mesa_logi("orbis-drm: poll bisection over %llu pair(s): %lld bytes lost INSIDE "
+                   "orbis_sync_wait (%.1f/poll), %lld bytes lost OUTSIDE it in the caller's loop "
+                   "(%.1f/poll). The 73 belongs to whichever of these carries it; if neither does, "
+                   "it is spent somewhere neither window covers.",
+                   (unsigned long long)orbis_bis_pairs,
+                   (long long)orbis_bis_inside, (double)orbis_bis_inside / (double)orbis_bis_pairs,
+                   (long long)orbis_bis_outside, (double)orbis_bis_outside / (double)orbis_bis_pairs);
+      }
+   }
+#endif
+
    /* ⚠ THE MEASUREMENT THE FENCE POOL NEEDS. A title exhausted its 32-fence pool and threw "device is
     * lost" while this arm reported the GPU label advancing normally - which means the disagreement is
     * between what a fence WAS given and what this wait is comparing it against. Print both, per handle,
@@ -5780,11 +5866,31 @@ orbis_sync_wait(struct util_sync_provider *p, uint32_t *handles, unsigned num_ha
          if (timeout_nsec == 0 || expired_on_entry) {
 #if defined(__PS4__)
             orbis_kc_hit(ORBIS_KC_SYNC_POLL);
+            if (bis_open) {
+               const uint64_t x = orbis_internal_memory_free();
+               orbis_bis_inside += (int64_t)bis_entry_free - (int64_t)x;
+               orbis_bis_exit_free = x; /* arms the OUTSIDE window for the next poll */
+            }
 #endif
             static unsigned polls;
             if (orbis_budget(&polls, 4)) {
+               char callers[10 * 20 + 1];
+               size_t at = 0;
+               callers[0] = '\0';
+               if (&orbis_unwind_collect != NULL) {
+                  void *frames[10];
+                  const int nf = orbis_unwind_collect(frames, 10, 1);
+                  for (int i = 0; i < nf; i++) {
+                     const int n2 = snprintf(callers + at, sizeof(callers) - at, "%s%p",
+                                             i ? " " : "", frames[i]);
+                     if (n2 < 0 || (size_t)n2 >= sizeof(callers) - at)
+                        break;
+                     at += (size_t)n2;
+                  }
+               }
                mesa_logi("orbis-drm: syncobj POLL says not yet, label %u - a deadline of now or "
-                         "earlier is a question, not a failure", *orbis_fence_label);
+                         "earlier is a question, not a failure. Asked by, innermost first: %s",
+                         *orbis_fence_label, at ? callers : "(no unwinder)");
             }
          } else {
 #if defined(__PS4__)
