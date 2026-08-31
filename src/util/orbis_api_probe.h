@@ -58,6 +58,56 @@ enum orbis_api_slot {
    ORBIS_API_SLOTS,
 };
 
+/* ⚠ THE KERNEL-CALL CENSUS, AND IT LIVES HERE BECAUSE THE FIRST VERSION OF IT LIED BY OMISSION.
+ *
+ * Counting every memory-touching sceKernel entry point in ac_orbis_drm.c produced windows whose only
+ * non-zero counter was SubmitCommandBuffers, and that was read - by me - as "the leak is per submit".
+ * It is not what the data said. It said "the leak is per something that happens once per submit, AMONG
+ * THE CALLS THAT WERE COUNTED", and the calls that were NOT counted include every sceKernel and
+ * sceVideoOut entry point in wsi_orbis.c and sceKernelUsleep everywhere. Presents run 1:1 with submits
+ * in every leaking window, so a per-present cost fits the same numbers exactly as well - measured:
+ * 650 B x presents fits w11-w13 to 0.02%, 309 B x submits fits them to 0.3%. The census could not tell
+ * them apart and did not say so.
+ *
+ * ⚠ SO THE ENUM IS SHARED RATHER THAN DUPLICATED. The precedent above it - ids 47-52 written out by
+ * hand in wsi_orbis.c with a comment saying they "were verified against it when this was written" - is
+ * exactly the drift this avoids: two files agreeing by inspection until one of them changes. */
+enum orbis_kc_slot {
+   ORBIS_KC_DMEM_ALLOC = 0,
+   ORBIS_KC_DMEM_RELEASE,
+   ORBIS_KC_DMEM_MAP,
+   ORBIS_KC_FMEM_MAP,
+   ORBIS_KC_MMAP,
+   ORBIS_KC_MUNMAP,
+   ORBIS_KC_MPROTECT,
+   ORBIS_KC_SUBMIT,
+   ORBIS_KC_BO_ALLOC,
+   ORBIS_KC_BO_FREE,
+   ORBIS_KC_VA_MAP,
+   ORBIS_KC_VA_UNMAP,
+   ORBIS_KC_SYNC_TIMEOUT,
+
+   /* ⚠ EVERYTHING BELOW THIS LINE IS WHAT THE FIRST CENSUS COULD NOT SEE.
+    *
+    * usleep first, because it is on BOTH hot paths and is the highest-frequency libkernel call in the
+    * process: orbis_poll_pause sleeps 50 us per iteration of every fence poll, and
+    * wsi_orbis_wait_for_flip_slot sleeps 500 us per iteration while present blocks ~15 ms of every
+    * 16.7 ms frame. Neither was counted, and either would divide into the measured constants. */
+   ORBIS_KC_USLEEP,
+   ORBIS_KC_GNM_FLUSH_GARLIC,
+   ORBIS_KC_GNM_SUBMIT_DONE,
+   ORBIS_KC_GNM_ALLOWED,
+   ORBIS_KC_VO_SUBMIT_FLIP,
+   ORBIS_KC_VO_FLIP_STATUS,
+   ORBIS_KC_VO_REGISTER,
+   ORBIS_KC_VO_OPEN_CLOSE,
+
+   ORBIS_KC_SLOTS,
+};
+
+/* Defined in ac_orbis_drm.c, which owns the counters and the report that divides them by presents. */
+void orbis_kc_count(unsigned slot);
+
 #ifdef HAVE_ORBIS_PLATFORM
 
 #include <stdint.h>

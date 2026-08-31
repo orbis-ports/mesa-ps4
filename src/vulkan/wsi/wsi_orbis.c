@@ -147,6 +147,42 @@ static int32_t sceGnmSubmitDone(void) { return 0; }
  * must match that patch's enum; 47-50 were verified against it when this was written. */
 void orbis_api_count(unsigned id, uint64_t n);
 void orbis_api_time(unsigned id, uint64_t ns);
+
+/* ⚠ AND THE KERNEL-CALL CENSUS, WHICH THIS FILE WAS MISSING FROM ENTIRELY - the omission that sent a
+ * whole round of this investigation at the wrong call.
+ *
+ * The census in ac_orbis_drm.c counted every memory-touching sceKernel entry point IN THAT FILE, and
+ * the report then attributed a 309 B/frame leak to sceGnmSubmitCommandBuffers because it was the only
+ * counter that moved. It was the only counter that EXISTED on a per-frame path: presents run 1:1 with
+ * submits in every leaking window, and every sceVideoOut call and every sceKernelUsleep in this file
+ * was invisible. A per-present cost fits the same measurements just as well - 650 B x presents matched
+ * three consecutive windows to 0.02%.
+ *
+ * So the present path books into the same counters, through the same shared enum, and the next report
+ * can tell a per-submit cost from a per-present one instead of assuming. */
+#include "util/orbis_api_probe.h"
+
+#if defined(__PS4__)
+#define sceKernelUsleep(...) (orbis_kc_count(ORBIS_KC_USLEEP), (sceKernelUsleep)(__VA_ARGS__))
+#define sceVideoOutSubmitFlip(...)                                                                    \
+   (orbis_kc_count(ORBIS_KC_VO_SUBMIT_FLIP), (sceVideoOutSubmitFlip)(__VA_ARGS__))
+#define sceVideoOutGetFlipStatus(...)                                                                 \
+   (orbis_kc_count(ORBIS_KC_VO_FLIP_STATUS), (sceVideoOutGetFlipStatus)(__VA_ARGS__))
+#define sceVideoOutRegisterBuffers(...)                                                               \
+   (orbis_kc_count(ORBIS_KC_VO_REGISTER), (sceVideoOutRegisterBuffers)(__VA_ARGS__))
+#define sceVideoOutOpen(...) (orbis_kc_count(ORBIS_KC_VO_OPEN_CLOSE), (sceVideoOutOpen)(__VA_ARGS__))
+#define sceVideoOutClose(...) (orbis_kc_count(ORBIS_KC_VO_OPEN_CLOSE), (sceVideoOutClose)(__VA_ARGS__))
+#define sceGnmSubmitDone(...)                                                                         \
+   (orbis_kc_count(ORBIS_KC_GNM_SUBMIT_DONE), (sceGnmSubmitDone)(__VA_ARGS__))
+#define sceGnmAreSubmitsAllowed(...)                                                                  \
+   (orbis_kc_count(ORBIS_KC_GNM_ALLOWED), (sceGnmAreSubmitsAllowed)(__VA_ARGS__))
+#define sceKernelAllocateDirectMemory(...)                                                            \
+   (orbis_kc_count(ORBIS_KC_DMEM_ALLOC), (sceKernelAllocateDirectMemory)(__VA_ARGS__))
+#define sceKernelMapDirectMemory(...)                                                                 \
+   (orbis_kc_count(ORBIS_KC_DMEM_MAP), (sceKernelMapDirectMemory)(__VA_ARGS__))
+#define sceKernelReleaseDirectMemory(...)                                                             \
+   (orbis_kc_count(ORBIS_KC_DMEM_RELEASE), (sceKernelReleaseDirectMemory)(__VA_ARGS__))
+#endif
 enum { ORBIS_ID_WSI_PRESENT = 47, ORBIS_ID_WSI_GPU_IDLE = 48, ORBIS_ID_WSI_COPY = 49,
        ORBIS_ID_WSI_FLIP_WAIT = 50, ORBIS_ID_AB_A = 51, ORBIS_ID_AB_B = 52 };
 

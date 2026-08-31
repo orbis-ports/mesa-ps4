@@ -97,34 +97,6 @@
  * cannot resolve it yields zero rather than a driver that will not build.
  */
 #if defined(__PS4__)
-enum {
-   ORBIS_KC_DMEM_ALLOC = 0,
-   ORBIS_KC_DMEM_RELEASE,
-   ORBIS_KC_DMEM_MAP,
-   ORBIS_KC_FMEM_MAP,
-   ORBIS_KC_MMAP,
-   ORBIS_KC_MUNMAP,
-   ORBIS_KC_MPROTECT,
-   ORBIS_KC_SUBMIT,
-   /* ⚠ THE MIDDLE TERM, AND WITHOUT IT THE OTHER COUNTS CANNOT BE READ. vkAllocateMemory is measured
-    * at ZERO per frame, which rules out application allocations and nothing else: RADV's own buffers -
-    * command-stream IBs, upload buffers, descriptor and query pools - never pass through it. zink
-    * churns exactly those, once per batch or once per draw, and on this platform each one becomes a
-    * BO here and a mapping below. Counting the BO and the VA operation separately from the syscall is
-    * what distinguishes "zink asks for more" from "we make each ask expensive". */
-   ORBIS_KC_BO_ALLOC,
-   ORBIS_KC_BO_FREE,
-   ORBIS_KC_VA_MAP,
-   ORBIS_KC_VA_UNMAP,
-   /* ⚠ THE EVENT THAT ACTUALLY DOMINATES A FAILING RUN, AND NOTHING WAS COUNTING IT. In the glcore
-    * capture of 2026-08-31, 81974 of the log's 82407 lines - 99.5% of the file - are the syncobj
-    * timeout warning below, across 1231 distinct fence-label values, while BO allocations over the
-    * WHOLE session numbered 661. Whatever is draining libkernel's internal memory tracks this event
-    * and not the allocator, so it belongs on the attribution line beside the bytes. */
-   ORBIS_KC_SYNC_TIMEOUT,
-   ORBIS_KC_SLOTS,
-};
-
 static uint64_t orbis_kc[ORBIS_KC_SLOTS];
 
 static const char *const orbis_kc_names[ORBIS_KC_SLOTS] = {
@@ -141,6 +113,14 @@ static const char *const orbis_kc_names[ORBIS_KC_SLOTS] = {
    [ORBIS_KC_VA_MAP] = "va_map",
    [ORBIS_KC_VA_UNMAP] = "va_unmap",
    [ORBIS_KC_SYNC_TIMEOUT] = "syncobj_timeout",
+   [ORBIS_KC_USLEEP] = "Usleep",
+   [ORBIS_KC_GNM_FLUSH_GARLIC] = "FlushGarlic",
+   [ORBIS_KC_GNM_SUBMIT_DONE] = "SubmitDone",
+   [ORBIS_KC_GNM_ALLOWED] = "AreSubmitsAllowed",
+   [ORBIS_KC_VO_SUBMIT_FLIP] = "VideoOutSubmitFlip",
+   [ORBIS_KC_VO_FLIP_STATUS] = "VideoOutGetFlipStatus",
+   [ORBIS_KC_VO_REGISTER] = "VideoOutRegisterBuffers",
+   [ORBIS_KC_VO_OPEN_CLOSE] = "VideoOutOpen/Close",
 };
 
 static inline void
@@ -149,6 +129,22 @@ orbis_kc_hit(unsigned slot)
    p_atomic_inc(&orbis_kc[slot]);
 }
 
+/* The cross-translation-unit door, so wsi_orbis.c books into the same counters and the same report.
+   Not static, and declared in util/orbis_api_probe.h beside the enum. */
+void
+orbis_kc_count(unsigned slot)
+{
+   if (slot < ORBIS_KC_SLOTS)
+      orbis_kc_hit(slot);
+}
+
+#define sceKernelUsleep(...) (orbis_kc_hit(ORBIS_KC_USLEEP), (sceKernelUsleep)(__VA_ARGS__))
+#define sceGnmFlushGarlic(...)                                                                     \
+   (orbis_kc_hit(ORBIS_KC_GNM_FLUSH_GARLIC), (sceGnmFlushGarlic)(__VA_ARGS__))
+#define sceGnmSubmitDone(...)                                                                      \
+   (orbis_kc_hit(ORBIS_KC_GNM_SUBMIT_DONE), (sceGnmSubmitDone)(__VA_ARGS__))
+#define sceGnmAreSubmitsAllowed(...)                                                               \
+   (orbis_kc_hit(ORBIS_KC_GNM_ALLOWED), (sceGnmAreSubmitsAllowed)(__VA_ARGS__))
 #define sceKernelAllocateDirectMemory(...)                                                         \
    (orbis_kc_hit(ORBIS_KC_DMEM_ALLOC), (sceKernelAllocateDirectMemory)(__VA_ARGS__))
 #define sceKernelReleaseDirectMemory(...)                                                          \
