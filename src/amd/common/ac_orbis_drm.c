@@ -1495,6 +1495,12 @@ static unsigned orbis_dead_at;
 static uint64_t orbis_submit_seq_no;
 
 static uint64_t orbis_arena_private;
+
+/* Sony's tessellation factor ring, if this run backed it with real memory. See ORBIS_TF_SONY_BASE below;
+ * zero means the mapping was never asked for or did not land, and every reader treats that zero as the
+ * difference between "use Sony's ring" and "use ours". */
+static uint64_t orbis_sony_tf_va;
+static uint64_t orbis_sony_tf_size;
 /* The arena's physical offset and the address the whole of it was first mapped at. Together they turn any address in
  * the window into the physical page behind it - phys = orbis_arena_phys + (va - orbis_arena_map_base) - which is what
  * lets a range be unmapped and mapped again at exactly the same address. */
@@ -3188,6 +3194,17 @@ orbis_selftest_pad(void)
  * round-trip rung can write the RIGHT number rather than a magic one - a run where the write sticks then
  * leaves the register correct instead of corrupted. Zero until the rings exist. */
 static uint32_t orbis_roundtrip_base;
+
+/* Zero unless ORBIS_TF_SONY_BASE mapped real memory at exactly the address it asked for. Callers read it as
+ * "use Sony's factor ring instead of ours", so the zero is what keeps a refused mapping from turning into a
+ * driver that points the hardware at nothing. */
+uint64_t
+ac_orbis_sony_tf_ring(uint64_t *size)
+{
+   if (size != NULL)
+      *size = orbis_sony_tf_size;
+   return orbis_sony_tf_va;
+}
 
 void
 ac_orbis_note_tf_base(uint32_t base_shifted)
@@ -4932,6 +4949,21 @@ orbis_read_hw_registers(void)
       { "VGT_TF_MEMORY_BASE",      0x30940, 0, 0, "ac_emit_cp_tess_rings; ours is our factor ring >> 8. If this "
                                                   "reads 0x0ff00000 it is SONY's and our write did not survive" },
 
+      /* ⚠ AND THE REGISTER THAT DECIDES WHERE THOSE THREE LAND, WHICH NOBODY HAS ASKED FOR.
+       *
+       * GRBM_GFX_INDEX is the SELECT rather than a per-engine register, so it answers through the same
+       * route SCRATCH_REG0 does and its value is not in doubt the way theirs are. Sony's own default
+       * hardware state sets it to 0xe0000000 - full broadcast - which is a driver stating that it expects
+       * to find the select narrowed at the start of a command buffer.
+       *
+       * Anything but 0xe0000000 here explains this whole defect in one number: the VGT is per shader
+       * engine, so our VGT_TF_MEMORY_BASE reached one engine and the other kept Sony's 0xff0000000, which
+       * is where the reads fault - while the writes, which travel in a ring descriptor and not in a
+       * register, follow our base. It also explains why these three read back zero through a round trip
+       * that SCRATCH_REG0, which is not indexed, passes. */
+      { "GRBM_GFX_INDEX",          0x30800, 0, 0, "nothing in RADV but ac_write_harvested_raster_configs, which "
+                                                  "restores broadcast; Sony's init block writes 0xe0000000" },
+
       /* ---- THE PAYLOAD, ASKED FIRST. Five fields of GB_ADDR_CONFIG are SYNTHESISED by
        * orbis_gb_addr_config() and two are flagged there as unmeasured: ROW_SIZE ("a documented assumption")
        * and NUM_SHADER_ENGINES, which says ONE engine while drm_amdgpu_info_device.num_shader_engines says
@@ -5100,6 +5132,14 @@ orbis_read_hw_registers(void)
              "SCRATCH_REG0 round trip, rungs 2+ are one register each. A MISSING rung names what killed the "
              "title; ORBIS_READ_REGS_FIRST steps over it without a rebuild.", n_rungs, first, last);
 
+   /* SAID HERE RATHER THAN INSIDE THE RUNG, because a round trip that passes with the select broadcast and
+    * one that passes without it mean opposite things, and a log that does not carry which run this was
+    * cannot tell them apart afterwards. */
+   if (getenv("ORBIS_GRBM_BROADCAST") != NULL)
+      mesa_logi("orbis-drm: READ_REGS - ORBIS_GRBM_BROADCAST is set, so every round trip below writes "
+                "GRBM_GFX_INDEX = 0xe0000000 one packet before the register it tests. Read the results "
+                "against a run WITHOUT it; on its own it proves nothing.");
+
    /* The destination and the completion flag live in the private page, past the fence label and its scratch; the
     * IB goes in the staging ring's first slot, which nothing has used yet at this point. */
    volatile uint32_t *const dst = (volatile uint32_t *)(uintptr_t)(orbis_arena_private + 1024);
@@ -5197,6 +5237,22 @@ orbis_read_hw_registers(void)
       const bool roundtrip = rung >= 5 && reg >= 0x30938u && reg <= 0x30940u &&
                              getenv("ORBIS_REG_ROUNDTRIP") != NULL;
       if (roundtrip) {
+         /* ⚠ AND OPTIONALLY AIM THE WRITE FIRST, WHICH SEPARATES THE TWO READINGS THE ROUND TRIP LEFT OPEN.
+          *
+          * A narrowed GRBM_GFX_INDEX makes an INDEXED register answer zero to a write it never received -
+          * which is what all three of these did - while SCRATCH_REG0, which is not indexed, round trips
+          * through the same packet path. Broadcasting in the SAME packet stream, one packet before the
+          * write, is the whole experiment: a round trip that passes only with it names the cause, and one
+          * that fails with it too clears the select and leaves the register block itself as the answer.
+          *
+          * ORBIS_GRBM_BROADCAST=1 - the same knob radv_emit_tess_factor_ring reads, so a run either
+          * broadcasts everywhere or nowhere. */
+         if (getenv("ORBIS_GRBM_BROADCAST") != NULL) {
+            *dw++ = ORBIS_PM4_TYPE3(0x79 /* IT_SET_UCONFIG_REG */, 2);
+            *dw++ = (0x30800u - 0x30000u) >> 2;
+            *dw++ = 0xe0000000u;   /* SE | SH | INSTANCE broadcast, and Sony's own value */
+         }
+
          const uint32_t want = (reg == 0x30940u) ? orbis_roundtrip_base : control_pattern;
          *dw++ = ORBIS_PM4_TYPE3(0x79 /* IT_SET_UCONFIG_REG */, 2);
          *dw++ = (reg - 0x30000u) >> 2;
@@ -5579,6 +5635,103 @@ orbis_arena_setup_once(void)
                memset(dva, 0x5a, (size_t)len);
                mesa_logi("orbis-drm: DECOY %llu MiB mapped at 0x%" PRIx64 " and filled with 0x5a - a read that "
                          "would have faulted now returns mid-grey",
+                         (unsigned long long)(len / (1024 * 1024)), at);
+            }
+         }
+      }
+   }
+
+   /* ⚠ PUT THE FACTOR RING WHERE SONY'S REGISTER ALREADY POINTS, RATHER THAN FIGHTING THE REGISTER.
+    *
+    * Every other route into this defect goes through VGT_TF_MEMORY_BASE, and that register has refused to
+    * answer anything: written and read back in the same packet stream it returns 0x00000000, while
+    * SCRATCH_REG0 round trips through the same path. So "our base did not survive" and "this register
+    * cannot be read this way" are still not separated, and separating them costs a console run either way.
+    *
+    * THIS ROUTE DOES NOT NEED THE REGISTER TO WORK AT ALL. sceGnmGetTheTessellationFactorRingBufferBaseAddress
+    * answers 0xff0000000 in this process, first-hand; the reads that fault land at 0xff0000000 + 0x2000
+    * through + 0x1c000, which is inside a factor ring of any plausible size; and the decoy above has already
+    * proved this address can be backed with real memory, because backing it turned a fatal fault into a
+    * completed frame. So if the FACTOR RING IS PLACED THERE - the descriptor the HS writes factors through
+    * AND the register the VGT reads them through - the write path and the read path agree whether or not our
+    * register write ever lands. If it does land, it writes the value the register already holds.
+    *
+    * ⚠ WHAT THIS IS NOT: it is not a claim that 0xff0000000 is ours. It is a claim that nothing else on
+    * this console is using it, and the evidence is that no retail title programs VGT_SHADER_STAGES_EN.HS_EN -
+    * 3057 captured command streams, never once - so no other process has ever driven the stage that reads
+    * this ring. The compositor shares this GPU with us, so if that is wrong it is wrong loudly.
+    *
+    * ⚠ AND IT NEVER FAILS QUIETLY, for the reason the decoy states: a run that believes it is using Sony's
+    * ring and is not would read as a failed experiment rather than as a broken one. orbis_sony_tf_va stays
+    * zero unless the mapping landed at exactly the address asked for.
+    *
+    * ⚠ AND IT IS ON BY DEFAULT, WHICH IT WAS NOT WHEN IT WAS WRITTEN. It shipped off because it was a
+    * candidate, and the rule this file keeps is that a candidate does not become a default by being
+    * plausible. It became one by being measured, on 2026-08-31 and on hardware:
+    *
+    *   dEQP-VK.tessellation, 44-case smoke   44/44 Pass with it; without it the same 44 died on the
+    *                                         first tessellated draw, a texture-cache READ at
+    *                                         0xff0010000 - Sony's base plus an offset
+    *   dEQP-VK.tessellation, 535-case core   418 Pass; every one of the 117 failures carries a
+    *                                         geometry shader and not one case without a geometry
+    *                                         shader fails
+    *   OpenGothic                            no fault, no artefacts, 45-60 fps - unchanged from the
+    *                                         stage being off, so what this port charged tessellation
+    *                                         was subdivision asked for by garbage factors
+    *   the rings, under that title           all 256 offchip buffers used, none past the ring, and
+    *                                         the factor ring never written past VGT_TF_RING_SIZE
+    *
+    * The mapping is still allowed to fail, and a failure is still not fatal: orbis_sony_tf_va stays
+    * zero and every reader falls back to our own ring, which is the pre-2026-08-31 behaviour with its
+    * pre-2026-08-31 fault. That is stated rather than silent.
+    *
+    * ORBIS_TF_SONY_BASE=0 switches it off. =<addr>[:<MiB>] moves it. 2 MiB by default: RADV computes a
+    * 256 KiB factor ring for this part and sceKernelMapDirectMemory COMMITS EAGERLY here, so this asks
+    * for megabytes and never for gigabytes. */
+   {
+      const char *const sony = getenv("ORBIS_TF_SONY_BASE");
+      const bool        off = sony != NULL && sony[0] == '0' && sony[1] == '\0';
+
+      if (!off) {
+         char          *end = NULL;
+         /* Unset, or "1", both mean the default address: the knob's value is only ever consulted when
+          * somebody is deliberately moving the ring. */
+         const bool     plain = sony == NULL || *sony == '\0' || (sony[0] == '1' && sony[1] == '\0');
+         const uint64_t at = plain ? 0xff0000000ull : strtoull(sony, &end, 0);
+         const uint64_t mib = (!plain && end != NULL && *end == ':') ? strtoull(end + 1, NULL, 10) : 2;
+         const uint64_t len = (mib > 0 ? mib : 1) * 1024 * 1024;
+         off_t          sphys = 0;
+         int32_t        err = sceKernelAllocateDirectMemory(0, direct_total, len, ORBIS_DIRECT_ALIGN,
+                                                           ORBIS_KERNEL_WB_ONION, &sphys);
+
+         if (err != 0) {
+            mesa_loge("orbis-drm: TF_SONY_BASE refused physical memory: 0x%08x - the factor ring stays OURS, "
+                      "and this run is not the experiment it was meant to be", (unsigned)err);
+         } else {
+            void *sva = (void *)(uintptr_t)at;
+
+            err = sceKernelMapDirectMemory(&sva, len, ORBIS_GRAPHICS_PROT, 0, sphys, ORBIS_DIRECT_ALIGN);
+            if (err != 0) {
+               mesa_loge("orbis-drm: TF_SONY_BASE could not map 0x%" PRIx64 ": 0x%08x - the factor ring stays "
+                         "OURS", at, (unsigned)err);
+               sceKernelReleaseDirectMemory(sphys, len);
+            } else if ((uint64_t)(uintptr_t)sva != at) {
+               mesa_loge("orbis-drm: TF_SONY_BASE landed at 0x%" PRIx64 " and NOT at the requested 0x%" PRIx64
+                         " - the factor ring stays OURS; treat this run as a control",
+                         (uint64_t)(uintptr_t)sva, at);
+            } else {
+               /* Zeroed rather than poisoned, unlike the decoy. This is a ring the hardware WRITES first and
+                * reads second, so a marker byte everywhere would be indistinguishable from factors that never
+                * arrived. Zero is a tessellation factor of zero, which discards the patch: geometry with
+                * holes in it says "written nowhere", where 0x5a would have said "written somewhere else". */
+               memset(sva, 0, (size_t)len);
+               orbis_sony_tf_va = at;
+               orbis_sony_tf_size = len;
+               mesa_logi("orbis-drm: TF_SONY_BASE - %llu MiB of real memory mapped at 0x%" PRIx64 ", which is "
+                         "where sceGnmGetTheTessellationFactorRingBufferBaseAddress() says Sony's factor ring "
+                         "is and where every faulting read has landed. The factor ring's DESCRIPTOR and its "
+                         "REGISTER both move here, so the write path and the read path agree whether or not "
+                         "our register write survives.",
                          (unsigned long long)(len / (1024 * 1024)), at);
             }
          }

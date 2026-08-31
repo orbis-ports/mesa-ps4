@@ -583,6 +583,16 @@ void ac_orbis_watch_range(uint64_t va, uint64_t size);
  * stated as such, rather than one more address that "looks fine". */
 void ac_orbis_note_freed_range(uint64_t va, uint64_t size, const char *what);
 
+/* Where Sony's tessellation factor ring is, if ORBIS_TF_SONY_BASE backed that address with real memory this
+ * run - and zero if it did not, which every caller must read as "use our own ring". Fills in the mapping's
+ * size, which is what bounds the descriptor built over it.
+ *
+ * It exists because the read path and the write path disagree about where the factor ring is: the HS writes
+ * factors through a ring DESCRIPTOR and the VGT reads them through VGT_TF_MEMORY_BASE, and on this console
+ * that register still holds Sony's 0xff0000000. Placing the ring there makes the two agree without the
+ * register ever having to accept a write. */
+uint64_t ac_orbis_sony_tf_ring(uint64_t *size);
+
 /* Remembers what this driver programmed into VGT_TF_MEMORY_BASE, so the register ladder can write the same
  * value back when it tests whether that register is reachable at all. */
 void ac_orbis_note_tf_base(uint32_t base_shifted);

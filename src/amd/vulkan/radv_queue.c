@@ -39,6 +39,14 @@
 static uint8_t *orbis_tess_ring_map;
 static uint64_t orbis_tess_ring_size;
 static uint32_t orbis_tess_ring_sized_at; /* what ac_gpu_info computed, for the ratio */
+/* The same instrument pointed at SONY's factor ring, which ORBIS_TF_SONY_BASE moves the ring to and which
+ * the BO watermark above therefore stops covering. The poison starts where VGT_TF_RING_SIZE ends, so the
+ * ring itself keeps the zeros it was mapped with - a tess factor of zero discards its patch, where 0x5a5a5a5a
+ * read as a float is 1.5e16 and would clamp to the maximum level on every patch that never got written.
+ * Inside the ring the pattern would change what the hardware does; outside it, nothing should ever write. */
+static uint8_t *orbis_sony_tf_tail;      /* first byte past VGT_TF_RING_SIZE */
+static uint64_t orbis_sony_tf_tail_size; /* how much of the mapping is past it */
+static uint32_t orbis_sony_tf_ring_bytes;
 #endif
 
 
@@ -321,8 +329,46 @@ radv_fill_shader_rings(struct radv_device *device, uint32_t *desc, struct radeon
    desc += 8;
 
    if (tess_rings_bo) {
-      radv_set_ring_buffer(pdev, tess_rings_bo, pdev->info.tess_offchip_ring_size, pdev->info.tess_factor_ring_size,
-                           false, false, true, 0, 0, &desc[0]);
+#ifdef HAVE_ORBIS_PLATFORM
+      /* ⚠ THE OTHER HALF OF ORBIS_TF_SONY_BASE, AND WITHOUT IT THE KNOB WOULD ONLY SWAP THE DEFECT ROUND.
+       *
+       * desc[0] is what the HS writes tessellation factors THROUGH; VGT_TF_MEMORY_BASE is what the VGT reads
+       * them through. Moving only the register would leave the factors written to our ring and read from
+       * Sony's, which is this defect with the two addresses exchanged. Both move, or neither does.
+       *
+       * The size is the MAPPING's rather than info->tess_factor_ring_size: a descriptor bounds what the
+       * shader may write, and it must not be allowed to write past what was actually mapped there. */
+      uint64_t       sony_tf_size = 0;
+      const uint64_t sony_tf = ac_orbis_sony_tf_ring(&sony_tf_size);
+#else
+      const uint64_t sony_tf = 0;
+#endif
+
+      if (sony_tf != 0) {
+#ifdef HAVE_ORBIS_PLATFORM
+         const uint32_t size = (uint32_t)MIN2(sony_tf_size, (uint64_t)pdev->info.tess_factor_ring_size);
+         const struct ac_buffer_state ac_state = {
+            .va = sony_tf,
+            .size = size,
+            .format = PIPE_FORMAT_R32_FLOAT,
+            .swizzle = {PIPE_SWIZZLE_X, PIPE_SWIZZLE_Y, PIPE_SWIZZLE_Z, PIPE_SWIZZLE_W},
+            .gfx10_oob_select = V_008F0C_OOB_SELECT_RAW,
+            .has_desc_resource_level = pdev->info.compiler_info.has_desc_resource_level,
+         };
+         static unsigned said;
+
+         if (p_atomic_read(&said) < 1 && p_atomic_inc_return(&said) <= 1)
+            mesa_logi("radv/orbis: the tess FACTOR ring descriptor points at Sony's 0x%" PRIx64 ", %u B - the "
+                      "same address VGT_TF_MEMORY_BASE holds. The OFFCHIP ring stays ours: its address travels "
+                      "in desc[4] and has never been in doubt.",
+                      sony_tf, size);
+
+         ac_build_buffer_descriptor(pdev->info.gfx_level, &ac_state, &desc[0]);
+#endif
+      } else {
+         radv_set_ring_buffer(pdev, tess_rings_bo, pdev->info.tess_offchip_ring_size,
+                              pdev->info.tess_factor_ring_size, false, false, true, 0, 0, &desc[0]);
+      }
 
       radv_set_ring_buffer(pdev, tess_rings_bo, 0, pdev->info.tess_offchip_ring_size, false, false, true, 0, 0,
                            &desc[4]);
@@ -635,11 +681,21 @@ radv_emit_tess_factor_ring(struct radv_device *device, struct radv_cmd_stream *c
        * spent a commit today removing eighteen copies of the racy version. */
       static unsigned said;
       if (p_atomic_read(&said) < 1 && p_atomic_inc_return(&said) <= 1) {
+         /* ⚠ AND IT SAYS WHICH OF THE TWO ARRANGEMENTS THIS RUN IS, because ORBIS_TF_SONY_BASE leaves the
+          * offchip ring ours and moves only the factor ring, and a log that claimed "OURS" for both would
+          * make the two runs indistinguishable - which is exactly the mistake this line was added to
+          * prevent. */
+         uint64_t       sony_size = 0;
+         const uint64_t sony = ac_orbis_sony_tf_ring(&sony_size);
+
          mesa_logi("radv/orbis: tess rings are OURS - 0x%" PRIx64 "..0x%" PRIx64 " (offchip %u B, factor %u B, "
-                   "total %u B); VGT_TF_MEMORY_BASE <- 0x%" PRIx64 ", replacing Sony's 0x0ff00000",
+                   "total %u B); VGT_TF_MEMORY_BASE <- 0x%" PRIx64 "%s",
                    va, va + pdev->info.total_tess_ring_size, pdev->info.tess_offchip_ring_size,
                    pdev->info.tess_factor_ring_size, pdev->info.total_tess_ring_size,
-                   (va + pdev->info.tess_offchip_ring_size) >> 8);
+                   (sony != 0 ? sony : va + pdev->info.tess_offchip_ring_size) >> 8,
+                   sony != 0 ? " - SONY's factor ring, backed by ORBIS_TF_SONY_BASE. Only the OFFCHIP ring is "
+                               "ours in this run."
+                             : ", replacing Sony's 0x0ff00000");
 
          /* ⚠ THE NUMBERS THE OVERRUN IS READ AGAINST. A write fault inside this ring is only interpretable
           * against the buffer count and the stride: the fault at 0x212a50000 meant "offchip buffer 74" only
@@ -689,7 +745,68 @@ radv_emit_tess_factor_ring(struct radv_device *device, struct radv_cmd_stream *c
                    bias, orbis_tf_va);
       }
    }
-   ac_orbis_note_tf_base((uint32_t)(orbis_tf_va >> 8));
+   /* ⚠ NOTE WHAT THE REGISTER WILL ACTUALLY CARRY, NOT WHAT WE ALLOCATED. Under ORBIS_TF_SONY_BASE
+    * ac_emit_cp_tess_rings programs Sony's base instead of ours, and the register ladder writes this value
+    * back when it tests whether VGT_TF_MEMORY_BASE is reachable - so noting our address here would have the
+    * probe writing a base the driver never programmed, on the one register this hunt is stuck on. */
+   {
+      uint64_t       sony_size = 0;
+      const uint64_t sony = ac_orbis_sony_tf_ring(&sony_size);
+
+      ac_orbis_note_tf_base((uint32_t)((sony != 0 ? sony : orbis_tf_va) >> 8));
+   }
+#endif
+
+#ifdef HAVE_ORBIS_PLATFORM
+   /* ⚠ AIM THE REGISTER WRITE AT EVERY SHADER ENGINE BEFORE MAKING IT, BECAUSE NOTHING HAS EVER CHECKED
+    * WHERE SONY LEFT IT POINTING.
+    *
+    * GRBM_GFX_INDEX decides which shader engine, shader array and instance a register write reaches. Under
+    * amdgpu it is broadcast - the kernel put it there at boot and nothing narrows it except
+    * ac_write_harvested_raster_configs, which restores it. Here the last writer is Sony, and Sony's own
+    * sceGnmDrawInitDefaultHardwareState block - 256 dwords and 39 registers, dumped from this console -
+    * sets GRBM_GFX_INDEX = 0xe0000000. A driver only re-broadcasts at the start of every command buffer if
+    * it expects to find the index narrowed.
+    *
+    * AND THAT IS THE SHAPE OF THIS DEFECT, both halves of it at once. The VGT is PER SHADER ENGINE, so
+    * VGT_TF_MEMORY_BASE is an INDEXED register: with the index narrowed our base reaches one VGT and the
+    * other keeps what it had, which is Sony's 0xff0000000. The tessellation READS come from that register
+    * and fault at Sony's base no matter what we program; the WRITES travel in a ring DESCRIPTOR
+    * (radv_fill_shader_rings, desc[0]) rather than in a register, and those follow our base exactly - which
+    * is what moving the offchip count measured.
+    *
+    * It also predicts the one result the round-trip probe already has and could not explain: SCRATCH_REG0,
+    * which is NOT indexed, round trips through this same write path, while all three VGT_TF_* registers,
+    * which are, read back 0x00000000 - the answer of a register that never received the write.
+    *
+    * ⚠ A CANDIDATE, NOT A REPAIR, so it is off by default. Wrong, it costs three dwords a preamble;
+    * shipped on a hunch and wrong, it is this driver writing somebody else's select for no reason.
+    * ORBIS_GRBM_BROADCAST=1. */
+   {
+      static int broadcast = -1;
+      if (broadcast < 0) {
+         const char *const e = getenv("ORBIS_GRBM_BROADCAST");
+         broadcast = (e != NULL && *e != '\0' && *e != '0');
+      }
+
+      if (broadcast) {
+         const uint32_t all = S_030800_SE_BROADCAST_WRITES(1) | S_030800_SH_BROADCAST_WRITES(1) |
+                              S_030800_INSTANCE_BROADCAST_WRITES(1);
+
+         /* p_atomic, for the same reason the line above it is: this runs on whatever thread built the
+          * preamble. */
+         static unsigned said;
+         if (p_atomic_read(&said) < 1 && p_atomic_inc_return(&said) <= 1)
+            mesa_logi("radv/orbis: ORBIS_GRBM_BROADCAST - GRBM_GFX_INDEX <- 0x%08x immediately before the "
+                      "tessellation registers, so they reach every shader engine's VGT. If the read faults "
+                      "at 0x0ff00000 stop, the select was narrowed and our base only ever reached one.",
+                      all);
+
+         radeon_begin(cs);
+         radeon_set_uconfig_reg(R_030800_GRBM_GFX_INDEX, all);
+         radeon_end();
+      }
+   }
 #endif
 
    ac_emit_cp_tess_rings(cs->b, &pdev->info, va);
@@ -1272,6 +1389,33 @@ radv_update_preamble_cs(struct radv_queue_state *queue, struct radv_device *devi
                       ORBIS_TESS_RING_POISON);
          } else {
             mesa_logw("radv/orbis: tess ring would not map - no watermark this boot");
+         }
+
+         /* ⚠ AND THE FACTOR RING IS NOT IN THAT BO ANY MORE WHEN ORBIS_TF_SONY_BASE IS SET, so the
+          * watermark above now measures the offchip region and nothing else. The question it exists to
+          * answer - is the ring SHORTER than the hardware uses - is a question about the FACTOR ring:
+          * that is where the writes past the end were measured, and its size still comes from CU topology
+          * this port marks UNCITED.
+          *
+          * The mapping is 2 MiB and the ring is 261120 B, so there is room to be written past. Poisoning
+          * only the part beyond VGT_TF_RING_SIZE turns "does the hardware respect that size" into a byte
+          * count, and a disturbed byte there is not an interpretation - nothing else in this process can
+          * reach that address. */
+         {
+            uint64_t       mapped = 0;
+            const uint64_t sony = ac_orbis_sony_tf_ring(&mapped);
+
+            if (sony != 0 && mapped > pdev->info.tess_factor_ring_size) {
+               orbis_sony_tf_ring_bytes = pdev->info.tess_factor_ring_size;
+               orbis_sony_tf_tail = (uint8_t *)(uintptr_t)(sony + orbis_sony_tf_ring_bytes);
+               orbis_sony_tf_tail_size = mapped - orbis_sony_tf_ring_bytes;
+
+               memset(orbis_sony_tf_tail, ORBIS_TESS_RING_POISON, (size_t)orbis_sony_tf_tail_size);
+               mesa_logi("radv/orbis: Sony's factor ring - %u B is the programmed size and the %" PRIu64
+                         " B past it are filled with 0x%02x. Anything but that byte afterwards is the "
+                         "hardware writing outside VGT_TF_RING_SIZE.",
+                         orbis_sony_tf_ring_bytes, orbis_sony_tf_tail_size, ORBIS_TESS_RING_POISON);
+            }
          }
       }
 #endif
@@ -2347,25 +2491,57 @@ radv_queue_submit(struct vk_queue *vqueue, struct vk_queue_submit *submission)
 {
 #ifdef HAVE_ORBIS_PLATFORM
    /* The watermark, read from the CPU between submissions. It runs backwards from the end, so a ring the
-    * hardware barely touches costs a few pages of reading rather than the whole 9 MiB. */
+    * hardware barely touches costs a few pages of reading rather than the whole 9 MiB.
+    *
+    * ⚠ AND IT REPORTS UNCONDITIONALLY, BECAUSE THE FIRST VERSION COULD NOT SAY "NOTHING". It printed only
+    * when the mark rose above the previous one, and the previous one starts at zero - so a run where the
+    * hardware disturbed nothing looked exactly like a run where the instrument never reached its threshold,
+    * and exactly like a run where the pointer was never armed. Measured: run 9, 192 tessellation cases,
+    * both scans silent and all three readings still open afterwards.
+    *
+    * So the line goes out every nth submission whatever the numbers are, and it carries the submission
+    * count. Silence now means one thing only - fewer than n submissions - and a zero is an answer. */
    if (orbis_tess_ring_map != NULL) {
       static uint64_t nth;
-      const uint64_t  every = strtoull(getenv("ORBIS_TESS_RING_WATERMARK"), NULL, 10);
+      const char *const e = getenv("ORBIS_TESS_RING_WATERMARK");
+      const uint64_t  every = e != NULL ? strtoull(e, NULL, 10) : 0;
 
       if (every != 0 && (++nth % every) == 0) {
-         static uint64_t high_water;
-         uint64_t        i = orbis_tess_ring_size;
+         uint64_t i = orbis_tess_ring_size;
+         uint64_t j = 0;
 
          while (i > 0 && orbis_tess_ring_map[i - 1] == ORBIS_TESS_RING_POISON)
             --i;
 
-         if (i > high_water) {
-            high_water = i;
-            mesa_logi("radv/orbis: tess ring watermark %" PRIu64 " B of %" PRIu64 " allocated - ac_gpu_info "
-                      "sizes it at %u, so the hardware wants %.2fx that. A ring of %" PRIu64
-                      " B would have held this frame.",
-                      i, orbis_tess_ring_size, orbis_tess_ring_sized_at,
-                      (double)i / (double)orbis_tess_ring_sized_at, i);
+         /* The same read on Sony's ring, and it answers the sharper question: the scan above measures how
+          * much of an allocation was used, this one measures whether the hardware went PAST the size it was
+          * given. Backwards from the end, so an undisturbed tail costs one page. */
+         if (orbis_sony_tf_tail != NULL) {
+            j = orbis_sony_tf_tail_size;
+            while (j > 0 && orbis_sony_tf_tail[j - 1] == ORBIS_TESS_RING_POISON)
+               --j;
+         }
+
+         mesa_logi("radv/orbis: tess watermark @ submission %" PRIu64 " - BO %" PRIu64 " B of %" PRIu64
+                   " disturbed (ac_gpu_info sizes the rings at %u); Sony's ring %s",
+                   nth, i, orbis_tess_ring_size, orbis_tess_ring_sized_at,
+                   orbis_sony_tf_tail == NULL
+                      ? "NOT ARMED - ORBIS_TF_SONY_BASE is off, so nothing was moved there"
+                      : (j == 0 ? "UNTOUCHED past its programmed size" : "WRITTEN PAST ITS SIZE, see below"));
+
+         if (j > 0) {
+            static uint64_t sony_high_water;
+
+            if (j > sony_high_water) {
+               sony_high_water = j;
+               mesa_logw("radv/orbis: ⚠ THE HARDWARE WROTE %" PRIu64 " B PAST VGT_TF_RING_SIZE. The factor "
+                         "ring is programmed as %u B and byte %" PRIu64 " of Sony's mapping was disturbed, "
+                         "so a ring of %" PRIu64 " B is what this frame actually needed - %.2fx the "
+                         "programmed size. Nothing else in this process can reach that address.",
+                         j, orbis_sony_tf_ring_bytes, orbis_sony_tf_ring_bytes + j,
+                         (uint64_t)orbis_sony_tf_ring_bytes + j,
+                         (double)(orbis_sony_tf_ring_bytes + j) / (double)orbis_sony_tf_ring_bytes);
+            }
          }
       }
    }

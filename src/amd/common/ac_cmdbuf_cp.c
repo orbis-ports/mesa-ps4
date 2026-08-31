@@ -8,6 +8,9 @@
 #include "ac_cmdbuf.h"
 #include "ac_cmdbuf_cp.h"
 #include "ac_gpu_info.h"
+#ifdef HAVE_ORBIS_PLATFORM
+#include "ac_linux_drm.h"
+#endif
 #include "ac_shader_util.h"
 
 #include "amd_family.h"
@@ -367,6 +370,33 @@ ac_emit_cp_tess_rings(struct ac_cmdbuf *cs, const struct radeon_info *info,
       if (bias_s != NULL)
          va += strtoull(bias_s, NULL, 0);
    }
+
+#ifdef HAVE_ORBIS_PLATFORM
+   /* ⚠ AND THE FACTOR RING MAY NOT BE OURS AT ALL. ORBIS_TF_SONY_BASE backs Sony's 0xff0000000 with real
+    * memory and moves the ring there; the descriptor the HS writes through moves with it, in
+    * radv_fill_shader_rings. The register is still written, and written with the value it already holds -
+    * so this arm costs nothing if the write lands, and repairs the disagreement if it does not.
+    *
+    * Zero when the mapping was not asked for or did not land, which is the only state in which the ring
+    * stays ours. */
+   if (info->family == CHIP_LIVERPOOL || info->family == CHIP_GLADIUS) {
+      uint64_t       sony_size = 0;
+      const uint64_t sony = ac_orbis_sony_tf_ring(&sony_size);
+
+      if (sony != 0) {
+         static bool said;
+
+         if (!said) {
+            said = true;
+            mesa_logi("orbis: VGT_TF_MEMORY_BASE <- SONY's factor ring 0x%" PRIx64 " (%" PRIu64 " B mapped) "
+                      "and not ours at 0x%" PRIx64 ". The register now agrees with what it already held, so a "
+                      "write that never lands costs nothing.",
+                      sony, sony_size, va);
+         }
+         va = sony;
+      }
+   }
+#endif
    uint32_t tf_ring_size = info->tess_factor_ring_size / 4;
 
    if (info->gfx_level >= GFX11) {

@@ -1063,15 +1063,39 @@ radv_physical_device_get_supported_extensions(const struct radv_physical_device 
  * depends on another has to follow it, and two getenv() calls in two structs is not a switch,
  * it is two switches that happen to share a name.
  *
- * ⚠ AND THE DEFAULT IS NOW OFF, WHICH INVERTS WHAT THIS FILE USED TO ARGUE. The old comment
- * said "advertising a feature is the correct behaviour until a run says otherwise". Runs said
- * otherwise: this stage faults this silicon, and it has been switched off in every
- * configuration this port has ever shipped or measured. A default that every operator must
- * know to change is not a default, it is a trap with documentation - and the documentation
- * only reaches people who already know. Anyone who downloads this driver gets the
- * configuration it was tested in.
+ * ⚠ THE DEFAULT HAS BEEN OFF AND IS NOW ON AGAIN, AND BOTH INVERSIONS WERE RIGHT WHEN THEY WERE
+ * MADE. It was off because the stage faulted this silicon in every configuration this port had
+ * ever measured, and a default every operator must know to change is a trap with documentation.
+ * The stage no longer faults, so what that default now protects is nothing, at the price of two
+ * API versions.
  *
- * ORBIS_NO_TESS=0 advertises it again, for whoever eventually goes after the stage itself. */
+ * WHAT CHANGED, and it is one defect: tessellation factors were WRITTEN through a ring descriptor
+ * into a buffer of ours and READ through VGT_TF_MEMORY_BASE, which on this console still held
+ * Sony's 0xff0000000 - an address nothing had mapped. ORBIS_TF_SONY_BASE puts real memory there and
+ * moves the descriptor and the register both to it, so the two agree whether or not our register
+ * write survives. That knob is on by default too; see ac_orbis_drm.c.
+ *
+ * MEASURED ON HARDWARE, 2026-08-31, and each line is a separate run:
+ *
+ *   dEQP-VK.tessellation, 44-case smoke      44/44 Pass; the same 44 died on the first
+ *                                            tessellated draw without the repair
+ *   dEQP-VK.tessellation, 535-case core     418 Pass, 117 Fail - and EVERY failure carries a
+ *                                            geometry shader while NOTHING without one fails.
+ *                                            418/418 with GS=no. The remainder is this port's
+ *                                            open GS-ring defect, which tessellation walked into
+ *                                            rather than caused
+ *   OpenGothic, which tessellates            no fault, no artefacts, 45-60 fps - the same frame
+ *                                            rate as with the stage switched off. The "third of
+ *                                            the frame time" this port charged tessellation was
+ *                                            garbage factors asking for subdivision nobody wanted
+ *   both rings, under that title             all 256 offchip buffers used and none past the ring;
+ *                                            the factor ring never written past VGT_TF_RING_SIZE
+ *
+ * ⚠ AND THIS IS THE BIT THAT HOLDS TWO CEILINGS. glcaps measured GL_ARB_tessellation_shader as the
+ * single missing extension of GL 4.0 with every rung above it satisfied, so this flag is what
+ * takes the port from GL 3.3 to GL 4.6 and from ES 3.1 to ES 3.2 at once.
+ *
+ * ORBIS_NO_TESS=1 switches it back off, for a title that would rather have the old behaviour. */
 static bool
 orbis_tessellation_available(void)
 {
@@ -1079,12 +1103,13 @@ orbis_tessellation_available(void)
 
    if (cached < 0) {
       const char *const v = getenv("ORBIS_NO_TESS");
-      cached = v != NULL && v[0] == '0' && v[1] == '\0';
+      const bool        off = v != NULL && v[0] == '1' && v[1] == '\0';
 
-      if (cached)
-         mesa_logw("orbis: ORBIS_NO_TESS=0 - tessellation is ADVERTISED. No run has ever survived "
-                   "a pipeline that uses it on this silicon; this run is an experiment, not a "
-                   "configuration.");
+      cached = !off;
+
+      if (off)
+         mesa_logw("orbis: ORBIS_NO_TESS=1 - tessellation is NOT advertised, which also costs GL 4.6 "
+                   "and ES 3.2. The stage works on this silicon; this is a deliberate downgrade.");
    }
 
    return cached != 0;
@@ -1130,7 +1155,10 @@ radv_physical_device_get_features(const struct radv_physical_device *pdev, struc
        *   the fault remains     -> tessellation is exonerated, the address was a coincidence of one number,
        *                            and everything built on it today comes down
        *
-       * ⚠ OFF BY DEFAULT HERE - see orbis_tessellation_available(). ORBIS_NO_TESS=0 turns it back on. */
+       * ⚠ AND THE FAULT DID DISAPPEAR, on 2026-08-31, though not by disabling the stage: the reads were
+       * landing on Sony's factor ring because VGT_TF_MEMORY_BASE still held its address, and putting the
+       * ring there closed it. ON by default now - see orbis_tessellation_available(); ORBIS_NO_TESS=1
+       * turns it back off. */
 #ifdef HAVE_ORBIS_PLATFORM
       .tessellationShader = orbis_tessellation_available(),
 #else
