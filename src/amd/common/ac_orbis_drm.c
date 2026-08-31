@@ -149,6 +149,15 @@ orbis_kc_count(unsigned slot)
       orbis_kc_hit(slot);
 }
 
+/* ⚠ AND THE ALLOCATOR'S OWN TRAFFIC TO libkernel, which is the last uncounted route out of the pool.
+ * The ledger puts 9073 of 9280 bytes a frame above this driver, where the only libkernel calls made
+ * are the ones musl's allocator makes through orbis-compat's mmap when a request cannot be served from
+ * a carve-out. Per-frame fall-through counts belong on the same line as the bytes. Weak, as ever. */
+extern void orbis_mmap_counts(unsigned long long *maps, unsigned long long *maps_carved,
+                              unsigned long long *maps_fell, unsigned long long *unmaps,
+                              unsigned long long *unmaps_carved, unsigned long long *unmaps_fell)
+   __attribute__((weak));
+
 /* ------------------------------------------------------------------------- the frame ledger
  *
  * See the enum in util/orbis_api_probe.h for why this exists and why the segments are narrow.
@@ -302,15 +311,21 @@ orbis_ledger_mark(unsigned id)
       const uint64_t dwall_us = (orbis_lg_wall_ns - orbis_lg_wall_last) / 1000;
       orbis_lg_wall_last = orbis_lg_wall_ns;
 
+      unsigned long long mm = 0, mmc = 0, mmf = 0, mu = 0, muc = 0, muf = 0;
+      if (&orbis_mmap_counts != NULL)
+         orbis_mmap_counts(&mm, &mmc, &mmf, &mu, &muc, &muf);
+
       mesa_logi("orbis-drm: frame ledger over %llu SAMPLED frame(s) of %llu seen: %lld bytes a frame "
                 "SINCE THE LAST REPORT, over %llu us of sampled wall time = %lld bytes/ms "
                 "(%lld bytes total, %lld a frame averaged over the whole run). "
-                "Per segment, since the last report: %s",
+                "musl mmap traffic since boot: %llu map(s), %llu FELL THROUGH to libkernel; "
+                "%llu unmap(s), %llu FELL THROUGH. Per segment, since the last report: %s",
                 (unsigned long long)orbis_lg_frames, (unsigned long long)orbis_lg_frames_seen,
                 (long long)(dframes ? dtotal / dframes : 0),
                 (unsigned long long)dwall_us,
                 (long long)(dwall_us ? (dtotal * 1000) / (int64_t)dwall_us : 0),
                 (long long)total, (long long)(total / (int64_t)orbis_lg_frames),
+                mm, mmf, mu, muf,
                 n ? line : "every segment zero");
    }
 #else
