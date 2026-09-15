@@ -22,6 +22,7 @@
  */
 
 #include "zink_screen.h"
+#include "git_sha1.h"
 
 #include "zink_kopper.h"
 #include "zink_compiler.h"
@@ -314,7 +315,14 @@ disk_cache_init(struct zink_screen *screen)
    struct mesa_blake3 ctx;
    _mesa_blake3_init(&ctx);
 
-#if HAVE_BUILD_ID
+#if defined(__PS4__)
+   /* ⚠ NO BUILD-ID LOOKUP ON THE CONSOLE. build_id_find_nhdr_for_addr walks program headers through
+    * dl_iterate_phdr, and on the PS4 that walk dies inside libkernel - RADV hit it first and uses
+    * -Dradv-build-id instead (build-support/orbis/build.sh). With the shader cache enabled this call
+    * hung the first frame of every GL context. The Mesa version and commit stand in for the build;
+    * uncommitted driver changes do NOT change the key, so clear MESA_SHADER_CACHE_DIR after one. */
+   _mesa_blake3_update(&ctx, PACKAGE_VERSION MESA_GIT_SHA1, strlen(PACKAGE_VERSION MESA_GIT_SHA1));
+#elif HAVE_BUILD_ID
    /* Hash in the zink driver build. */
    const struct build_id_note *note =
        build_id_find_nhdr_for_addr(disk_cache_init);

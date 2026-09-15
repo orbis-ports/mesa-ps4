@@ -1107,6 +1107,25 @@ disk_cache_mmap_cache_index(void *mem_ctx, struct disk_cache *cache)
    int fd = -1;
    bool mapped = false;
 
+#if defined(__PS4__)
+   /* ⚠ NO SHARED FILE MAPPING ON THE CONSOLE. The index file never got its size (posix_fallocate/ftruncate fail
+    * there) and a writable MAP_SHARED of a file is not something this platform is known to honour, so this
+    * returned false and disk_cache_type_create silently left path_init_failed set: every put was dropped, for
+    * every cache type. The index only has to be shared between processes, and there is one. Keep it in anonymous
+    * memory; use MESA_DISK_CACHE_DATABASE=1, whose files are plain reads and writes and which enforces its own
+    * size limit. */
+   {
+      const size_t size = sizeof(*cache->size) + CACHE_INDEX_MAX_KEYS * CACHE_KEY_SIZE;
+      cache->index_mmap = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+      if (cache->index_mmap == MAP_FAILED)
+         return false;
+      cache->index_mmap_size = size;
+      cache->size = (p_atomic_uint64_t *) cache->index_mmap;
+      cache->stored_keys = cache->index_mmap + sizeof(uint64_t);
+      return true;
+   }
+#endif
+
    char *path = ralloc_asprintf(mem_ctx, "%s/index", cache->path);
    if (path == NULL)
       goto path_fail;

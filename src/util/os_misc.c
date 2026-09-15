@@ -229,9 +229,11 @@ os_get_option_internal(const char *name, bool use_secure_getenv)
 {
    const char *opt;
    if (use_secure_getenv) {
-#ifdef HAVE_SECURE_GETENV
+#if defined(HAVE_SECURE_GETENV) && !defined(__PS4__)
       opt = secure_getenv(name);
 #else
+      /* On the PS4 musl's secure_getenv answers NULL for everything (the process looks AT_SECURE to it), which
+       * silently turned off the shader disk cache; there is no setuid boundary on the console to protect. */
       opt = getenv(name);
 #endif
    } else {
