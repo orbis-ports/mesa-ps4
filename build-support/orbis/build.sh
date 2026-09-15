@@ -225,7 +225,10 @@ cd "${TREE}"
 # the options do change between runs now that the build-id is derived from the inputs.
 # The wrap is fetched here, explicitly: every setup below runs with -Dwrap_mode=nodownload, and the extracted
 # tree is gitignored, so a fresh clone (CI) has only the .wrap file. The download is hash-checked against it.
-[[ -d subprojects/zlib-1.3.1 ]] || nix develop nixpkgs#mesa --command meson subprojects download zlib
+# ⚠ -u MESON_PACKAGE_CACHE_DIR: the devShell points it at a read-only /nix/store path (Mesa's Rust crates),
+# and the download died there with "PermissionError: [Errno 13]" - first CI run of this, 2026-09-15.
+[[ -d subprojects/zlib-1.3.1 ]] || \
+  nix develop nixpkgs#mesa --command env -u MESON_PACKAGE_CACHE_DIR meson subprojects download zlib
 ORBIS_SETUP=()
 [[ -d build-orbis ]] && ORBIS_SETUP=(--reconfigure)
 nix develop nixpkgs#mesa --command env PKG_CONFIG_PATH= PKG_CONFIG_LIBDIR="${CROSS}/lib/pkgconfig" \
