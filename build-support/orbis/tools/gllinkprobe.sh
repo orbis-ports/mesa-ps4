@@ -66,6 +66,7 @@ clang --target=x86_64-pc-freebsd12-elf --sysroot="${SDK}" \
       "${BUILD}/src/mesa/glapi/es1api/libGLESv1_CM.a" \
       "${GALLIUM}" \
       -Wl,--whole-archive "${BUILD}/src/amd/vulkan/libvulkan_radeon.a" -Wl,--no-whole-archive \
+      "${BUILD}"/subprojects/zlib-*/libz.a \
       -Wl,--end-group \
       -L"${ORBIS_COMPAT}/build" -lorbis-compat \
       -L"${SDK}/lib" -lc -lkernel -lc++ -lSceGnmDriver -lSceVideoOut "${SDK}/lib/crt1.o" \

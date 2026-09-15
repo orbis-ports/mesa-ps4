@@ -184,15 +184,17 @@ jobs:
           set -euo pipefail
           B=build-orbis
           gallium="$(echo "$B"/src/gallium/targets/dri/libgallium-*.a)"
+          zlib="$(echo "$B"/subprojects/zlib-*/libz.a)"
           for a in "$B/src/amd/vulkan/libvulkan_radeon.a" \
                    "$B/src/egl/libEGL.a" \
                    "$B/src/mesa/glapi/es2api/libGLESv2.a" \
                    "$B/src/mesa/glapi/es1api/libGLESv1_CM.a" \
-                   "$gallium"; do
+                   "$gallium" "$zlib"; do
             [ -f "$a" ] || { echo "!! ninja produced no $a - read the build log above" >&2; exit 1; }
             printf '   %-58s %s bytes\n' "$a" "$(stat -c%s "$a")"
           done
           echo "gallium=$gallium" >> "$GITHUB_OUTPUT"
+          echo "zlib=$zlib" >> "$GITHUB_OUTPUT"
 
       # ---------------------------------------------------------------------------------
       # THE GATE. gllinkprobe.sh links the way a title links - the corrected linker script,
@@ -224,6 +226,7 @@ jobs:
         id: manifest
         env:
           GALLIUM: ${{ steps.archives.outputs.gallium }}
+          ZLIB: ${{ steps.archives.outputs.zlib }}
         run: |
           set -euo pipefail
           B=build-orbis
@@ -267,12 +270,14 @@ jobs:
                    "$stage/build-orbis/src/egl" \
                    "$stage/build-orbis/src/mesa/glapi/es2api" \
                    "$stage/build-orbis/src/mesa/glapi/es1api" \
-                   "$stage/build-orbis/src/gallium/targets/dri"
+                   "$stage/build-orbis/src/gallium/targets/dri" \
+                   "$stage/$(dirname "$ZLIB")"
           cp "$B/src/amd/vulkan/libvulkan_radeon.a"      "$stage/build-orbis/src/amd/vulkan/"
           cp "$B/src/egl/libEGL.a"                       "$stage/build-orbis/src/egl/"
           cp "$B/src/mesa/glapi/es2api/libGLESv2.a"      "$stage/build-orbis/src/mesa/glapi/es2api/"
           cp "$B/src/mesa/glapi/es1api/libGLESv1_CM.a"   "$stage/build-orbis/src/mesa/glapi/es1api/"
           cp "$GALLIUM"                                  "$stage/build-orbis/src/gallium/targets/dri/"
+          cp "$ZLIB"                                     "$stage/$(dirname "$ZLIB")/"
           cp -a include "$stage/include"
 
           {

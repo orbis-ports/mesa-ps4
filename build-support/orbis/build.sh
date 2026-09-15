@@ -178,13 +178,12 @@ COMMON_OPTS=(
 # the DRM path OFF; the host build wants NO platform but libdrm ON, because the whole point of the host
 # build is to run RADV against the amdgpu drm-shim. Passing 'orbis' to the host build makes dep_libdrm a
 # null_dep, so the shim compiles without libdrm's own -I and dies on xf86drm.h's #include <drm.h>.
-# -Dzlib=disabled because zlib is a HOST library here. Mesa's zlib is a 'feature' option defaulting to
-# enabled, and with allow_fallback it reaches for a wrap when the system copy is gone - so this has to be
-# said explicitly rather than left to detection failing gracefully. Consequence: HAVE_ZLIB and
-# HAVE_COMPRESSION are unset, which costs the shader disk cache's compression. There is no disk cache on
-# this console.
-# ...and -Dshader-cache=disabled follows from it: Mesa errors out with "Shader Cache requires compression"
-# when both zlib and zstd are off.
+# zlib comes from Mesa's own wrap (subprojects/zlib.wrap), never from the system: -Dforce_fallback_for=zlib,
+# because zlib is a HOST library here and meson finding it is how 21 undefined symbols once reached the link
+# probe. The shader disk cache needs it ("Shader Cache requires compression" with zlib and zstd both off),
+# and the cache is what takes zink's pipeline compiles off a title's second run - it works on the console
+# since the build-id, secure_getenv and index-mmap fixes. The archive is build-orbis/subprojects/zlib-*/libz.a
+# and a title links it after the drivers.
 # -Dradv-build-id, and THIS ONE WAS FOUND ON HARDWARE. RADV derives its pipeline-cache UUID from the
 # driver's ELF build-id, and when there is none it walks program headers looking for a NT_GNU_BUILD_ID
 # note: disk_cache_get_function_identifier -> build_id_find_nhdr_for_addr. Our eboot has no such note
@@ -195,7 +194,7 @@ COMMON_OPTS=(
 # same function, so no patch is involved. The value is derived from the build's real inputs - the Mesa
 # commit and the working tree - so the cache UUID changes when the driver does.
 ORBIS_BUILD_ID="$(printf '%s-%s' "${MESA_HEAD}" "${SERIES_SHA}" | sha256sum | cut -c1-40)"
-ORBIS_OPTS=(-Dplatforms=orbis -Dzlib=disabled -Dshader-cache=disabled
+ORBIS_OPTS=(-Dplatforms=orbis -Dzlib=enabled -Dshader-cache=enabled -Dforce_fallback_for=zlib
             "-Dradv-build-id=${ORBIS_BUILD_ID}")
 HOST_OPTS=(-Dplatforms=)
 
@@ -224,6 +223,9 @@ cd "${TREE}"
 # ABI - in a build that links libc++.
 # --reconfigure when the directory already exists: meson refuses a plain setup on a configured tree, and
 # the options do change between runs now that the build-id is derived from the inputs.
+# The wrap is fetched here, explicitly: every setup below runs with -Dwrap_mode=nodownload, and the extracted
+# tree is gitignored, so a fresh clone (CI) has only the .wrap file. The download is hash-checked against it.
+[[ -d subprojects/zlib-1.3.1 ]] || nix develop nixpkgs#mesa --command meson subprojects download zlib
 ORBIS_SETUP=()
 [[ -d build-orbis ]] && ORBIS_SETUP=(--reconfigure)
 nix develop nixpkgs#mesa --command env PKG_CONFIG_PATH= PKG_CONFIG_LIBDIR="${CROSS}/lib/pkgconfig" \

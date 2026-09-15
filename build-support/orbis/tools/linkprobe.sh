@@ -51,7 +51,7 @@ clang --target=x86_64-pc-freebsd12-elf --sysroot="${SDK}" \
       -Wl,--script="${ORBIS_COMPAT}/cmake/orbis-tls.ld" -Wl,--eh-frame-hdr -Wl,--no-rosegment \
       -Wl,--error-limit=0 \
       "${BUILD}/linkprobe.o" \
-      -Wl,--whole-archive "${A}" -Wl,--no-whole-archive \
+      -Wl,--whole-archive "${A}" -Wl,--no-whole-archive "${BUILD}"/subprojects/zlib-*/libz.a \
       -L"${ORBIS_COMPAT}/build" -lorbis-compat \
       -L"${SDK}/lib" -lc -lkernel -lc++ -lSceGnmDriver -lSceVideoOut "${SDK}/lib/crt1.o" \
       -o "${OUT}"
