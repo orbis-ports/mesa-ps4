@@ -31,7 +31,9 @@ present a frame: WSI over `sceVideoOut` is the one batch still outstanding.
 | 04 | `winsys/amdgpu/` off the one DRM call it makes | landed |
 | 05 | `ac_orbis_drm.c` — the `ac_drm_*` arm | landed |
 | 06 | `radv_orbis_winsys.c` and the enumeration hook | landed |
-| 07 | `wsi_orbis.c` over `sceVideoOut` | pending |
+| 07 | `wsi_orbis.c` over `sceVideoOut` | **landed** |
+
+⚠ **Batch 07 said `pending` until 2026-09-17 and had not been true for a long time.** `wsi_orbis.c` is 950 lines, is built into the driver (`src/vulkan/wsi/meson.build:43`), and calls the real `sceVideoOutRegisterBuffers` and `sceVideoOutSubmitFlip` under `#if defined(__PS4__)` - the empty ones a reader meets first are the `#else` arm, for the host build, and that arm says so: *"A HOST FLIP SUCCEEDS AND SHOWS NOTHING"*. The standing proof is that OpenGothic presents frames and RetroArch presents frames from dozens of cores. A stale line in a status table is worth naming because it is read as a fact about the code: it cost one session an argument that a Vulkan example could not draw to the screen.
 
 Carried across but **not** yet re-applied, each needing to be confirmed against a log rather than taken
 on faith - see `~/src-ps4/ps4-mesa-docs/docs/` for what the earlier effort measured:

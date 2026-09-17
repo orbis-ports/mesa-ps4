@@ -19,6 +19,11 @@
 # the archive on the line below. gen.py has nothing to emit for a GL title.
 set -euo pipefail
 
+# Portable file size. macOS stat has no -c: `stat: illegal option -- c`, and the message goes to
+# stderr while the substitution yields the empty string, so the line still prints and reads as a
+# successful step with a blank number. GNU first, BSD second; both are exact.
+orbis_size() { stat -c%s "$1" 2>/dev/null || stat -f%z "$1"; }
+
 BUILD="${1:?usage: glrun.sh <gl-build-dir> <sdk> [out-dir] [source.c]}"
 SDK="${2:?usage: glrun.sh <gl-build-dir> <sdk> [out-dir] [source.c]}"
 # ⚠ THE SOURCE IS AN ARGUMENT because the link line is the hard-won part, not the program. glrun.c
@@ -157,7 +162,7 @@ OO_PS4_TOOLCHAIN="${SDK}" "${SDK}/bin/linux/create-fself" \
 
 [[ -f "${OUT_DIR}/eboot.bin" ]] || die "create-fself produced no eboot.bin"
 
-echo "${SRC%.c}: eboot.bin is $(stat -c%s "${OUT_DIR}/eboot.bin") bytes  (stamp ${STAMP})"
-echo "       (linker output was $(stat -c%s "${OUT_DIR}/app.elf") bytes of plain ELF)"
+echo "${SRC%.c}: eboot.bin is $(orbis_size "${OUT_DIR}/eboot.bin") bytes  (stamp ${STAMP})"
+echo "       (linker output was $(orbis_size "${OUT_DIR}/app.elf") bytes of plain ELF)"
 echo "       netlog -> ${NETLOG_HOST}:${NETLOG_PORT}"
 echo "       next: scripts/ps4/make-pkg.sh --eboot ${OUT_DIR}/eboot.bin --out-dir ${OUT_DIR}/pkg ..."

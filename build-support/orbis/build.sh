@@ -18,6 +18,11 @@
 # missing.
 set -euo pipefail
 
+# Portable file size. macOS stat has no -c: `stat: illegal option -- c`, and the message goes to
+# stderr while the substitution yields the empty string, so the line still prints and reads as a
+# successful step with a blank number. GNU first, BSD second; both are exact.
+orbis_size() { stat -c%s "$1" 2>/dev/null || stat -f%z "$1"; }
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TREE="$(git -C "${ROOT}" rev-parse --show-toplevel)"
 SDK="${OO_PS4_TOOLCHAIN:-${HOME}/.local/opt/openorbis}"
@@ -77,8 +82,21 @@ rm -rf "${CROSS}"
 mkdir -p "${CROSS}/lib/pkgconfig"
 
 # ---------------------------------------------------------------- the cross file
+#
+# ⚠ THE FOUR TOOLS ARE SUBSTITUTED, AND THE DEFAULTS ARE WHAT THIS SCRIPT ALWAYS PASSED. Why they
+# are overridable at all is argued in orbis-compat/cmake/orbis.ini.in's [binaries] comment: meson
+# runs inside `nix develop nixpkgs#mesa`, and on aarch64-darwin that devShell's cc-wrapper puts
+# -mmacos-version-min=15.0 on a freebsd12 cross compile. meson probes with
+# -Werror=unused-command-line-argument, so every probe fails and config.h comes out empty.
+#
+#   ORBIS_CC=/opt/homebrew/opt/llvm/bin/clang ORBIS_CXX=/opt/homebrew/opt/llvm/bin/clang++ \
+#     ps4/build.sh
+#
+# On Linux the wrapper does not do this and the defaults are right, which is why CI never saw it.
 echo "== meson cross file"
 sed -e "s|@OO_PS4_TOOLCHAIN@|${SDK}|g" -e "s|@ORBIS_CROSS@|${CROSS}|g" -e "s|@ORBIS_COMPAT@|${ORBIS_COMPAT}|g" \
+    -e "s|@ORBIS_CC@|${ORBIS_CC:-clang}|g"  -e "s|@ORBIS_CXX@|${ORBIS_CXX:-clang++}|g" \
+    -e "s|@ORBIS_AR@|${ORBIS_AR:-ar}|g"     -e "s|@ORBIS_STRIP@|${ORBIS_STRIP:-strip}|g" \
     "${ORBIS_COMPAT}/cmake/orbis.ini.in" > "${CROSS}/orbis.ini"
 
 # ⚠ THE LIBRARY HALF OF orbis-compat IS NOW IN THE TEMPLATE, AND THIS BLOCK ONLY CHECKS THAT IT IS.
@@ -605,5 +623,5 @@ INI
     -Dwrap_mode=nodownload -Dbuildtype=release
   nix develop nixpkgs#mesa --command ninja -C build-mingw \
     || die "the Windows arm does not build - this is the gap that let a never-compiled _WIN32 fix ship twice"
-  echo "   vulkan_radeon.dll: $(stat -c%s build-mingw/src/amd/vulkan/vulkan_radeon.dll) bytes"
+  echo "   vulkan_radeon.dll: $(orbis_size build-mingw/src/amd/vulkan/vulkan_radeon.dll) bytes"
 fi

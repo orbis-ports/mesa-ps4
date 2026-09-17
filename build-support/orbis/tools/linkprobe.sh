@@ -11,6 +11,11 @@
 # configure that reported success.
 set -euo pipefail
 
+# Portable file size. macOS stat has no -c: `stat: illegal option -- c`, and the message goes to
+# stderr while the substitution yields the empty string, so the line still prints and reads as a
+# successful step with a blank number. GNU first, BSD second; both are exact.
+orbis_size() { stat -c%s "$1" 2>/dev/null || stat -f%z "$1"; }
+
 BUILD="${1:?usage: linkprobe.sh <build-dir> <sdk> [out]}"
 SDK="${2:?usage: linkprobe.sh <build-dir> <sdk> [out]}"
 OUT="${3:-${BUILD}/linkprobe.elf}"
@@ -56,4 +61,4 @@ clang --target=x86_64-pc-freebsd12-elf --sysroot="${SDK}" \
       -L"${SDK}/lib" -lc -lkernel -lc++ -lSceGnmDriver -lSceVideoOut "${SDK}/lib/crt1.o" \
       -o "${OUT}"
 
-echo "linkprobe: linked $(stat -c%s "${OUT}") bytes -> ${OUT}"
+echo "linkprobe: linked $(orbis_size "${OUT}") bytes -> ${OUT}"
