@@ -105,6 +105,7 @@ mkdir -p "${CROSS}/lib/pkgconfig"
 # On Linux the wrapper does not do this and the defaults are right, which is why CI never saw it.
 echo "== meson cross file"
 sed -e "s|@OO_PS4_TOOLCHAIN@|${SDK}|g" -e "s|@ORBIS_CROSS@|${CROSS}|g" -e "s|@ORBIS_COMPAT@|${ORBIS_COMPAT}|g" \
+    -e "s|@ORBIS_KIT@|${ORBIS_KIT}|g" \
     -e "s|@ORBIS_CC@|${ORBIS_CC:-clang}|g"  -e "s|@ORBIS_CXX@|${ORBIS_CXX:-clang++}|g" \
     -e "s|@ORBIS_AR@|${ORBIS_AR:-ar}|g"     -e "s|@ORBIS_STRIP@|${ORBIS_STRIP:-strip}|g" \
     "${ORBIS_KIT}/cmake/orbis.ini.in" > "${CROSS}/orbis.ini"
