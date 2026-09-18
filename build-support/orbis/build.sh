@@ -63,6 +63,16 @@ ORBIS_COMPAT="${ORBIS_COMPAT_DIR:-${HOME}/src-ps4/orbis-compat}"
 [[ -f "${ORBIS_COMPAT}/include/bits/alltypes.h" ]] || die \
   "orbis-compat not found at ${ORBIS_COMPAT} - set ORBIS_COMPAT_DIR"
 
+# ⚠ THE MESON CROSS FILE TEMPLATE IS THE KIT'S SINCE 2026-09-18. cmake/ - which holds orbis.ini.in
+# as well as the CMake toolchain file - moved to orbis-ports/orbis-porting-kit; the overlay keeps
+# include/ and the archive, which is what the two checks above and below actually want. The
+# fallback is the overlay, which carried the template until then, so a pinned checkout older than
+# the move still configures.
+ORBIS_KIT="${ORBIS_KIT_DIR:-}"
+[[ -n "${ORBIS_KIT}" && -f "${ORBIS_KIT}/cmake/orbis.ini.in" ]] || ORBIS_KIT="${ORBIS_COMPAT}"
+[[ -f "${ORBIS_KIT}/cmake/orbis.ini.in" ]] || die \
+  "no cmake/orbis.ini.in in ${ORBIS_KIT} - clone https://github.com/orbis-ports/orbis-porting-kit and set ORBIS_KIT_DIR"
+
 # ---------------------------------------------------------------- the cross prefix
 #
 # The seven headers that used to be copied from ${ROOT}/shims are GONE FROM THIS TREE. They live in
@@ -97,7 +107,7 @@ echo "== meson cross file"
 sed -e "s|@OO_PS4_TOOLCHAIN@|${SDK}|g" -e "s|@ORBIS_CROSS@|${CROSS}|g" -e "s|@ORBIS_COMPAT@|${ORBIS_COMPAT}|g" \
     -e "s|@ORBIS_CC@|${ORBIS_CC:-clang}|g"  -e "s|@ORBIS_CXX@|${ORBIS_CXX:-clang++}|g" \
     -e "s|@ORBIS_AR@|${ORBIS_AR:-ar}|g"     -e "s|@ORBIS_STRIP@|${ORBIS_STRIP:-strip}|g" \
-    "${ORBIS_COMPAT}/cmake/orbis.ini.in" > "${CROSS}/orbis.ini"
+    "${ORBIS_KIT}/cmake/orbis.ini.in" > "${CROSS}/orbis.ini"
 
 # ⚠ THE LIBRARY HALF OF orbis-compat IS NOW IN THE TEMPLATE, AND THIS BLOCK ONLY CHECKS THAT IT IS.
 #
