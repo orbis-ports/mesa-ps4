@@ -36,7 +36,7 @@ on:
       orbis-compat-ref:
         description: orbis-compat commit to build against (a sha, never a branch).
         required: false
-        default: cc75949e8f7b4811fa4f4a5bf1c106178a906f07
+        default: 6af90a8600464af4e29b384a9533e8284c14c625
       publish:
         description: Create a Release as well as an artifact.
         required: false
@@ -54,7 +54,7 @@ env:
   OPENORBIS_SDK_TAG: v0.5.4
   OPENORBIS_SDK_REPO: OpenOrbis/OpenOrbis-PS4-Toolchain
   OPENORBIS_SDK_ASSET: toolchain-llvm-18.tar.gz
-  ORBIS_COMPAT_REF: ${{ github.event.inputs.orbis-compat-ref || 'cc75949e8f7b4811fa4f4a5bf1c106178a906f07' }}
+  ORBIS_COMPAT_REF: ${{ github.event.inputs.orbis-compat-ref || '6af90a8600464af4e29b384a9533e8284c14c625' }}
 
 jobs:
   bundle:
