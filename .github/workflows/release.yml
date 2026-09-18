@@ -55,6 +55,7 @@ env:
   OPENORBIS_SDK_REPO: OpenOrbis/OpenOrbis-PS4-Toolchain
   OPENORBIS_SDK_ASSET: toolchain-llvm-18.tar.gz
   ORBIS_COMPAT_REF: ${{ github.event.inputs.orbis-compat-ref || '314078413251644820955bd09335836ad19f88bd' }}
+  ORBIS_KIT_REF: ${{ github.event.inputs.orbis-kit-ref || 'v1' }}
 
 jobs:
   bundle:
@@ -156,6 +157,17 @@ jobs:
           ref: ${{ env.ORBIS_COMPAT_REF }}
           path: .orbis/orbis-compat
 
+      # ⚠ THE KIT IS A SECOND CHECKOUT SINCE 2026-09-18. scripts/ps4/orbis-env.sh, the toolchain
+      # file and the Vulkan loader shim moved to orbis-ports/orbis-porting-kit; the overlay is
+      # include/ and the archive. ps4/build.sh sources orbis-env.sh, so without this the first run
+      # after the move failed with "No such file or directory" on that path.
+      - name: Checkout orbis-porting-kit
+        uses: actions/checkout@v4
+        with:
+          repository: orbis-ports/orbis-porting-kit
+          ref: ${{ env.ORBIS_KIT_REF }}
+          path: .orbis/orbis-porting-kit
+
       - name: Restore liborbis-compat.a
         id: compat-cache
         uses: actions/cache@v4
@@ -174,6 +186,9 @@ jobs:
           compat="${GITHUB_WORKSPACE}/.orbis/orbis-compat"
           [ -f "$compat/build/liborbis-compat.a" ] || { echo "!! no liborbis-compat.a" >&2; exit 1; }
           echo "ORBIS_COMPAT_DIR=$compat" >> "$GITHUB_ENV"
+          kit="${GITHUB_WORKSPACE}/.orbis/orbis-porting-kit"
+          [ -f "$kit/scripts/ps4/orbis-env.sh" ] || { echo "!! no orbis-env.sh in the kit at $kit" >&2; exit 1; }
+          echo "ORBIS_KIT_DIR=$kit" >> "$GITHUB_ENV"
 
       # ---------------------------------------------------------------------------------
       # The build. ps4/build.sh is the doorway every repository in the organisation has; it
