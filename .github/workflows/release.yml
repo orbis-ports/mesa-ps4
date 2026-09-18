@@ -16,6 +16,14 @@
 # the layer that changes most often inside an artifact meant to change least. What ships
 # instead is the list of names Mesa imports from it, so a consumer can assert the interface
 # without pinning the commit.
+#
+# ⚠ AND SINCE 2026-09-18, THE FINGERPRINT OF THE include/ TREE THIS BUILD COMPILED AGAINST -
+# orbis-compat-include-sha256 in the manifest. That is not a retreat into pinning: it is 64
+# bytes, it freezes nothing, and a consumer is free to ignore it. It exists because the import
+# list checks presence and not meaning - its own note below says constants inlined at Mesa's
+# compile time leave no symbol to check at all - so a struct that changed size passes that
+# assertion and breaks at run time. orbis-compat's SDK bundle pairs on this number offline,
+# with no clone and no history. See the Manifest step for the algorithm and where it is defined.
 
 name: orbis-mesa release
 
@@ -259,6 +267,47 @@ jobs:
           COMPAT_SHA="$(git -C "$ORBIS_COMPAT_DIR" rev-parse HEAD)"
           NAME="orbis-mesa-${SHORT}"
 
+          # ---------------------------------------------------------------------------
+          # THE include/ FINGERPRINT: the one number that says what this Mesa ACTUALLY
+          # COMPILED AGAINST, rather than which commit the workflow asked for.
+          #
+          # ⚠ WHY A HASH WHEN orbis-compat-commit IS ALREADY ABOVE. Downstream, orbis-compat's
+          # scripts/release/make-sdk-bundle.sh freezes a Mesa bundle and an orbis-compat
+          # checkout into one redistributable SDK and refuses the pair unless they are
+          # coherent. That gate used to test commit-id EQUALITY, which made a README typo
+          # invalidate a three-hour Mesa build: measured 2026-09-17, a bundle was refused over
+          # cc75949..4f61d6f, three commits whose `git diff -- include/` is empty. It now tests
+          # include/, because include/ is the whole of what Mesa compiles from that repository.
+          # But the matching verify-sdk-bundle.sh runs OFFLINE on an unpacked tarball with no
+          # git history, so it cannot re-derive any diff - without this field it can only read
+          # back the verdict the cut wrote, which is one number read twice. With it, two
+          # machines that never met produce the number independently and the pairing is
+          # evidence instead of testimony.
+          #
+          # ⚠ THE ALGORITHM IS DEFINED IN ONE PLACE AND THIS IS A COPY OF IT: orbis-compat
+          # scripts/release/make-sdk-bundle.sh, _include_sha256. Its comment states why the
+          # three copies (there, in verify-sdk-bundle.sh, here) must stay identical character
+          # for character - they are compared for EQUALITY, so one byte "tidied" here reads
+          # over there as a mismatched pair and refuses a bundle that is perfectly fine. Short
+          # form: sha256 over the concatenation of "<sha256 of file>  <path>\n" for every
+          # regular file under include/, paths relative to the checkout, in LC_ALL=C order.
+          #
+          # ⚠ HASHED FROM $ORBIS_COMPAT_DIR, NOT FROM $COMPAT_SHA's TREE. That directory is what
+          # meson put on the -isystem line and what the archives were compiled against. Hashing
+          # `git show $COMPAT_SHA:include` would record what the commit says and miss precisely
+          # the case this field exists for: a checkout that is not its commit.
+          _sha256(){ if command -v sha256sum >/dev/null 2>&1; then sha256sum "$@"; else shasum -a 256 "$@"; fi; }
+          _include_sha256(){
+            ( cd "$1" && find include -type f -print0 | LC_ALL=C sort -z \
+                | while IFS= read -r -d '' f; do _sha256 "$f"; done | _sha256 | cut -d' ' -f1 )
+          }
+          COMPAT_INCLUDE_SHA="$(_include_sha256 "$ORBIS_COMPAT_DIR")"
+          # A short answer means find read the wrong directory - orbis-compat has 27 files under
+          # include/ and a Mesa that compiled at all saw them. Better here than as a pairing
+          # mismatch in another repository three steps later.
+          [ ${#COMPAT_INCLUDE_SHA} -eq 64 ] || { echo "!! include/ fingerprint '$COMPAT_INCLUDE_SHA' is not 64 hex - measured the wrong tree" >&2; exit 1; }
+          printf '   orbis-compat include/  %s\n' "$COMPAT_INCLUDE_SHA"
+
           stage="$RUNNER_TEMP/$NAME"
           rm -rf "$stage"
           # ⚠ THE LAYOUT IS THE ONE Makefile.orbis READS, not one of the bundle's invention:
@@ -286,6 +335,12 @@ jobs:
             echo "mesa-version=$(cat VERSION)"
             echo "mesa-ref=$(git describe --tags --always 2>/dev/null || echo unknown)"
             echo "orbis-compat-commit=$COMPAT_SHA"
+            # ⚠ THIS, NOT THE COMMIT ABOVE, IS WHAT A CONSUMER SHOULD PAIR ON. The commit is
+            # provenance; this is the tree the compiler read. orbis-compat's
+            # verify-sdk-bundle.sh compares it against the include/ shipped beside these
+            # archives, and that comparison is the only part of the pairing check that needs
+            # neither a git history nor trust in a verdict somebody else recorded.
+            echo "orbis-compat-include-sha256=$COMPAT_INCLUDE_SHA"
             echo "openorbis-sdk-tag=$OPENORBIS_SDK_TAG"
             echo "gallium-archive=build-orbis/src/gallium/targets/dri/$(basename "$GALLIUM")"
             echo "gllinkprobe=pass"
