@@ -23,6 +23,15 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TREE="$(cd "${ROOT}/../.." && pwd)"
 
 ORBIS_COMPAT="${ORBIS_COMPAT_DIR:-${HOME}/src-ps4/orbis-compat}"
+
+# ⚠ THE LINKER SCRIPT IS THE KIT'S SINCE 2026-09-18. cmake/ moved to
+# orbis-ports/orbis-porting-kit; the overlay keeps include/ and the archive, both of which this
+# probe still takes from ORBIS_COMPAT. The fallback is the overlay, which carried the script until
+# then. Without this the probe fails with "cannot find linker script" and reports it as an archive
+# that is not self-contained, which is a diagnosis about the wrong thing entirely.
+ORBIS_KIT="${ORBIS_KIT_DIR:-}"
+[[ -n "${ORBIS_KIT}" && -f "${ORBIS_KIT}/cmake/orbis-tls.ld" ]] || ORBIS_KIT="${ORBIS_COMPAT}"
+
 [[ -f "${ORBIS_COMPAT}/build/liborbis-compat.a" ]] || {
   echo "gllinkprobe: no ${ORBIS_COMPAT}/build/liborbis-compat.a - build orbis-compat first" >&2; exit 2; }
 
@@ -62,7 +71,7 @@ clang --target=x86_64-pc-freebsd12-elf --sysroot="${SDK}" -fPIC \
 # ⚠ NO COMMENTS INSIDE THE CONTINUED COMMAND BELOW - a `#` between backslashes ends it silently.
 clang --target=x86_64-pc-freebsd12-elf --sysroot="${SDK}" \
       -nostdlib -fuse-ld=lld -pie -Wl,-m,elf_x86_64 \
-      -Wl,--script="${ORBIS_COMPAT}/cmake/orbis-tls.ld" -Wl,--eh-frame-hdr -Wl,--no-rosegment \
+      -Wl,--script="${ORBIS_KIT}/cmake/orbis-tls.ld" -Wl,--eh-frame-hdr -Wl,--no-rosegment \
       -Wl,--error-limit=0 -Wl,--allow-multiple-definition \
       "${BUILD}/glprobe.o" \
       -Wl,--start-group \

@@ -28,6 +28,15 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # that links this driver links orbis-compat too - the overlay is not optional - so the probe's link line
 # has to look like a title's.
 ORBIS_COMPAT="${ORBIS_COMPAT_DIR:-${HOME}/src-ps4/orbis-compat}"
+
+# ⚠ THE LINKER SCRIPT IS THE KIT'S SINCE 2026-09-18. cmake/ moved to
+# orbis-ports/orbis-porting-kit; the overlay keeps include/ and the archive, both of which this
+# probe still takes from ORBIS_COMPAT. The fallback is the overlay, which carried the script until
+# then. Without this the probe fails with "cannot find linker script" and reports it as an archive
+# that is not self-contained, which is a diagnosis about the wrong thing entirely.
+ORBIS_KIT="${ORBIS_KIT_DIR:-}"
+[[ -n "${ORBIS_KIT}" && -f "${ORBIS_KIT}/cmake/orbis-tls.ld" ]] || ORBIS_KIT="${ORBIS_COMPAT}"
+
 [[ -f "${ORBIS_COMPAT}/build/liborbis-compat.a" ]] || {
   echo "linkprobe: no ${ORBIS_COMPAT}/build/liborbis-compat.a - build orbis-compat first" >&2; exit 2; }
 
@@ -53,7 +62,7 @@ clang --target=x86_64-pc-freebsd12-elf --sysroot="${SDK}" -fPIC \
 # of the flags become a separate no-op - which briefly made the archive look like it had lost sceGnm* symbols.
 clang --target=x86_64-pc-freebsd12-elf --sysroot="${SDK}" \
       -nostdlib -fuse-ld=lld -pie -Wl,-m,elf_x86_64 \
-      -Wl,--script="${ORBIS_COMPAT}/cmake/orbis-tls.ld" -Wl,--eh-frame-hdr -Wl,--no-rosegment \
+      -Wl,--script="${ORBIS_KIT}/cmake/orbis-tls.ld" -Wl,--eh-frame-hdr -Wl,--no-rosegment \
       -Wl,--error-limit=0 \
       "${BUILD}/linkprobe.o" \
       -Wl,--whole-archive "${A}" -Wl,--no-whole-archive "${BUILD}"/subprojects/zlib-*/libz.a \
