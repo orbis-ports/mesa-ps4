@@ -620,6 +620,7 @@ struct amdgpu_va {
     * kernel's reference, kept the only way this arm can keep one. */
    bool     retired;
    uint64_t retire_seq;
+   uint64_t mark; /* 0 until a frame boundary stamps it; see ac_orbis_frame_boundary */
 };
 
 static simple_mtx_t orbis_va_lock = SIMPLE_MTX_INITIALIZER;
@@ -1129,6 +1130,34 @@ static uint64_t orbis_arena_map_base;
  * silent - which is what the whole of 2026-08-11 was spent discovering. */
 static bool orbis_arena_unmapped;
 
+/* ⚠ THE WINDOW IS ADDRESSES, NOT MEMORY - the arena extension (2026-11-07).
+ *
+ * RADV's window used to be the arena and nothing else, so every buffer had to fit in the 1 GiB the arena could
+ * get - and on hardware it did not. Fallout 3 (opening the Pip-Boy) and Left 4 Dead 2 both died with DXVK's
+ * "Memory allocation failed" at 820 and 856 MiB of DXVK allocations, the second for a 1,264-byte buffer; with
+ * ORBIS_ARENA_MIB=1280 the same L4D2 save played on. Most of the arena's memory was not even in use when it ran
+ * out: VRAM buffers are moved onto GARLIC memory of their own (orbis_garlic_back), and the arena pages behind
+ * them sit idle. What ran out was ADDRESSES.
+ *
+ * So the window is now the arena PLUS an extension of reserved address space straight after it, which costs
+ * nothing until it is used. A buffer placed there gets direct memory of its own when it is mapped - GARLIC for
+ * VRAM, as before, WB_ONION otherwise - and gives it back when its range retires. The allocator is first-fit
+ * from the bottom, so a title that fits in the arena never touches the extension and runs exactly as it did.
+ *
+ * Both pieces come out of ONE reservation, made before the arena is mapped into the front of it, so the window is
+ * contiguous by construction and nothing else can already be living where the extension goes.
+ * ORBIS_ARENA_EXT_MIB sets its size (default 1024; 0 turns it off). */
+static uint64_t orbis_ext_base;       /* 0 = no extension; otherwise the extension is orbis_ext_base..orbis_va_end */
+static uint64_t orbis_ext_pending;    /* reserved at setup, opened once the window is protected */
+#if defined(__PS4__)
+static void orbis_ext_release(uint64_t lo, uint64_t hi);
+#endif
+static inline bool
+orbis_in_ext(uint64_t addr)
+{
+   return orbis_ext_base != 0 && addr >= orbis_ext_base;
+}
+
 /* ⚠ A RANGE MAY NOT LOSE ITS PAGES WHILE THE GPU IS STILL WRITING TO IT, AND THAT IS WHAT amdgpu GUARANTEES FOR US
  * ON LINUX.
  *
@@ -1171,6 +1200,7 @@ static struct orbis_retire {
    uint64_t garlic_addr;
    uint64_t garlic_bytes;
    int64_t  garlic_phys;
+   uint64_t mark; /* 0 until a frame boundary stamps it; see ac_orbis_frame_boundary */
 } orbis_retire_q[ORBIS_RETIRE_MAX];
 static unsigned orbis_retire_head, orbis_retire_count;
 /* ⚠ ONE LOCK FOR THE RING, AND IT USED TO HAVE THREE - WHICH IS THE SAME AS NONE.
@@ -5050,6 +5080,17 @@ static int orbis_arena_state; /* 0 = untouched, 1 = up, -1 = tried and failed */
 
 static int orbis_arena_setup_once(void);
 
+/* ORBIS_ARENA_EXT_MIB, default 1024. Rounded to the 2 MiB the arena itself is aligned to. */
+static uint64_t
+orbis_ext_wanted(void)
+{
+   const char *const s = getenv("ORBIS_ARENA_EXT_MIB");
+   const uint64_t    mib = s != NULL ? strtoull(s, NULL, 10) : 1024;
+   if (s != NULL)
+      mesa_logi("orbis-drm: ORBIS_ARENA_EXT_MIB=%s", s);
+   return (mib * 1024 * 1024) & ~(ORBIS_DIRECT_ALIGN - 1);
+}
+
 static int
 orbis_arena_setup(void)
 {
@@ -5159,7 +5200,47 @@ orbis_arena_setup_once(void)
          continue;
       }
 
-      err = sceKernelMapDirectMemory(&va, want, ORBIS_GRAPHICS_PROT, 0, phys, ORBIS_DIRECT_ALIGN);
+      /* The extension's addresses are reserved together with the arena's, and the arena is then mapped into the
+       * front of that reservation - Sony's reserve-then-map-fixed, the same pattern pw_wine_dmem_ps4.c uses for
+       * Wine's heap - so the extension cannot collide with anything. A 4 GiB alignment is asked for first so the
+       * whole window shares one address32_hi; if the kernel will not, any 2 MiB one will do, and if no
+       * reservation is possible at all the arena is mapped where the kernel likes, as it always was. */
+      void          *res = NULL;
+      uint64_t       res_bytes = 0;
+      const uint64_t ext_want = orbis_ext_wanted();
+      if (ext_want != 0) {
+         static const uint64_t aligns[] = {1ull << 32, ORBIS_DIRECT_ALIGN};
+         for (unsigned a = 0; a < ARRAY_SIZE(aligns) && res == NULL; ++a) {
+            void   *at = NULL;
+            int32_t rerr = sceKernelReserveVirtualRange(&at, want + ext_want, 0, aligns[a]);
+            if (rerr == 0 && at != NULL)
+               res = at;
+            else
+               mesa_logi("orbis-drm: reserving %llu MiB of window (align 0x%llx) -> 0x%08x",
+                         (unsigned long long)((want + ext_want) / (1024 * 1024)), (unsigned long long)aligns[a],
+                         (unsigned)rerr);
+         }
+         if (res != NULL)
+            res_bytes = want + ext_want;
+      }
+      va = res;
+      err = sceKernelMapDirectMemory(&va, want, ORBIS_GRAPHICS_PROT, res != NULL ? 0x0010 /* MAP_FIXED */ : 0, phys,
+                                     ORBIS_DIRECT_ALIGN);
+      if (err == 0 && res != NULL && va != res) {
+         mesa_loge("orbis-drm: the arena was asked for at %p and landed at %p - giving up on the extension", res, va);
+         sceKernelMunmap(va, want);
+         err = -1;
+      }
+      if (err != 0 && res != NULL) {
+         /* The reservation is the new part; never let it cost the arena. Drop it and map the old way. */
+         mesa_logw("orbis-drm: mapping the arena into its reservation -> 0x%08x - no extension this run",
+                   (unsigned)err);
+         sceKernelMunmap(res, res_bytes);
+         res = NULL;
+         res_bytes = 0;
+         va = NULL;
+         err = sceKernelMapDirectMemory(&va, want, ORBIS_GRAPHICS_PROT, 0, phys, ORBIS_DIRECT_ALIGN);
+      }
       if (err != 0) {
          mesa_logi("orbis-drm: sceKernelMapDirectMemory(%llu MiB) -> 0x%08x, trying smaller",
                    (unsigned long long)(want / (1024 * 1024)), err);
@@ -5169,6 +5250,7 @@ orbis_arena_setup_once(void)
       }
 
       arena = want;
+      orbis_ext_pending = res_bytes != 0 ? res_bytes - want : 0;
       break;
    }
 
@@ -5484,6 +5566,21 @@ orbis_arena_setup_once(void)
                 " MiB) is mapped but NOT ACCESSIBLE - a buffer gains access when it is mapped and loses it when it "
                 "is unmapped, the way amdgpu's page tables behave",
                 orbis_va_base, orbis_va_end, win / (1024 * 1024));
+   }
+   if (orbis_ext_pending != 0) {
+      /* Only now, and only in the protected mode: the flat arena assumes every address in the window is
+       * memory, and the self-test above writes the window's last page, which must be the arena's. */
+      orbis_ext_base = orbis_va_end;
+      orbis_va_end += orbis_ext_pending;
+      mesa_logi("orbis-drm: extension window 0x%" PRIx64 "..0x%" PRIx64 " - arena %" PRIu64
+                " MiB plus %" PRIu64 " MiB of reserved addresses that get memory of their own when a buffer lands "
+                "there%s",
+                orbis_va_base, orbis_va_end, (orbis_ext_base - orbis_va_base) / (1024 * 1024),
+                orbis_ext_pending / (1024 * 1024),
+                ((orbis_va_base >> 32) != ((orbis_va_end - 1) >> 32))
+                   ? "; it crosses a 4 GiB line, so 32-bit buffers stay below it" : "");
+   } else {
+      mesa_logi("orbis-drm: no extension - the window is the arena alone");
    }
    return 0;
 }
@@ -6315,10 +6412,15 @@ orbis_query_memory(struct drm_amdgpu_memory_info *m)
 {
    memset(m, 0, sizeof(*m));
 
+   /* ⚠ ONCE, NOT THREE TIMES (2026-11-07). RADV's APU path (radv_physical_device_init_mem_types) ADDS the
+    * visible-VRAM and GTT sizes and shares the sum out 2/3 : 1/3. Reporting the whole pool as both made it advertise
+    * twice what exists - 661 + 1322 MiB over a 992 MiB window - so DXVK and the games planned for memory that was
+    * never there. The pool is split here in the same ratio, so the sum RADV builds is the pool. */
    const uint64_t pool = orbis_va_end - orbis_va_base;
-   m->vram.total_heap_size = pool;
-   m->cpu_accessible_vram.total_heap_size = pool;
-   m->gtt.total_heap_size = pool;
+   const uint64_t gtt = (pool / 3) & ~(uint64_t)(orbis_page_size() - 1);
+   m->vram.total_heap_size = pool - gtt;
+   m->cpu_accessible_vram.total_heap_size = pool - gtt;
+   m->gtt.total_heap_size = gtt;
    return 0;
 }
 
@@ -7120,7 +7222,7 @@ static bool orbis_vram_garlic_on(void)
 static bool
 orbis_garlic_back(struct orbis_bo *bo, uint64_t start, uint64_t bytes)
 {
-   if (!orbis_vram_garlic_on() || bo == NULL || bo->foreign)
+   if (!orbis_vram_garlic_on() || bo == NULL || bo->foreign || orbis_in_ext(start))
       return false;
    if (!(bo->preferred_heap & AMDGPU_GEM_DOMAIN_VRAM))
       return false;
@@ -7226,6 +7328,160 @@ orbis_garlic_restore(struct orbis_bo *bo)
 
    orbis_garlic_take(bo, &addr, &bytes, &phys);
    orbis_garlic_put_back(addr, bytes, phys);
+}
+
+/* ---- the arena extension's memory: one record per mapping, keyed by address -------------------------------
+ *
+ * By ADDRESS rather than by BO because RADV maps a BO twice when it pads it (radv_amdgpu_bo.c maps one read-only
+ * page after the buffer with the same handle), and unmaps both with one call. A record is created when a range
+ * in the extension is mapped and destroyed when that range retires - after the GPU has passed it, through the same
+ * retire queue the arena uses - or when its addresses are handed out again. */
+#define ORBIS_EXT_MAX 8192
+static struct orbis_ext {
+   uint64_t addr;
+   uint64_t bytes;
+   int64_t  phys;
+} orbis_ext_tab[ORBIS_EXT_MAX];
+static unsigned      orbis_ext_count;
+static uint64_t      orbis_ext_live, orbis_ext_peak, orbis_ext_said_peak;
+static simple_mtx_t  orbis_ext_lock = SIMPLE_MTX_INITIALIZER;
+
+/* Insert one permanent range into the VA list so the allocator never hands it out. Only for addresses this file
+ * could not get back after releasing their memory - an address that is neither ours nor reserved may by now be
+ * someone else's, and mapping over it would destroy whatever lives there. */
+static void
+orbis_ext_poison(uint64_t addr, uint64_t bytes)
+{
+   struct amdgpu_va *const node = calloc(1, sizeof(*node));
+   if (node == NULL)
+      return;
+   node->base = addr;
+   node->size = bytes;
+   simple_mtx_lock(&orbis_va_lock);
+   struct amdgpu_va **link = &orbis_va_list;
+   while (*link && (*link)->base < addr)
+      link = &(*link)->next;
+   node->next = *link;
+   *link = node;
+   simple_mtx_unlock(&orbis_va_lock);
+}
+
+/* Give one record's addresses back to the reservation and then its memory back to the kernel. Reserving over the
+ * mapping replaces it in one step; if the kernel will not do that, unmap and reserve, and if the addresses still
+ * cannot be had, take them out of circulation for good. */
+static void
+orbis_ext_unback(const struct orbis_ext *e)
+{
+   const uint64_t page = orbis_page_size();
+   void          *at = (void *)(uintptr_t)e->addr;
+   int32_t        err = sceKernelReserveVirtualRange(&at, e->bytes, ORBIS_MAP_FIXED, page);
+   if (err != 0 || (uintptr_t)at != e->addr) {
+      static unsigned said;
+      if (orbis_budget(&said, 4))
+         mesa_logw("orbis-drm: extension re-reserve over 0x%" PRIx64 " (%" PRIu64 " KiB) -> 0x%08x at %p - "
+                   "unmapping first",
+                   e->addr, e->bytes / 1024, (unsigned)err, at);
+      sceKernelMunmap((void *)(uintptr_t)e->addr, e->bytes);
+      at = (void *)(uintptr_t)e->addr;
+      err = sceKernelReserveVirtualRange(&at, e->bytes, ORBIS_MAP_FIXED, page);
+      if (err != 0 || (uintptr_t)at != e->addr) {
+         mesa_loge("orbis-drm: extension re-reserve failed: addr=0x%" PRIx64 " size=%" PRIu64 " result=0x%08x - "
+                   "these addresses are retired for good",
+                   e->addr, e->bytes, (unsigned)err);
+         orbis_ext_poison(e->addr, e->bytes);
+      }
+   }
+   sceKernelReleaseDirectMemory((off_t)e->phys, e->bytes);
+}
+
+static void
+orbis_ext_release(uint64_t lo, uint64_t hi)
+{
+   if (orbis_ext_base == 0 || hi <= orbis_ext_base)
+      return;
+   simple_mtx_lock(&orbis_ext_lock);
+   for (unsigned i = orbis_ext_count; i-- > 0;) {
+      const struct orbis_ext e = orbis_ext_tab[i];
+      if (!(e.addr < hi && lo < e.addr + e.bytes))
+         continue;
+      orbis_ext_unback(&e);
+      orbis_ext_live -= e.bytes;
+      orbis_ext_tab[i] = orbis_ext_tab[--orbis_ext_count];
+   }
+   simple_mtx_unlock(&orbis_ext_lock);
+}
+
+/* Give a range in the extension memory of its own and map it there. VRAM buffers get GARLIC, exactly as
+ * orbis_garlic_back gives them inside the arena; everything else gets WB_ONION, which is what the arena is. */
+static int
+orbis_ext_back(struct orbis_bo *bo, uint64_t start, uint64_t bytes)
+{
+   if (start < orbis_ext_base) {
+      mesa_loge("orbis-drm: extension straddle: addr=0x%" PRIx64 " end=0x%" PRIx64 " ext=0x%" PRIx64
+                " - a range may not run from the arena into the extension",
+                start, start + bytes, orbis_ext_base);
+      return -EINVAL;
+   }
+   if (bo != NULL && bo->foreign)
+      return 0; /* its memory is another buffer's, already mapped where it is */
+
+   /* Anything still recorded here belongs to a range that was unmapped and whose addresses have now been handed
+    * out again; it has to go before this one can be mapped over it. */
+   orbis_ext_release(start, start + bytes);
+
+   const bool garlic = orbis_vram_garlic_on() && bo != NULL && (bo->preferred_heap & AMDGPU_GEM_DOMAIN_VRAM);
+   int        type = garlic ? ORBIS_KERNEL_WC_GARLIC : ORBIS_KERNEL_WB_ONION;
+   off_t      phys = 0;
+   int32_t    err = sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), bytes, orbis_page_size(), type,
+                                                  &phys);
+   if (err != 0 && garlic) {
+      type = ORBIS_KERNEL_WB_ONION;
+      err = sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), bytes, orbis_page_size(), type, &phys);
+   }
+   if (err != 0) {
+      mesa_loge("orbis-drm: extension allocation failed: addr=0x%" PRIx64 " size=%" PRIu64 " live=%" PRIu64
+                " KiB result=0x%08x - the console has no direct memory left for this buffer",
+                start, bytes, orbis_ext_live / 1024, (unsigned)err);
+      return -ENOMEM;
+   }
+   void *at = (void *)(uintptr_t)start;
+   err = sceKernelMapDirectMemory(&at, bytes, ORBIS_GRAPHICS_PROT, ORBIS_MAP_FIXED, phys, orbis_page_size());
+   if (err != 0 || (uintptr_t)at != start) {
+      mesa_loge("orbis-drm: extension map failed: addr=0x%" PRIx64 " size=%" PRIu64 " result=0x%08x landed=%p",
+                start, bytes, (unsigned)err, at);
+      if (err == 0)
+         sceKernelMunmap(at, bytes);
+      sceKernelReleaseDirectMemory(phys, bytes);
+      return -ENOMEM;
+   }
+
+   simple_mtx_lock(&orbis_ext_lock);
+   if (orbis_ext_count == ORBIS_EXT_MAX) {
+      simple_mtx_unlock(&orbis_ext_lock);
+      mesa_loge("orbis-drm: extension table full: addr=0x%" PRIx64 " size=%" PRIu64 " - %u ranges recorded "
+                "already; raise ORBIS_EXT_MAX",
+                start, bytes, (unsigned)ORBIS_EXT_MAX);
+      const struct orbis_ext e = {start, bytes, (int64_t)phys};
+      orbis_ext_unback(&e);
+      return -ENOMEM;
+   }
+   orbis_ext_tab[orbis_ext_count++] = (struct orbis_ext){start, bytes, (int64_t)phys};
+   orbis_ext_live += bytes;
+   const bool first = orbis_ext_peak == 0;
+   if (orbis_ext_live > orbis_ext_peak)
+      orbis_ext_peak = orbis_ext_live;
+   const bool step = orbis_ext_peak >= orbis_ext_said_peak + 64ull * 1024 * 1024;
+   if (step)
+      orbis_ext_said_peak = orbis_ext_peak;
+   const uint64_t live = orbis_ext_live, peak = orbis_ext_peak;
+   const unsigned count = orbis_ext_count;
+   simple_mtx_unlock(&orbis_ext_lock);
+
+   if (first || step)
+      mesa_logi("orbis-drm: extension in use: %" PRIu64 " KiB live, peak %" PRIu64 " KiB, %u ranges (last: "
+                "0x%" PRIx64 ", %" PRIu64 " KiB, %s)",
+                live / 1024, peak / 1024, count, start, bytes / 1024, type == ORBIS_KERNEL_WC_GARLIC ? "GARLIC" : "ONION");
+   return 0;
 }
 #endif
 
@@ -7369,6 +7625,8 @@ orbis_backing_map_locked(struct orbis_bo *bo, uint64_t bo_offset, uint64_t size,
             if (!hits_range && !hits_chunk)
                continue;
 
+            if (hits_range && orbis_in_ext(r->addr))
+               orbis_ext_release(r->addr, r->addr + r->size); /* its memory dies with it, not with the new tenant */
             r->size = 0; /* cancelled: this range is live again */
             if (r->garlic_bytes != 0) {
                g_addr = r->garlic_addr;
@@ -7387,6 +7645,8 @@ orbis_backing_map_locked(struct orbis_bo *bo, uint64_t bo_offset, uint64_t size,
          orbis_garlic_put_back(g_addr, g_bytes, (off_t)g_phys);
       }
 
+      if (orbis_in_ext(start + bytes - 1))
+         return orbis_ext_back(bo, start, bytes);
       const int32_t err = sceKernelMprotect((const void *)(uintptr_t)start, (size_t)bytes, ORBIS_GRAPHICS_PROT);
       if (err != 0) {
          mesa_loge("orbis-drm: granting access to 0x%" PRIx64 "..0x%" PRIx64 " failed: 0x%08x", start, start + bytes,
@@ -7434,8 +7694,16 @@ orbis_protect_now(uint64_t addr, uint64_t size)
       mesa_logi("orbis-prot: REVOKE 0x%" PRIx64 "..0x%" PRIx64 " (label %u, last submit #%" PRIu64 ")", addr,
                 addr + size, *orbis_fence_label, orbis_submit_seq_no);
    const uint64_t page = orbis_page_size();
-   const uint64_t start = addr & ~(page - 1);
-   const uint64_t bytes = ((addr + size + page - 1) & ~(page - 1)) - start;
+   uint64_t       start = addr & ~(page - 1);
+   uint64_t       bytes = ((addr + size + page - 1) & ~(page - 1)) - start;
+   if (orbis_in_ext(start + bytes - 1)) {
+      /* Retired ranges in the extension lose their memory, which takes the access with it. */
+      const uint64_t from = MAX2(start, orbis_ext_base);
+      orbis_ext_release(from, start + bytes);
+      if (start >= orbis_ext_base)
+         return;
+      bytes = orbis_ext_base - start;
+   }
    const int32_t  err = sceKernelMprotect((const void *)(uintptr_t)start, (size_t)bytes, ORBIS_PROT_NONE);
    if (err != 0) {
       static unsigned said;
@@ -7475,8 +7743,21 @@ orbis_retire_ranges(void)
     * often as anything needs them back. */
    const uint32_t label = *orbis_fence_label;
    const uint32_t newest = (uint32_t)orbis_submit_seq_no;
-   if ((int32_t)(label - newest) < 0)
-      return; /* the GPU is still behind: nothing may be released yet */
+   /* ⚠ AND "CAUGHT UP WITH EVERYTHING" STOPPED HAPPENING (2026-11-07). The rule above was written when present waited
+    * for GPU idle every frame. Present now waits for ITS OWN frame while the next one is already submitted, and this
+    * function is only called from submit (where the submission just numbered cannot have run), unmap and VA free - so
+    * on a title that renders continuously the GPU is essentially never seen idle and NOTHING was released. Left 4
+    * Dead 2 on an orbis-win build filled a 2 GiB window with ~960 MiB actually allocated by DXVK and died with the
+    * window exhausted; Fallout 3 and New Vegas hit the same wall inside 1 GiB.
+    *
+    * So the rule is kept and given a second way to be met. Each frame boundary (ac_orbis_frame_boundary, from the
+    * WSI's present after its GPU wait) stamps every parked range that has no stamp with the newest submission at that
+    * moment; a range may go once the GPU has reached its stamp. That is the same guarantee - every submission handed
+    * out before the release point has finished - measured at the first frame boundary after the free instead of at a
+    * moment of total idle, and it always includes at least the rest of the frame the range was freed in. The trace
+    * that set the rule (PARK behind #5982, #5983 already in flight writing into it) is covered: #5983 was handed out
+    * before the next boundary, so the stamp is at least #5983. */
+   const bool all = (int32_t)(label - newest) >= 0;
 
    /* ⚠ A "DRAIN ONLY WHEN THE FENCE MOVED" SKIP WENT HERE AND WAS REVERTED, and the reasoning that
     * put it there is worth keeping so it is not reinvented.
@@ -7501,7 +7782,7 @@ orbis_retire_ranges(void)
    simple_mtx_lock(&orbis_va_lock);
    for (struct amdgpu_va **link = &orbis_va_list; *link;) {
       struct amdgpu_va *const va = *link;
-      if (va->retired) { /* the GPU has caught up with everything, checked above */
+      if (va->retired && (all || (va->mark != 0 && (int32_t)(label - (uint32_t)va->mark) >= 0))) {
          *link = va->next;
          free(va);
          continue;
@@ -7527,6 +7808,8 @@ orbis_retire_ranges(void)
        * the queue drains whole. The comparison stays as an assertion of that reasoning rather than as a filter. */
       if ((int32_t)(label - (uint32_t)r->seq) < 0)
          break;
+      if (!all && (r->mark == 0 || (int32_t)(label - (uint32_t)r->mark) < 0))
+         break; /* FIFO: stamps are handed out in queue order, so nothing behind this one is ready either */
 
       /* ⚠ THE CHUNK GOES BACK BEFORE THE PROTECT, NOT AFTER, and the order is load-bearing: putting
        * the arena's pages back is a fresh MAP_FIXED mapping with ORBIS_GRAPHICS_PROT, so it hands
@@ -7611,6 +7894,7 @@ orbis_backing_unmap_locked(uint64_t addr, uint64_t size, struct orbis_bo *bo)
       orbis_retire_q[slot].addr = start;
       orbis_retire_q[slot].size = bytes;
       orbis_retire_q[slot].seq = orbis_submit_seq_no;
+      orbis_retire_q[slot].mark = 0;
       /* The chunk is taken off the BO here rather than restored: the BO can be freed the moment
        * this returns, and the queue must not hold a pointer to it. Zeroes for a BO that has none. */
       {
@@ -7809,8 +8093,11 @@ orbis_protect_range_locked(uint64_t addr, uint64_t size, bool give_back)
 
    /* The arm's own slice is never RADV's to free, and revoking rights on the fence label or the staging ring
     * would break the driver rather than catch a bug in it. */
-   if (addr < orbis_va_base)
+   if (addr < orbis_va_base || orbis_in_ext(addr))
       return;
+   /* The extension has no rights to take away: a retired range there loses its memory instead. */
+   if (orbis_in_ext(addr + size - 1))
+      size = orbis_ext_base - addr;
 
    const uint64_t page = orbis_page_size();
    const uint64_t lo = give_back ? (addr & ~(page - 1)) : ((addr + page - 1) & ~(page - 1));
@@ -8392,6 +8679,19 @@ ac_drm_va_range_alloc(ac_drm_device *dev, enum amdgpu_gpu_va_range va_range_type
       candidate = orbis_align_up((*link)->base + (*link)->size, align);
       link = &(*link)->next;
    }
+   /* A range that would start in the arena and end in the extension starts in the extension instead: the two
+    * halves are backed differently, and one mapping cannot be both. */
+   if (!va_base_required && orbis_ext_base != 0 && candidate < orbis_ext_base && candidate + size > orbis_ext_base) {
+      candidate = orbis_align_up(orbis_ext_base, align);
+      for (;;) {
+         while (*link && (*link)->base + (*link)->size <= candidate)
+            link = &(*link)->next;
+         if (!(*link && candidate + size > (*link)->base))
+            break;
+         candidate = orbis_align_up((*link)->base + (*link)->size, align);
+         link = &(*link)->next;
+      }
+   }
 
    if (candidate + size > limit) {
       simple_mtx_unlock(&orbis_va_lock);
@@ -8530,6 +8830,7 @@ ac_drm_va_range_free(amdgpu_va_handle va_range_handle)
    if (orbis_arena_unmapped) {
       simple_mtx_lock(&orbis_va_lock);
       va_range_handle->retire_seq = orbis_submit_seq_no;
+      va_range_handle->mark = 0;
       va_range_handle->retired = true;
       simple_mtx_unlock(&orbis_va_lock);
       orbis_retire_ranges();
@@ -8673,7 +8974,8 @@ ac_drm_query_heap_info(ac_drm_device *dev, uint32_t heap, uint32_t flags, struct
    simple_mtx_unlock(&orbis_va_lock);
 
    info->heap_size = orbis_va_end - orbis_va_base;
-   info->heap_usage = used;
+   /* One pool: its usage is reported under VRAM only, or RADV's budget (visible VRAM + GTT) counts it twice. */
+   info->heap_usage = heap == AMDGPU_GEM_DOMAIN_GTT ? 0 : used;
    info->max_allocation = largest;
    return 0;
 }
@@ -9154,6 +9456,50 @@ ac_orbis_wait_gpu_seq(uint64_t want, uint64_t timeout_ns)
       orbis_poll_pause();
    }
    return true;
+}
+
+/* The WSI's frame boundary: stamp every parked range that has no stamp yet with the newest submission, then
+ * release whatever the GPU has already passed. See orbis_retire_ranges for why this exists. Telemetry once every
+ * 600 boundaries: how much the allocator is still holding back, so a leak shows up as a number rather than as a
+ * window-exhausted line minutes later. */
+void ac_orbis_frame_boundary(void);
+void
+ac_orbis_frame_boundary(void)
+{
+#if defined(__PS4__)
+   if (!orbis_arena_unmapped)
+      return;
+   const uint64_t newest = orbis_submit_seq_no;
+   if (newest == 0)
+      return;
+   uint64_t held = 0, held_ranges = 0;
+   simple_mtx_lock(&orbis_va_lock);
+   for (struct amdgpu_va *va = orbis_va_list; va; va = va->next) {
+      if (!va->retired)
+         continue;
+      if (va->mark == 0)
+         va->mark = newest;
+      held += va->size;
+      ++held_ranges;
+   }
+   simple_mtx_unlock(&orbis_va_lock);
+   simple_mtx_lock(&orbis_retire_lock);
+   for (unsigned i = 0; i < orbis_retire_count; ++i) {
+      struct orbis_retire *const r = &orbis_retire_q[(orbis_retire_head + i) % ORBIS_RETIRE_MAX];
+      if (r->mark == 0)
+         r->mark = newest;
+   }
+   const unsigned parked = orbis_retire_count;
+   simple_mtx_unlock(&orbis_retire_lock);
+
+   static uint64_t boundaries;
+   if (boundaries++ % 600 == 0)
+      mesa_logi("orbis-drm: retire boundary %" PRIu64 ": %" PRIu64 " freed ranges (%" PRIu64
+                " KiB) waiting for the GPU, %u parked mappings, label %u, newest #%" PRIu64,
+                boundaries, held_ranges, held / 1024, parked, *orbis_fence_label, newest);
+
+   orbis_retire_ranges();
+#endif
 }
 
 bool

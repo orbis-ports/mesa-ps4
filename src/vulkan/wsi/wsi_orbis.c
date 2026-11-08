@@ -636,6 +636,14 @@ wsi_orbis_scanout_present(struct wsi_orbis_scanout *so, uint32_t index, const vo
           if (orbis_raster_ab(&nb)) { orbis_ab_live = true; orbis_ab_bucket = nb; } } }
    }
 
+   /* The frame boundary for the allocator: freed GPU ranges are handed back from here once the GPU has passed the
+    * submission they are stamped with (ac_orbis_drm.c, orbis_retire_ranges). Without it a title that never lets
+    * the GPU go fully idle never gets a freed range back, and runs out of window. */
+   {
+      extern void ac_orbis_frame_boundary(void);
+      ac_orbis_frame_boundary();
+   }
+
    /* ⚠ THE FRAME BOUNDARY SONY'S DRIVER HAS NEVER BEEN TOLD ABOUT.
     *
     * `sceGnmSubmitDone` means, in Sony's own words as quoted in ac_orbis_drm.c, "tell the driver that all command
